@@ -102,7 +102,7 @@ export const builtins: Record<string, Builtin> = {
   },
 
   echo(args) {
-    return ok(args.join(" "));
+    return ok(`${args.join(" ")}\n`);
   },
 
   rm(args, ctx) {
