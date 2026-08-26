@@ -1,6 +1,7 @@
 import { FSError } from "../fs/FSError";
 import { VirtualFileSystem } from "../fs/VirtualFileSystem";
 import { resolvePath } from "./resolvePath";
+import { killPort } from "../process/previewBridge";
 
 export type ShellContext = {
   cwd: string;
@@ -118,6 +119,14 @@ export const builtins: Record<string, Builtin> = {
         return fail(`rm: ${describeError(error)}`);
       }
     }
+    return ok();
+  },
+
+  kill(args) {
+    const portArg = args[0];
+    const port = Number(portArg);
+    if (!portArg || Number.isNaN(port)) return fail("kill: usage: kill <port>");
+    if (!killPort(port)) return fail(`kill: no server listening on port ${port}`);
     return ok();
   },
 

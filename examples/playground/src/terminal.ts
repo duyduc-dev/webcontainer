@@ -24,6 +24,17 @@ export function attachTerminal(dwc: DuckWebContainer, container: HTMLElement) {
 
   writePrompt();
 
+  // A command that starts a listening server never exits on its own — a real
+  // foreground server blocks a real shell the same way. So the terminal has
+  // to move on as soon as the server starts, not wait for an exit that may
+  // never come. `pendingAdvance` is whichever comes first for the in-flight
+  // command: a normal exit, or the server starting to listen.
+  let pendingAdvance: (() => void) | null = null;
+
+  dwc.on("listen", () => {
+    pendingAdvance?.();
+  });
+
   term.onData(async (data) => {
     if (data === "\r") {
       term.write("\r\n");
@@ -36,12 +47,21 @@ export function attachTerminal(dwc: DuckWebContainer, container: HTMLElement) {
       }
 
       const process = await dwc.shell.spawn(command);
+      let advanced = false;
+      const advance = (newCwd?: string) => {
+        if (advanced) return;
+        advanced = true;
+        pendingAdvance = null;
+        if (newCwd !== undefined) cwd = newCwd;
+        writePrompt();
+      };
+      pendingAdvance = () => advance();
+
       process.onData((_stream, chunk) => {
         term.write(toCrlf(chunk));
       });
       process.onExit((_exitCode, newCwd) => {
-        cwd = newCwd;
-        writePrompt();
+        advance(newCwd);
       });
       return;
     }

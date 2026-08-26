@@ -9,6 +9,7 @@ import {
 import { VirtualFileSystem } from "../../kernel/fs/VirtualFileSystem";
 import { FSError } from "../../kernel/fs/FSError";
 import { Shell } from "../../kernel/shell/Shell";
+import { sendPreviewRequest } from "../../kernel/process/previewBridge";
 import { Logger } from "../../utilities/logger";
 
 const logger = new Logger("KernelWorker");
@@ -154,6 +155,35 @@ async function handleProcessSpawn(
   });
 }
 
+async function handlePreviewFetch(
+  message: Extract<
+    KernelBTWEventMessage,
+    { type: KernelBTWEventType.PREVIEW_FETCH }
+  >,
+) {
+  try {
+    const result = await sendPreviewRequest(message.port, {
+      method: message.method,
+      path: message.path,
+      headers: message.headers,
+      body: message.body,
+    });
+    workPostMessage({
+      type: KernelWTBEventType.PREVIEW_FETCH_RESPONSE,
+      requestId: message.requestId,
+      ok: true,
+      result,
+    });
+  } catch (error) {
+    workPostMessage({
+      type: KernelWTBEventType.PREVIEW_FETCH_RESPONSE,
+      requestId: message.requestId,
+      ok: false,
+      error: { code: "EINVAL", path: "", message: String(error) },
+    });
+  }
+}
+
 self.onmessage = (event: MessageEvent<KernelBTWEventMessage>) => {
   const data = event.data;
   if (data.type === KernelBTWEventType.FS_REQUEST) {
@@ -166,6 +196,10 @@ self.onmessage = (event: MessageEvent<KernelBTWEventMessage>) => {
   }
   if (data.type === KernelBTWEventType.PROCESS_SPAWN) {
     handleProcessSpawn(data);
+    return;
+  }
+  if (data.type === KernelBTWEventType.PREVIEW_FETCH) {
+    handlePreviewFetch(data);
     return;
   }
   log("event", event);
