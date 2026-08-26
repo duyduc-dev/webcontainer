@@ -50,6 +50,7 @@ export async function runNode(
       entryPath,
       sources: [...preload.sources.entries()],
       resolutions: [...preload.resolutions.entries()],
+      fsFiles: [...preload.fsFiles.entries()],
       argv: rest,
       env: ctx.env,
       cwd: ctx.cwd,

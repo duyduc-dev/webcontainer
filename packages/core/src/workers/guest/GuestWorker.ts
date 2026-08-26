@@ -1,10 +1,13 @@
 import { resolutionKey } from "../../kernel/modules/preload";
+import { loadPureBuiltin } from "./builtins";
+import { createFsModule } from "./builtins/fs";
 
 type BootMessage = {
   type: "boot";
   entryPath: string;
   sources: [string, string][];
   resolutions: [string, string][];
+  fsFiles: [string, string][];
   argv: string[];
   env: Record<string, string>;
   cwd: string;
@@ -15,6 +18,7 @@ type ModuleRecord = { exports: unknown };
 const moduleCache = new Map<string, ModuleRecord>();
 let sources: Map<string, string>;
 let resolutions: Map<string, string>;
+let fsModule: unknown;
 
 function postData(stream: "stdout" | "stderr", chunk: string) {
   self.postMessage({ type: "data", stream, chunk });
@@ -35,6 +39,12 @@ function dirnameOf(path: string): string {
 
 function createRequire(fromPath: string) {
   return function guestRequire(specifier: string): unknown {
+    // Node builtins always win over node_modules, even if a package shadows
+    // the name — checked before the preloaded-graph lookup below.
+    if (specifier === "fs") return fsModule;
+    const pureBuiltin = loadPureBuiltin(specifier);
+    if (pureBuiltin !== undefined) return pureBuiltin;
+
     const resolved = resolutions.get(resolutionKey(fromPath, specifier));
     if (!resolved) {
       throw new Error(`Cannot find module '${specifier}'`);
@@ -73,6 +83,7 @@ self.onmessage = (event: MessageEvent<BootMessage>) => {
 
   sources = new Map(message.sources);
   resolutions = new Map(message.resolutions);
+  fsModule = createFsModule(new Map(message.fsFiles));
   (self as unknown as { process: unknown }).process = {
     argv: ["node", message.entryPath, ...message.argv],
     env: message.env,
@@ -87,6 +98,13 @@ self.onmessage = (event: MessageEvent<BootMessage>) => {
     exitCode = 1;
   }
 
-  self.postMessage({ type: "exit", exitCode });
-  self.close();
+  // setTimeout (a macrotask), not a synchronous close: lets any already-
+  // resolved promises' .then() chains — e.g. util.promisify wrapping a
+  // synchronously-invoked callback — finish before the worker exits. Doesn't
+  // wait for genuinely delayed work (real timers, real async I/O) started at
+  // the top level; that needs full event-loop-drain tracking, out of scope.
+  setTimeout(() => {
+    self.postMessage({ type: "exit", exitCode });
+    self.close();
+  }, 0);
 };
