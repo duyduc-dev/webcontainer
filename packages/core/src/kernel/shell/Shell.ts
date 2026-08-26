@@ -2,6 +2,8 @@ import { VirtualFileSystem } from "../fs/VirtualFileSystem";
 import { tokenize } from "./tokenize";
 import { builtins, ShellContext } from "./builtins";
 import { runNpm } from "./npmCommand";
+import { runNode } from "./nodeCommand";
+import { AsyncCommand, DataCallback } from "./commandTypes";
 
 export type ShellExecResult = {
   stdout: string;
@@ -10,15 +12,9 @@ export type ShellExecResult = {
   cwd: string;
 };
 
-type DataCallback = (stream: "stdout" | "stderr", chunk: string) => void;
-type AsyncCommand = (
-  args: string[],
-  ctx: ShellContext,
-  onData: DataCallback,
-) => Promise<{ exitCode: number; cwd?: string }>;
-
 const asyncCommands: Record<string, AsyncCommand> = {
   npm: runNpm,
+  node: runNode,
 };
 
 export class Shell {

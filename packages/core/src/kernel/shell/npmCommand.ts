@@ -3,9 +3,7 @@ import { resolvePackage } from "../registry/npmRegistry";
 import { installPackage } from "../registry/installPackage";
 import { resolvePath } from "./resolvePath";
 import { FSError } from "../fs/FSError";
-
-export type AsyncCommandResult = { exitCode: number; cwd?: string };
-export type DataCallback = (stream: "stdout" | "stderr", chunk: string) => void;
+import { AsyncCommandResult, DataCallback } from "./commandTypes";
 
 function readPackageJson(ctx: ShellContext): Record<string, unknown> {
   const path = resolvePath(ctx.cwd, "package.json");
