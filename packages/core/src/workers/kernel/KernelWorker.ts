@@ -80,7 +80,7 @@ function handleFsRequest(
   }
 }
 
-function handleShellRequest(
+async function handleShellRequest(
   message: Extract<
     KernelBTWEventMessage,
     { type: KernelBTWEventType.SHELL_REQUEST }
@@ -89,7 +89,7 @@ function handleShellRequest(
   try {
     const shell = shells.get(message.shellId);
     if (!shell) throw new Error(`unknown shell: ${message.shellId}`);
-    const result = shell.exec(message.line);
+    const result = await shell.execAsync(message.line);
     workPostMessage({
       type: KernelWTBEventType.SHELL_RESPONSE,
       requestId: message.requestId,
@@ -106,7 +106,7 @@ function handleShellRequest(
   }
 }
 
-function handleProcessSpawn(
+async function handleProcessSpawn(
   message: Extract<
     KernelBTWEventMessage,
     { type: KernelBTWEventType.PROCESS_SPAWN }
@@ -137,24 +137,14 @@ function handleProcessSpawn(
     return;
   }
 
-  const result = shell.exec(message.line);
-
-  if (result.stdout) {
+  const result = await shell.execAsync(message.line, (stream, chunk) => {
     workPostMessage({
       type: KernelWTBEventType.PROCESS_DATA,
       processId,
-      stream: "stdout",
-      chunk: result.stdout,
+      stream,
+      chunk,
     });
-  }
-  if (result.stderr) {
-    workPostMessage({
-      type: KernelWTBEventType.PROCESS_DATA,
-      processId,
-      stream: "stderr",
-      chunk: result.stderr,
-    });
-  }
+  });
 
   workPostMessage({
     type: KernelWTBEventType.PROCESS_EXIT,
