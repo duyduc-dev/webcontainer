@@ -20,6 +20,9 @@ importers:
       '@dwc/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@xterm/xterm':
+        specifier: ^6.0.0
+        version: 6.0.0
     devDependencies:
       vite:
         specifier: ^7.1.0
@@ -345,6 +348,9 @@ packages:
 
   '@types/estree@1.0.9':
     resolution: {integrity: sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==}
+
+  '@xterm/xterm@6.0.0':
+    resolution: {integrity: sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==}
 
   acorn@8.18.0:
     resolution: {integrity: sha512-lGq+9yr1/GuAWaVYIHRjvvySG5/4VfKIvC8EWxStPdcDh/Ka7FG3twP6v4d5BkravUilhIAsG4Qj83t02LWUPQ==}
@@ -772,6 +778,8 @@ snapshots:
     optional: true
 
   '@types/estree@1.0.9': {}
+
+  '@xterm/xterm@6.0.0': {}
 
   acorn@8.18.0: {}
 
