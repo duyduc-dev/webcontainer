@@ -13,10 +13,13 @@ export class KernelBridge {
   >();
 
   constructor() {
-    this.worker = new Worker(new URL("./workers/kernel/KernelWorker.ts"), {
-      type: "module",
-      name: "KernelWorker",
-    });
+    this.worker = new Worker(
+      new URL("./workers/kernel/KernelWorker.js", import.meta.url),
+      {
+        type: "module",
+        name: "KernelWorker",
+      },
+    );
 
     this.worker.onmessage = (event: MessageEvent<KernelWTBEventMessage>) => {
       const data = event.data;
@@ -34,7 +37,10 @@ export class KernelBridge {
     return () => handlersSet.delete(handler);
   }
 
-  private emitFromWorkerToBridge(type: KernelWTBEventType, data: KernelWTBEventMessage) {
+  private emitFromWorkerToBridge(
+    type: KernelWTBEventType,
+    data: KernelWTBEventMessage,
+  ) {
     const set = this.handlers.get(type);
     if (set) for (const h of set) h(data);
   }
