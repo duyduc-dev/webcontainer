@@ -1,4 +1,5 @@
 import { DuckWebContainer } from "@dwc/core";
+import { attachTerminal } from "./terminal";
 
 const output = document.getElementById("output")!;
 
@@ -18,6 +19,8 @@ const main = async () => {
     await dwc.shell.exec("cd /project");
     const pwd = await dwc.shell.exec("pwd");
     console.log(pwd.stdout); // "/project"
+
+    attachTerminal(dwc, document.getElementById("terminal")!);
   } catch (error) {
     console.error("Failed to instantiate DuckWebContainer", error);
     output.textContent = `Failed to instantiate DuckWebContainer: ${String(error)}`;
