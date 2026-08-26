@@ -1,3 +1,9 @@
+import { KernelBridge } from "./bridges/kernel/KernelBridge";
+
 export class DuckWebContainer {
-  static boot() {}
+  private readonly kernelBridge;
+
+  constructor() {
+    this.kernelBridge = new KernelBridge();
+  }
 }
