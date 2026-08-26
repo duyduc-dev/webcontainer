@@ -3,10 +3,11 @@ import EventEmitter from "./events";
 import util from "./util";
 
 // Node's builtin names always win over node_modules, even if an npm package
-// happens to share the name. `fs` is included here so preload.ts skips VFS
-// resolution for it too, but it's handled separately in GuestWorker.ts since
-// (unlike these three) it needs boot-time data injected, not just a pure value.
-export const ALL_BUILTIN_MODULE_NAMES = new Set(["path", "events", "util", "fs"]);
+// happens to share the name. `fs` and `http` are included here so preload.ts
+// skips VFS resolution for them too, but they're handled separately in
+// GuestWorker.ts since (unlike these three) they need boot-time data/postMessage
+// access injected, not just a pure value.
+export const ALL_BUILTIN_MODULE_NAMES = new Set(["path", "events", "util", "fs", "http"]);
 
 const pureBuiltins: Record<string, () => unknown> = {
   path: () => path,
