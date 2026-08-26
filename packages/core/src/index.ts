@@ -1,3 +1,1 @@
-export function hello() {
-  return "hello from core";
-}
+export { DuckWebContainer } from "./dwc";
