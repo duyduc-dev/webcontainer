@@ -38,10 +38,7 @@ export class DuckWebContainer {
   }
 
   on(type: string, handler: AnyListener): UnsubscribeFn {
-    let handlersSet = this.listeners.get(type);
-    if (!handlersSet) {
-      handlersSet = new Set();
-    }
+    let handlersSet = this.listeners.get(type) ?? new Set();
     handlersSet.add(handler);
     this.listeners.set(type, handlersSet);
     return () => handlersSet.delete(handler);
