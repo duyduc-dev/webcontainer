@@ -2,3 +2,4 @@ node_modules
 dist
 .turbo
 .claude/settings.local.json
+examples/playground/public
