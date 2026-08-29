@@ -1,22 +1,30 @@
-// A deliberately scoped `fs` shim: read-only, synchronous, and limited to
-// absolute literal paths discovered by preload.ts's static scan (same
-// limitation as require() — a computed path isn't found ahead of time and
-// fails clearly at runtime instead of silently misbehaving). Relative-path
-// resolution isn't supported since, unlike require(), fs calls have no
-// natural "which module is calling this" context to resolve against.
-export function createFsModule(files: Map<string, string>) {
+import { FsReaderWithReaddir } from "../../../kernel/fs/FsReader";
+
+// A read-only, synchronous `fs` shim backed by whichever FsReader the guest
+// was booted with — either live round trips to the kernel's VirtualFileSystem
+// (sync transport) or a snapshot of literal paths discovered ahead of time by
+// preload.ts's static scan (fallback transport, when COOP/COEP aren't set).
+// Errors propagate as real FSError instances straight from the client.
+export function createFsModule(client: FsReaderWithReaddir) {
   return {
     readFileSync(path: string, encoding?: string): string | Uint8Array {
-      const content = files.get(path);
-      if (content === undefined) {
-        throw new Error(
-          `ENOENT: no such file or directory, open '${path}' (only absolute literal paths discovered ahead of time are supported)`,
-        );
-      }
-      return encoding ? content : new TextEncoder().encode(content);
+      const content = client.readFile(path);
+      return encoding ? new TextDecoder().decode(content) : content;
     },
     existsSync(path: string): boolean {
-      return files.has(path);
+      return client.exists(path);
+    },
+    statSync(path: string) {
+      const stat = client.stat(path);
+      return {
+        isFile: () => stat.type === "file",
+        isDirectory: () => stat.type === "dir",
+        size: stat.size,
+        mtimeMs: stat.mtime,
+      };
+    },
+    readdirSync(path: string): string[] {
+      return client.readdir(path);
     },
   };
 }

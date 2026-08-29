@@ -1,11 +1,11 @@
-import { VirtualFileSystem } from "../fs/VirtualFileSystem";
+import { FsReader } from "../fs/FsReader";
 import { dirname, isAbsolute, join } from "../fs/path";
 
-function tryFile(vfs: VirtualFileSystem, path: string): string | undefined {
+function tryFile(vfs: FsReader, path: string): string | undefined {
   return vfs.exists(path) && vfs.stat(path).type === "file" ? path : undefined;
 }
 
-function resolveAsFile(vfs: VirtualFileSystem, basePath: string): string | undefined {
+function resolveAsFile(vfs: FsReader, basePath: string): string | undefined {
   return (
     tryFile(vfs, basePath) ??
     tryFile(vfs, `${basePath}.js`) ??
@@ -13,7 +13,7 @@ function resolveAsFile(vfs: VirtualFileSystem, basePath: string): string | undef
   );
 }
 
-function readMainField(vfs: VirtualFileSystem, packageJsonPath: string): string | undefined {
+function readMainField(vfs: FsReader, packageJsonPath: string): string | undefined {
   try {
     const content = vfs.readFile(packageJsonPath);
     const pkg = JSON.parse(new TextDecoder().decode(content));
@@ -23,7 +23,7 @@ function readMainField(vfs: VirtualFileSystem, packageJsonPath: string): string 
   }
 }
 
-function resolveAsDirectory(vfs: VirtualFileSystem, basePath: string): string | undefined {
+function resolveAsDirectory(vfs: FsReader, basePath: string): string | undefined {
   if (!vfs.exists(basePath) || vfs.stat(basePath).type !== "dir") return undefined;
 
   const main = readMainField(vfs, join(basePath, "package.json"));
@@ -35,11 +35,11 @@ function resolveAsDirectory(vfs: VirtualFileSystem, basePath: string): string | 
   return tryFile(vfs, join(basePath, "index.js"));
 }
 
-function resolveModulePath(vfs: VirtualFileSystem, basePath: string): string | undefined {
+function resolveModulePath(vfs: FsReader, basePath: string): string | undefined {
   return resolveAsFile(vfs, basePath) ?? resolveAsDirectory(vfs, basePath);
 }
 
-export function resolveModule(vfs: VirtualFileSystem, fromDir: string, specifier: string): string {
+export function resolveModule(vfs: FsReader, fromDir: string, specifier: string): string {
   if (specifier.startsWith(".") || isAbsolute(specifier)) {
     const basePath = isAbsolute(specifier) ? specifier : join(fromDir, specifier);
     const resolved = resolveModulePath(vfs, basePath);

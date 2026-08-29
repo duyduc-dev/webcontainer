@@ -18,12 +18,14 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "vitest run"
   },
   "dependencies": {
     "semver": "^7.8.5"
   },
   "devDependencies": {
-    "@types/semver": "^7.8.0"
+    "@types/semver": "^7.8.0",
+    "vitest": "^4.1.11"
   }
 }

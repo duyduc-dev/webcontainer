@@ -1,7 +1,28 @@
 import { DuckWebContainer } from "@dwc/core";
 import { attachTerminal } from "./terminal";
+import { runVerification } from "./verify";
 
 const output = document.getElementById("output")!;
+
+function attachVerificationPanel(dwc: DuckWebContainer) {
+  const button = document.getElementById("run-verification") as HTMLButtonElement;
+  const verifyOutput = document.getElementById("verify-output")!;
+
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    verifyOutput.textContent = "running...";
+    try {
+      const results = await runVerification(dwc);
+      verifyOutput.textContent = results
+        .map((r) => `${r.pass ? "PASS" : "FAIL"}  ${r.name}\n      ${r.detail}`)
+        .join("\n\n");
+    } catch (error) {
+      verifyOutput.textContent = `verification crashed: ${String(error)}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
 
 const main = async () => {
   try {
@@ -73,6 +94,7 @@ server.listen(3000, () => console.log("listening on 3000"));
     previewFrame.src = dwc.preview.url(port);
 
     attachTerminal(dwc, document.getElementById("terminal")!);
+    attachVerificationPanel(dwc);
   } catch (error) {
     console.error("Failed to instantiate DuckWebContainer", error);
     output.textContent = `Failed to instantiate DuckWebContainer: ${String(error)}`;

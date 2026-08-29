@@ -2,13 +2,16 @@ import { ShellContext } from "./builtins";
 import { AsyncCommandResult, DataCallback } from "./commandTypes";
 import { resolvePath } from "./resolvePath";
 import { preloadModules } from "../modules/preload";
+import { createSyncFsBuffer, serviceSyncFsRequest } from "../modules/syncFsServer";
 import { registerPort, unregisterWorkerPorts } from "../process/previewBridge";
 import { KernelWTBEventType } from "../../models/kernel/KernelWorkerToBridgeModels";
+import type { BootMessage } from "../../workers/guest/GuestWorker";
 
 type GuestMessage =
   | { type: "data"; stream: "stdout" | "stderr"; chunk: string }
   | { type: "exit"; exitCode: number }
-  | { type: "listen"; port: number };
+  | { type: "listen"; port: number }
+  | { type: "sync-fs-ping" };
 
 export async function runNode(
   args: string[],
@@ -27,12 +30,42 @@ export async function runNode(
     return { exitCode: 1 };
   }
 
-  let preload;
-  try {
-    preload = preloadModules(ctx.vfs, entryPath);
-  } catch (error) {
-    onData("stderr", `node: ${String(error)}\n`);
-    return { exitCode: 1 };
+  // Cross-origin isolation (COOP/COEP response headers on the host page)
+  // unlocks SharedArrayBuffer, letting require()/fs resolve live against the
+  // kernel VFS instead of a snapshot pre-scanned before boot. Without it,
+  // fall back to today's static-preload behavior, unchanged.
+  const sab = self.crossOriginIsolated ? createSyncFsBuffer() : undefined;
+
+  let bootMessage: BootMessage;
+  if (sab) {
+    bootMessage = {
+      type: "boot",
+      transport: "sync",
+      entryPath,
+      sab,
+      argv: rest,
+      env: ctx.env,
+      cwd: ctx.cwd,
+    };
+  } else {
+    let preload;
+    try {
+      preload = preloadModules(ctx.vfs, entryPath);
+    } catch (error) {
+      onData("stderr", `node: ${String(error)}\n`);
+      return { exitCode: 1 };
+    }
+    bootMessage = {
+      type: "boot",
+      transport: "static",
+      entryPath,
+      sources: [...preload.sources.entries()],
+      resolutions: [...preload.resolutions.entries()],
+      fsFiles: [...preload.fsFiles.entries()],
+      argv: rest,
+      env: ctx.env,
+      cwd: ctx.cwd,
+    };
   }
 
   const worker = new Worker(new URL("../guest/GuestWorker.js", import.meta.url), {
@@ -44,6 +77,8 @@ export async function runNode(
       const message = event.data;
       if (message.type === "data") {
         onData(message.stream, message.chunk);
+      } else if (message.type === "sync-fs-ping") {
+        if (sab) serviceSyncFsRequest(ctx.vfs, sab);
       } else if (message.type === "listen") {
         registerPort(message.port, worker, () => resolve(0));
         self.postMessage({ type: KernelWTBEventType.LISTEN, port: message.port });
@@ -55,16 +90,7 @@ export async function runNode(
         resolve(message.exitCode);
       }
     });
-    worker.postMessage({
-      type: "boot",
-      entryPath,
-      sources: [...preload.sources.entries()],
-      resolutions: [...preload.resolutions.entries()],
-      fsFiles: [...preload.fsFiles.entries()],
-      argv: rest,
-      env: ctx.env,
-      cwd: ctx.cwd,
-    });
+    worker.postMessage(bootMessage);
   });
 
   worker.terminate();

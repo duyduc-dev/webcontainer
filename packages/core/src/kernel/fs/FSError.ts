@@ -4,7 +4,8 @@ export type FSErrorCode =
   | "ENOTDIR"
   | "EISDIR"
   | "ENOTEMPTY"
-  | "EINVAL";
+  | "EINVAL"
+  | "EFBIG";
 
 export class FSError extends Error {
   readonly code: FSErrorCode;

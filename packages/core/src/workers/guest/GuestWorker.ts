@@ -1,10 +1,16 @@
 import { resolutionKey } from "../../kernel/modules/preload";
+import { resolveModule } from "../../kernel/modules/resolve";
+import { FsReaderWithReaddir } from "../../kernel/fs/FsReader";
 import { loadPureBuiltin } from "./builtins";
+import { Buffer } from "./builtins/buffer";
 import { createFsModule } from "./builtins/fs";
 import { createHttpModule, HttpRequestListener } from "./builtins/http";
+import { createStaticFsClient } from "./fsClients/staticFsClient";
+import { createSyncFsClient } from "./fsClients/syncFsClient";
 
-type BootMessage = {
+type StaticBootMessage = {
   type: "boot";
+  transport: "static";
   entryPath: string;
   sources: [string, string][];
   resolutions: [string, string][];
@@ -13,6 +19,20 @@ type BootMessage = {
   env: Record<string, string>;
   cwd: string;
 };
+
+type SyncBootMessage = {
+  type: "boot";
+  transport: "sync";
+  entryPath: string;
+  sab: SharedArrayBuffer;
+  argv: string[];
+  env: Record<string, string>;
+  cwd: string;
+};
+
+// Exported so nodeCommand.ts (kernel-worker side) can type the boot message
+// it sends against the exact same union this worker expects to receive.
+export type BootMessage = StaticBootMessage | SyncBootMessage;
 
 type HttpRequestMessage = {
   type: "http-request";
@@ -28,11 +48,22 @@ type IncomingMessage = BootMessage | HttpRequestMessage;
 type ModuleRecord = { exports: unknown };
 
 const moduleCache = new Map<string, ModuleRecord>();
-let sources: Map<string, string>;
-let resolutions: Map<string, string>;
+let transport: "static" | "sync";
+let fsReader: FsReaderWithReaddir;
 let fsModule: unknown;
 let httpModule: unknown;
 let activeHandler: HttpRequestListener | undefined;
+
+// Static-transport-only: the whole require() graph pre-resolved/pre-read
+// ahead of boot by preload.ts's regex scan.
+let staticSources: Map<string, string>;
+let staticResolutions: Map<string, string>;
+
+// Sync-transport-only: each require() resolution is a live round trip over
+// the SharedArrayBuffer bridge, so cache (fromPath, specifier) -> resolved
+// path the same way preload.ts's ahead-of-time scan would have — just
+// populated lazily instead of eagerly.
+const syncResolutionCache = new Map<string, string>();
 
 function postData(stream: "stdout" | "stderr", chunk: string) {
   self.postMessage({ type: "data", stream, chunk });
@@ -51,28 +82,47 @@ function dirnameOf(path: string): string {
   return index <= 0 ? "/" : path.slice(0, index);
 }
 
+function resolveSync(fromPath: string, specifier: string): string {
+  const key = resolutionKey(fromPath, specifier);
+  const cached = syncResolutionCache.get(key);
+  if (cached) return cached;
+  const resolved = resolveModule(fsReader, dirnameOf(fromPath), specifier);
+  syncResolutionCache.set(key, resolved);
+  return resolved;
+}
+
 function createRequire(fromPath: string) {
   return function guestRequire(specifier: string): unknown {
     // Node builtins always win over node_modules, even if a package shadows
-    // the name — checked before the preloaded-graph lookup below.
+    // the name — checked before either transport's resolution below.
     if (specifier === "fs") return fsModule;
     if (specifier === "http") return httpModule;
     const pureBuiltin = loadPureBuiltin(specifier);
     if (pureBuiltin !== undefined) return pureBuiltin;
 
-    const resolved = resolutions.get(resolutionKey(fromPath, specifier));
-    if (!resolved) {
-      throw new Error(`Cannot find module '${specifier}'`);
+    if (transport === "static") {
+      const resolved = staticResolutions.get(resolutionKey(fromPath, specifier));
+      if (!resolved) throw new Error(`Cannot find module '${specifier}'`);
+      return loadModule(resolved);
     }
-    return loadModule(resolved);
+
+    return loadModule(resolveSync(fromPath, specifier));
   };
+}
+
+function readSyncSource(path: string): string | undefined {
+  try {
+    return new TextDecoder().decode(fsReader.readFile(path));
+  } catch {
+    return undefined;
+  }
 }
 
 function loadModule(path: string): unknown {
   const cached = moduleCache.get(path);
   if (cached) return cached.exports;
 
-  const source = sources.get(path);
+  const source = transport === "static" ? staticSources.get(path) : readSyncSource(path);
   if (source === undefined) {
     throw new Error(`Cannot find module source for '${path}'`);
   }
@@ -169,9 +219,16 @@ self.onmessage = (event: MessageEvent<IncomingMessage>) => {
 
   if (message.type !== "boot") return;
 
-  sources = new Map(message.sources);
-  resolutions = new Map(message.resolutions);
-  fsModule = createFsModule(new Map(message.fsFiles));
+  transport = message.transport;
+  if (message.transport === "static") {
+    staticSources = new Map(message.sources);
+    staticResolutions = new Map(message.resolutions);
+    fsReader = createStaticFsClient(new Map(message.fsFiles));
+  } else {
+    fsReader = createSyncFsClient(message.sab);
+  }
+
+  fsModule = createFsModule(fsReader);
   httpModule = createHttpModule((port, handler) => {
     activeHandler = handler;
     self.postMessage({ type: "listen", port });
@@ -181,6 +238,9 @@ self.onmessage = (event: MessageEvent<IncomingMessage>) => {
     env: message.env,
     cwd: () => message.cwd,
   };
+  // Real Node exposes Buffer as a global, not just via require("buffer") —
+  // an enormous fraction of npm packages reference it unqualified.
+  (self as unknown as { Buffer: unknown }).Buffer = Buffer;
 
   let exitCode = 0;
   try {
