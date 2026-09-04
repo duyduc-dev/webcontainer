@@ -26,7 +26,7 @@ describe("spawnChildWorker", () => {
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = ThrowingWorker;
 
-    expect(() => spawnChildWorker("worker.js", { name: "FsWorker" })).toThrowError(
+    expect(() => spawnChildWorker("worker.js", { name: "FsWorker" })).toThrow(
       expect.objectContaining({ code: "ERR_WORKER" }),
     );
   });

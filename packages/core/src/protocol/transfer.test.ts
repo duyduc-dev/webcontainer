@@ -27,7 +27,7 @@ describe("postWithTransfer", () => {
 
     expect(() =>
       postWithTransfer(target, { id: "1", type: "INIT", payload: { port: port1 } }),
-    ).toThrowError(/payload\.port/);
+    ).toThrow(/payload\.port/);
     expect(target.postMessage).not.toHaveBeenCalled();
 
     port1.close();
@@ -38,6 +38,6 @@ describe("postWithTransfer", () => {
     const buffer = new ArrayBuffer(8);
     const target = { postMessage: vi.fn() };
 
-    expect(() => postWithTransfer(target, { chunks: [buffer] })).toThrowError(/chunks\[0\]/);
+    expect(() => postWithTransfer(target, { chunks: [buffer] })).toThrow(/chunks\[0\]/);
   });
 });

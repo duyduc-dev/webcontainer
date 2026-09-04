@@ -17,12 +17,12 @@ describe("VirtualFileSystem", () => {
 
   it("throws ENOENT reading a file that does not exist", () => {
     const vfs = createVirtualFileSystem();
-    expect(() => vfs.readFile("/missing")).toThrowError(expect.objectContaining({ code: "ENOENT" }));
+    expect(() => vfs.readFile("/missing")).toThrow(expect.objectContaining({ code: "ENOENT" }));
   });
 
   it("throws ENOENT writing into a directory that does not exist", () => {
     const vfs = createVirtualFileSystem();
-    expect(() => vfs.writeFile("/no/such/dir/file.txt", "x")).toThrowError(
+    expect(() => vfs.writeFile("/no/such/dir/file.txt", "x")).toThrow(
       expect.objectContaining({ code: "ENOENT" }),
     );
   });
@@ -38,7 +38,7 @@ describe("VirtualFileSystem", () => {
   it("mkdir throws EEXIST when the directory already exists and recursive is not set", () => {
     const vfs = createVirtualFileSystem();
     vfs.mkdir("/src");
-    expect(() => vfs.mkdir("/src")).toThrowError(expect.objectContaining({ code: "EEXIST" }));
+    expect(() => vfs.mkdir("/src")).toThrow(expect.objectContaining({ code: "EEXIST" }));
   });
 
   it("mkdir with recursive creates intermediate directories and is idempotent", () => {
@@ -51,19 +51,19 @@ describe("VirtualFileSystem", () => {
   it("throws ENOTDIR when traversing through a file as if it were a directory", () => {
     const vfs = createVirtualFileSystem();
     vfs.writeFile("/file", "x");
-    expect(() => vfs.readFile("/file/nested")).toThrowError(expect.objectContaining({ code: "ENOTDIR" }));
+    expect(() => vfs.readFile("/file/nested")).toThrow(expect.objectContaining({ code: "ENOTDIR" }));
   });
 
   it("throws EISDIR reading a directory as a file", () => {
     const vfs = createVirtualFileSystem();
     vfs.mkdir("/dir");
-    expect(() => vfs.readFile("/dir")).toThrowError(expect.objectContaining({ code: "EISDIR" }));
+    expect(() => vfs.readFile("/dir")).toThrow(expect.objectContaining({ code: "EISDIR" }));
   });
 
   it("throws ENOTDIR calling readdir on a file", () => {
     const vfs = createVirtualFileSystem();
     vfs.writeFile("/file", "x");
-    expect(() => vfs.readdir("/file")).toThrowError(expect.objectContaining({ code: "ENOTDIR" }));
+    expect(() => vfs.readdir("/file")).toThrow(expect.objectContaining({ code: "ENOTDIR" }));
   });
 
   it("stat reports file size and kind", () => {
@@ -95,7 +95,7 @@ describe("VirtualFileSystem", () => {
     const vfs = createVirtualFileSystem();
     vfs.mkdir("/dir");
     vfs.writeFile("/dir/file", "x");
-    expect(() => vfs.rm("/dir")).toThrowError(expect.objectContaining({ code: "ENOTEMPTY" }));
+    expect(() => vfs.rm("/dir")).toThrow(expect.objectContaining({ code: "ENOTEMPTY" }));
   });
 
   it("rm with recursive removes a non-empty directory", () => {
@@ -108,7 +108,7 @@ describe("VirtualFileSystem", () => {
 
   it("rm throws ENOENT for a missing path", () => {
     const vfs = createVirtualFileSystem();
-    expect(() => vfs.rm("/missing")).toThrowError(expect.objectContaining({ code: "ENOENT" }));
+    expect(() => vfs.rm("/missing")).toThrow(expect.objectContaining({ code: "ENOENT" }));
   });
 
   it("rename moves a file to a new path", () => {
