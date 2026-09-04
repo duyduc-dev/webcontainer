@@ -8,4 +8,12 @@ export default defineConfig([
     sourcemap: true,
     clean: true,
   },
+  {
+    entry: {
+      "workers/kernel/worker": "src/workers/kernel/worker.ts",
+    },
+    format: ["esm"],
+    sourcemap: true,
+    clean: false,
+  },
 ]);
