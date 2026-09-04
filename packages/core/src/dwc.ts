@@ -1,26 +1,25 @@
 import { createKernelBridge } from "./bridges";
+import type { KernelBridgeOptions } from "./bridges";
+import type { Diagnostics } from "./protocol/diagnostics";
 
 type Unsubscribe = () => void;
-type Handler = (...args: any[]) => void;
+type Handler = (payload?: any) => void;
+
+interface BootDWCOptions extends KernelBridgeOptions {}
 
 interface BootDWCReturn {
+  diagnostics: Diagnostics;
   addEventListener(type: string, handler: Handler): Unsubscribe;
 }
 
-const bootDWC = (): BootDWCReturn => {
-  const kernelBridge = createKernelBridge();
-  const listeners = new Map<string, Set<Handler>>();
+const bootDWC = async (options: BootDWCOptions = {}): Promise<BootDWCReturn> => {
+  const kernelBridge = await createKernelBridge(options);
 
   return {
-    addEventListener: function (type: string, handler: Handler): Unsubscribe {
-      let handlers = listeners.get(type);
-      if (!handlers) listeners.set(type, (handlers = new Set()));
-      handlers.add(handler);
-      return () => {
-        handlers.delete(handler);
-      };
-    },
+    diagnostics: kernelBridge.diagnostics,
+    addEventListener: kernelBridge.on,
   };
 };
 
 export { bootDWC };
+export type { BootDWCOptions, BootDWCReturn };
