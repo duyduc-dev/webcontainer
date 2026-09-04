@@ -1,15 +1,8 @@
-export type FSErrorCode =
-  | "ENOENT"
-  | "EEXIST"
-  | "ENOTDIR"
-  | "EISDIR"
-  | "ENOTEMPTY"
-  | "EINVAL"
-  | "EFBIG";
+type FSErrorCode = "ENOENT" | "EEXIST" | "ENOTDIR" | "EISDIR" | "ENOTEMPTY" | "EINVAL" | "EFBIG";
 
-export class FSError extends Error {
-  readonly code: FSErrorCode;
-  readonly path: string;
+class FSError extends Error {
+  code: FSErrorCode;
+  path: string;
 
   constructor(code: FSErrorCode, path: string, message?: string) {
     super(message ?? `${code}: ${path}`);
@@ -18,3 +11,6 @@ export class FSError extends Error {
     this.path = path;
   }
 }
+
+export { FSError };
+export type { FSErrorCode };

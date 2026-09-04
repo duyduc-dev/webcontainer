@@ -1,104 +1,78 @@
-import { DuckWebContainer } from "@dwc/core";
-import { attachTerminal } from "./terminal";
-import { runVerification } from "./verify";
+import { bootDWC, DWCError } from "@dwc/core";
+import { Terminal } from "@xterm/xterm";
 
-const output = document.getElementById("output")!;
+function pipeToTerminal(stream: ReadableStream<Uint8Array>, terminal: Terminal): void {
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
 
-function attachVerificationPanel(dwc: DuckWebContainer) {
-  const button = document.getElementById("run-verification") as HTMLButtonElement;
-  const verifyOutput = document.getElementById("verify-output")!;
-
-  button.addEventListener("click", async () => {
-    button.disabled = true;
-    verifyOutput.textContent = "running...";
-    try {
-      const results = await runVerification(dwc);
-      verifyOutput.textContent = results
-        .map((r) => `${r.pass ? "PASS" : "FAIL"}  ${r.name}\n      ${r.detail}`)
-        .join("\n\n");
-    } catch (error) {
-      verifyOutput.textContent = `verification crashed: ${String(error)}`;
-    } finally {
-      button.disabled = false;
+  void (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      terminal.write(decoder.decode(value));
     }
-  });
+  })();
 }
 
-const main = async () => {
+async function main() {
+  const terminal = new Terminal({ convertEol: true });
+  terminal.open(document.getElementById("terminal")!);
+
   try {
-    const dwc = DuckWebContainer.initialize();
-    console.log("DuckWebContainer instantiated", dwc);
-    output.textContent = "DuckWebContainer instantiated successfully.";
+    const dwc = await bootDWC();
 
-    await dwc.fs.mkdir("/project", { recursive: true });
-    await dwc.fs.writeFile("/project/hello.txt", "hello world");
-    const content = await dwc.fs.readFile("/project/hello.txt", "utf8");
-    const list = await dwc.fs.readdir("/project");
-    output.textContent = `read back: ${content}, dir: ${list.join(",")}`;
+    dwc.diagnostics.onEvent((event) => {
+      console.log("[dwc]", event.type, event.payload);
+    });
 
-    await dwc.shell.exec("mkdir -p /project");
-    await dwc.shell.exec("cd /project");
-    const pwd = await dwc.shell.exec("pwd");
-    console.log(pwd.stdout); // "/project"
+    dwc.addEventListener("ready", (e) => {
+      console.log("ready", e);
+    });
 
-    // Root-absolute asset paths ("/style.css", "/app.js") exercise the
-    // Service Worker's per-client port tracking: the iframe navigates to a
-    // prefixed URL, but the browser resolves these against the document
-    // itself, so they arrive with no prefix at all.
+    await dwc.fs.mount({
+      "hello.txt": { file: { contents: "Hello, duck-webcontainer!" } },
+      src: {
+        directory: {
+          "index.js": { file: { contents: "console.log('hi');\n" } },
+        },
+      },
+    });
+
+    const contents = await dwc.fs.readFile("/hello.txt");
+    console.log("[dwc] readFile /hello.txt ->", new TextDecoder().decode(contents));
+
+    const entries = await dwc.fs.readdir("/src");
+    console.log("[dwc] readdir /src ->", entries);
+
     await dwc.fs.writeFile(
-      "/project/server.js",
-      String.raw`const http = require("http");
-const server = http.createServer((req, res) => {
-  if (req.url === "/style.css") {
-    res.writeHead(200, { "Content-Type": "text/css" });
-    res.end("body { background: #1e293b; color: #e2e8f0; font-family: sans-serif; }\n");
-    return;
-  }
-  if (req.url === "/app.js") {
-    res.writeHead(200, { "Content-Type": "application/javascript" });
-    res.end("document.getElementById('msg').textContent = 'root-absolute assets loaded!';\n");
-    return;
-  }
-  res.writeHead(200, { "Content-Type": "text/html" });
-  res.end(
-    "<!doctype html>\n" +
-    "<html>\n" +
-    "  <head><link rel='stylesheet' href='/style.css'></head>\n" +
-    "  <body>\n" +
-    "    <p id='msg'>waiting for /app.js...</p>\n" +
-    "    <script src='/app.js'></script>\n" +
-    "  </body>\n" +
-    "</html>\n"
-  );
-});
-server.listen(3000, () => console.log("listening on 3000"));
-`,
+      "/run.js",
+      [
+        "console.log('hello from the process worker');",
+        "console.log('argv:', process.argv.join(' '));",
+        "const fs = require('fs');",
+        "console.log('readFileSync /hello.txt ->', new TextDecoder().decode(fs.readFileSync('/hello.txt')));",
+        "",
+      ].join("\n"),
     );
 
-    // spawn (not exec) since a listening server never exits on its own.
-    const listening = new Promise<number>((resolve) => {
-      const unsubscribe = dwc.on("listen", (event) => {
-        unsubscribe();
-        resolve((event as { port: number }).port);
-      });
-    });
-    const server = await dwc.shell.spawn("node /project/server.js");
-    server.onData((stream, chunk) => console.log(`[server:${stream}]`, chunk));
+    const proc = await dwc.process.spawn("/run.js", { argv: ["--flag"] });
+    pipeToTerminal(proc.stdout, terminal);
+    pipeToTerminal(proc.stderr, terminal);
 
-    const port = await listening;
-    const preview = await dwc.preview.fetch(port, "/");
-    output.textContent += `\npreview [${preview.status}]: ${preview.body}`;
+    const exitCode = await proc.exit;
+    console.log("[dwc] process exited with code", exitCode);
+    terminal.writeln(`\r\n[process exited with code ${exitCode}]`);
 
-    await dwc.preview.enable({ swUrl: "/dwc-preview-sw.js" });
-    const previewFrame = document.getElementById("preview") as HTMLIFrameElement;
-    previewFrame.src = dwc.preview.url(port);
-
-    attachTerminal(dwc, document.getElementById("terminal")!);
-    attachVerificationPanel(dwc);
+    const shellResult = await dwc.shell.exec("mkdir -p /x && echo hi > /x/f && cat /x/f");
+    console.log("[dwc] shell.exec result ->", JSON.stringify(shellResult.output));
+    terminal.writeln(`[shell] mkdir -p /x && echo hi > /x/f && cat /x/f -> ${JSON.stringify(shellResult.output)}`);
   } catch (error) {
-    console.error("Failed to instantiate DuckWebContainer", error);
-    output.textContent = `Failed to instantiate DuckWebContainer: ${String(error)}`;
+    if (error instanceof DWCError) {
+      console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);
+      return;
+    }
+    throw error;
   }
-};
+}
 
 main();

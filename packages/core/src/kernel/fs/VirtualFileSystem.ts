@@ -1,155 +1,175 @@
 import { FSError } from "./FSError";
-import { normalize, dirname, basename } from "./path";
+import { normalize, segments as pathSegments } from "./path";
 
-type DirNode = { type: "dir"; children: Map<string, Node>; mtime: number };
-type FileNode = { type: "file"; content: Uint8Array; mtime: number };
-type Node = DirNode | FileNode;
-
-export type FileStat = { type: "file" | "dir"; size: number; mtime: number };
-
-function segmentsOf(normalizedPath: string): string[] {
-  return normalizedPath === "/" ? [] : normalizedPath.slice(1).split("/");
+interface FileNode {
+  type: "file";
+  contents: Uint8Array;
+  mtimeMs: number;
 }
 
-export class VirtualFileSystem {
-  private readonly root: DirNode = {
-    type: "dir",
-    children: new Map(),
-    mtime: Date.now(),
+interface DirNode {
+  type: "dir";
+  children: Map<string, Node>;
+  mtimeMs: number;
+}
+
+type Node = FileNode | DirNode;
+
+interface Stat {
+  isFile(): boolean;
+  isDirectory(): boolean;
+  size: number;
+  mtimeMs: number;
+}
+
+interface MkdirOptions {
+  recursive?: boolean;
+}
+
+interface RmOptions {
+  recursive?: boolean;
+}
+
+interface VirtualFileSystem {
+  mkdir(path: string, options?: MkdirOptions): void;
+  writeFile(path: string, contents: string | Uint8Array): void;
+  readFile(path: string): Uint8Array;
+  readdir(path: string): string[];
+  stat(path: string): Stat;
+  rm(path: string, options?: RmOptions): void;
+  rename(from: string, to: string): void;
+  exists(path: string): boolean;
+}
+
+const encoder = new TextEncoder();
+
+const createVirtualFileSystem = (): VirtualFileSystem => {
+  const root: DirNode = { type: "dir", children: new Map(), mtimeMs: Date.now() };
+
+  const resolveParent = (normalized: string): { parent: DirNode; name: string } => {
+    const segs = pathSegments(normalized);
+    if (segs.length === 0) {
+      throw new FSError("EINVAL", normalized, "Cannot operate on the root directory");
+    }
+
+    const name = segs[segs.length - 1];
+    let dir = root;
+    for (let i = 0; i < segs.length - 1; i++) {
+      const child = dir.children.get(segs[i]);
+      if (!child) throw new FSError("ENOENT", normalized);
+      if (child.type !== "dir") throw new FSError("ENOTDIR", normalized);
+      dir = child;
+    }
+    return { parent: dir, name };
   };
 
-  private resolveNode(path: string): Node | undefined {
-    const normalized = normalize(path);
-    let current: Node = this.root;
-    for (const segment of segmentsOf(normalized)) {
-      if (current.type !== "dir") return undefined;
-      const next = current.children.get(segment);
-      if (!next) return undefined;
-      current = next;
+  const resolveNode = (normalized: string): Node => {
+    let node: Node = root;
+    for (const segment of pathSegments(normalized)) {
+      if (node.type !== "dir") throw new FSError("ENOTDIR", normalized);
+      const child = node.children.get(segment);
+      if (!child) throw new FSError("ENOENT", normalized);
+      node = child;
     }
-    return current;
-  }
-
-  private getDir(path: string): DirNode {
-    const node = this.resolveNode(path);
-    if (!node) throw new FSError("ENOENT", path);
-    if (node.type !== "dir") throw new FSError("ENOTDIR", path);
     return node;
-  }
+  };
 
-  exists(path: string): boolean {
-    return this.resolveNode(path) !== undefined;
-  }
-
-  mkdir(path: string, opts?: { recursive?: boolean }): void {
+  const mkdir = (path: string, options: MkdirOptions = {}): void => {
     const normalized = normalize(path);
-    if (normalized === "/") {
-      if (opts?.recursive) return;
-      throw new FSError("EEXIST", path);
-    }
+    const segs = pathSegments(normalized);
+    if (segs.length === 0) return;
 
-    if (opts?.recursive) {
-      let current = this.root;
-      let builtPath = "";
-      for (const segment of segmentsOf(normalized)) {
-        builtPath += `/${segment}`;
-        let next = current.children.get(segment);
-        if (!next) {
-          next = { type: "dir", children: new Map(), mtime: Date.now() };
-          current.children.set(segment, next);
-        } else if (next.type !== "dir") {
-          throw new FSError("ENOTDIR", builtPath);
-        }
-        current = next;
-      }
+    if (!options.recursive) {
+      const { parent, name } = resolveParent(normalized);
+      if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
+      parent.children.set(name, { type: "dir", children: new Map(), mtimeMs: Date.now() });
       return;
     }
 
-    const parent = this.getDir(dirname(normalized));
-    const name = basename(normalized);
-    if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
-    parent.children.set(name, {
-      type: "dir",
-      children: new Map(),
-      mtime: Date.now(),
-    });
-  }
+    let dir = root;
+    for (const segment of segs) {
+      let child = dir.children.get(segment);
+      if (!child) {
+        child = { type: "dir", children: new Map(), mtimeMs: Date.now() };
+        dir.children.set(segment, child);
+      } else if (child.type !== "dir") {
+        throw new FSError("ENOTDIR", normalized);
+      }
+      dir = child;
+    }
+  };
 
-  writeFile(path: string, data: Uint8Array): void {
+  const writeFile = (path: string, contents: string | Uint8Array): void => {
     const normalized = normalize(path);
-    if (normalized === "/") throw new FSError("EISDIR", path);
+    const { parent, name } = resolveParent(normalized);
 
-    const parent = this.getDir(dirname(normalized));
-    const name = basename(normalized);
     const existing = parent.children.get(name);
-    if (existing?.type === "dir") throw new FSError("EISDIR", normalized);
+    if (existing && existing.type === "dir") throw new FSError("EISDIR", normalized);
 
-    parent.children.set(name, {
-      type: "file",
-      content: data,
-      mtime: Date.now(),
-    });
-  }
+    const bytes = typeof contents === "string" ? encoder.encode(contents) : contents;
+    parent.children.set(name, { type: "file", contents: bytes, mtimeMs: Date.now() });
+  };
 
-  readFile(path: string): Uint8Array {
-    const node = this.resolveNode(path);
-    if (!node) throw new FSError("ENOENT", path);
-    if (node.type === "dir") throw new FSError("EISDIR", path);
-    return node.content;
-  }
-
-  readdir(path: string): string[] {
-    const node = this.resolveNode(path);
-    if (!node) throw new FSError("ENOENT", path);
-    if (node.type !== "dir") throw new FSError("ENOTDIR", path);
-    return [...node.children.keys()];
-  }
-
-  stat(path: string): FileStat {
-    const node = this.resolveNode(path);
-    if (!node) throw new FSError("ENOENT", path);
-    return node.type === "dir"
-      ? { type: "dir", size: 0, mtime: node.mtime }
-      : { type: "file", size: node.content.byteLength, mtime: node.mtime };
-  }
-
-  rm(path: string, opts?: { recursive?: boolean }): void {
+  const readFile = (path: string): Uint8Array => {
     const normalized = normalize(path);
-    if (normalized === "/")
-      throw new FSError("EINVAL", path, "cannot remove root");
+    const node = resolveNode(normalized);
+    if (node.type !== "file") throw new FSError("EISDIR", normalized);
+    return node.contents;
+  };
 
-    const node = this.resolveNode(normalized);
-    if (!node) throw new FSError("ENOENT", path);
-    if (node.type === "dir" && node.children.size > 0 && !opts?.recursive) {
-      throw new FSError("ENOTEMPTY", path);
+  const readdir = (path: string): string[] => {
+    const normalized = normalize(path);
+    const node = resolveNode(normalized);
+    if (node.type !== "dir") throw new FSError("ENOTDIR", normalized);
+    return [...node.children.keys()].sort();
+  };
+
+  const stat = (path: string): Stat => {
+    const normalized = normalize(path);
+    const node = resolveNode(normalized);
+    return {
+      isFile: () => node.type === "file",
+      isDirectory: () => node.type === "dir",
+      size: node.type === "file" ? node.contents.byteLength : 0,
+      mtimeMs: node.mtimeMs,
+    };
+  };
+
+  const rm = (path: string, options: RmOptions = {}): void => {
+    const normalized = normalize(path);
+    const { parent, name } = resolveParent(normalized);
+
+    const node = parent.children.get(name);
+    if (!node) throw new FSError("ENOENT", normalized);
+    if (node.type === "dir" && node.children.size > 0 && !options.recursive) {
+      throw new FSError("ENOTEMPTY", normalized);
     }
+    parent.children.delete(name);
+  };
 
-    const parent = this.getDir(dirname(normalized));
-    parent.children.delete(basename(normalized));
-  }
-
-  rename(from: string, to: string): void {
+  const rename = (from: string, to: string): void => {
     const normalizedFrom = normalize(from);
-    const normalizedTo = normalize(to);
-    if (normalizedFrom === "/")
-      throw new FSError("EINVAL", from, "cannot rename root");
+    const { parent: fromParent, name: fromName } = resolveParent(normalizedFrom);
 
-    const node = this.resolveNode(normalizedFrom);
-    if (!node) throw new FSError("ENOENT", from);
+    const node = fromParent.children.get(fromName);
+    if (!node) throw new FSError("ENOENT", normalizedFrom);
 
-    const toParent = this.getDir(dirname(normalizedTo));
-    const toName = basename(normalizedTo);
-    const existing = toParent.children.get(toName);
-    if (existing && existing.type !== node.type) {
-      throw new FSError(
-        "EINVAL",
-        to,
-        "cannot rename across different node types",
-      );
-    }
-
+    const { parent: toParent, name: toName } = resolveParent(normalize(to));
+    fromParent.children.delete(fromName);
     toParent.children.set(toName, node);
-    const fromParent = this.getDir(dirname(normalizedFrom));
-    fromParent.children.delete(basename(normalizedFrom));
-  }
-}
+  };
+
+  const exists = (path: string): boolean => {
+    try {
+      resolveNode(normalize(path));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  return { mkdir, writeFile, readFile, readdir, stat, rm, rename, exists };
+};
+
+export { createVirtualFileSystem };
+export type { DirNode, FileNode, MkdirOptions, Node, RmOptions, Stat, VirtualFileSystem };
