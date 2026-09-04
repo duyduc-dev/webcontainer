@@ -1,11 +1,13 @@
 import { DWCError, ERR_INTERNAL } from "../../protocol/errors";
 import type { RequestEnvelope } from "../../protocol/envelope";
-import { createProcessTable } from "./processTable";
-import { createRouter } from "./router";
+import { createProcessTable } from "../../kernel/processTable";
+import { createRouter } from "../../kernel/router";
+import { createFsClient } from "./fsClient";
 import { postErrorReply, postReply } from "./service";
 
 const processTable = createProcessTable();
 const router = createRouter();
+const fsClient = createFsClient();
 
 router.handle("PING", () => "PONG");
 router.handle("INITIALIZE", () => {
@@ -13,6 +15,7 @@ router.handle("INITIALIZE", () => {
   return undefined;
 });
 router.handle("PROCESS_LIST", () => processTable.list());
+router.handle("FS_REQUEST", (payload) => fsClient.request(payload));
 
 self.onmessage = async (event: MessageEvent<RequestEnvelope>) => {
   const { id, type, payload } = event.data;

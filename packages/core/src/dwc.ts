@@ -1,3 +1,5 @@
+import { createFileSystemAPI } from "./apis/FileSystem";
+import type { FileSystemAPI } from "./apis/FileSystem";
 import { createKernelBridge } from "./bridges";
 import type { KernelBridgeOptions } from "./bridges";
 import type { Diagnostics } from "./protocol/diagnostics";
@@ -9,6 +11,7 @@ interface BootDWCOptions extends KernelBridgeOptions {}
 
 interface BootDWCReturn {
   diagnostics: Diagnostics;
+  fs: FileSystemAPI;
   addEventListener(type: string, handler: Handler): Unsubscribe;
 }
 
@@ -17,6 +20,7 @@ const bootDWC = async (options: BootDWCOptions = {}): Promise<BootDWCReturn> => 
 
   return {
     diagnostics: kernelBridge.diagnostics,
+    fs: createFileSystemAPI(kernelBridge.request),
     addEventListener: kernelBridge.on,
   };
 };

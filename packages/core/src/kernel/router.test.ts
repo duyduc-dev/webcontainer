@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DWCError } from "../../protocol/errors";
+import { DWCError } from "../protocol/errors";
 import { createRouter } from "./router";
 
 describe("router", () => {

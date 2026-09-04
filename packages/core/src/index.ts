@@ -8,3 +8,7 @@ export {
   ERR_NOT_ISOLATED,
   ERR_WORKER,
 } from "./protocol/errors";
+export { FSError } from "./kernel/fs/FSError";
+export type { FSErrorCode } from "./kernel/fs/FSError";
+export type { DirectoryEntry, FileEntry, FileSystemTree } from "./kernel/fs/mount";
+export type { FileSystemAPI, MkdirOptions, RmOptions, StatResult } from "./apis/FileSystem";

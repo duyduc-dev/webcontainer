@@ -1,4 +1,4 @@
-import { DWCError, ERR_NOT_IMPLEMENTED } from "../../protocol/errors";
+import { DWCError, ERR_NOT_IMPLEMENTED } from "../protocol/errors";
 
 type Handler = (payload: unknown) => unknown | Promise<unknown>;
 
