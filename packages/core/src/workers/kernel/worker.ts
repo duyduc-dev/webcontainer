@@ -1,22 +1,32 @@
-import { ERR_NOT_IMPLEMENTED } from "../../protocol/errors";
+import { DWCError, ERR_INTERNAL } from "../../protocol/errors";
 import type { RequestEnvelope } from "../../protocol/envelope";
+import { createProcessTable } from "./processTable";
+import { createRouter } from "./router";
 import { postErrorReply, postReply } from "./service";
 
-self.onmessage = (event: MessageEvent<RequestEnvelope>) => {
-  const { id, type } = event.data;
+const processTable = createProcessTable();
+const router = createRouter();
 
-  if (type === "PING") {
-    postReply(id, "PONG");
-    return;
+router.handle("PING", () => "PONG");
+router.handle("INITIALIZE", () => {
+  initialize();
+  return undefined;
+});
+router.handle("PROCESS_LIST", () => processTable.list());
+
+self.onmessage = async (event: MessageEvent<RequestEnvelope>) => {
+  const { id, type, payload } = event.data;
+
+  try {
+    const result = await router.dispatch(type, payload);
+    postReply(id, result);
+  } catch (error) {
+    if (error instanceof DWCError) {
+      postErrorReply(id, error.code, error.message);
+      return;
+    }
+    postErrorReply(id, ERR_INTERNAL, error instanceof Error ? error.message : String(error));
   }
-
-  if (type === "INITIALIZE") {
-    initialize();
-    postReply(id, undefined);
-    return;
-  }
-
-  postErrorReply(id, ERR_NOT_IMPLEMENTED, `Unknown request type: ${type}`);
 };
 
 function initialize() {}
