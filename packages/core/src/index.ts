@@ -13,3 +13,4 @@ export type { FSErrorCode } from "./kernel/fs/FSError";
 export type { DirectoryEntry, FileEntry, FileSystemTree } from "./kernel/fs/mount";
 export type { FileSystemAPI, MkdirOptions, RmOptions, StatResult } from "./apis/FileSystem";
 export type { ProcessAPI, ProcessHandle, SpawnOptions } from "./apis/Process";
+export type { ShellAPI, ShellExecResult } from "./apis/Shell";

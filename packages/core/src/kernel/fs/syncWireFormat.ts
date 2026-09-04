@@ -1,10 +1,6 @@
 import type { FSErrorCode } from "./FSError";
 
-/**
- * Binary frame layout for the future SharedArrayBuffer sync fs bridge (Phase 5).
- * The blocking client (Atomics.wait) is built then - this file only defines the
- * shared encode/decode contract, which is pure and fully testable in Node now.
- */
+/** Binary frame layout for the SharedArrayBuffer sync fs bridge (client added in Phase 5). */
 
 const FS_SYNC_STATE_IDLE = 0;
 const FS_SYNC_STATE_REQUESTED = 1;
@@ -15,6 +11,9 @@ const FS_SYNC_STATE_ABANDONED = 3;
 const FS_SYNC_STATE_INDEX = 0;
 const FS_SYNC_LENGTH_INDEX = 1;
 const FS_SYNC_CONTROL_LENGTH = 2;
+
+/** Default data buffer size (bytes) for one sync fs channel. */
+const FS_SYNC_DATA_BUFFER_SIZE = 1024 * 1024;
 
 enum FsOp {
   READ_FILE = 1,
@@ -275,6 +274,7 @@ export {
   encodeFsRequest,
   encodeFsResponse,
   FS_SYNC_CONTROL_LENGTH,
+  FS_SYNC_DATA_BUFFER_SIZE,
   FS_SYNC_LENGTH_INDEX,
   FS_SYNC_STATE_ABANDONED,
   FS_SYNC_STATE_IDLE,

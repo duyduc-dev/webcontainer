@@ -46,7 +46,13 @@ async function main() {
 
     await dwc.fs.writeFile(
       "/run.js",
-      "console.log('hello from the process worker');\nconsole.log('argv:', process.argv.join(' '));\n",
+      [
+        "console.log('hello from the process worker');",
+        "console.log('argv:', process.argv.join(' '));",
+        "const fs = require('fs');",
+        "console.log('readFileSync /hello.txt ->', new TextDecoder().decode(fs.readFileSync('/hello.txt')));",
+        "",
+      ].join("\n"),
     );
 
     const proc = await dwc.process.spawn("/run.js", { argv: ["--flag"] });
@@ -56,6 +62,10 @@ async function main() {
     const exitCode = await proc.exit;
     console.log("[dwc] process exited with code", exitCode);
     terminal.writeln(`\r\n[process exited with code ${exitCode}]`);
+
+    const shellResult = await dwc.shell.exec("mkdir -p /x && echo hi > /x/f && cat /x/f");
+    console.log("[dwc] shell.exec result ->", JSON.stringify(shellResult.output));
+    terminal.writeln(`[shell] mkdir -p /x && echo hi > /x/f && cat /x/f -> ${JSON.stringify(shellResult.output)}`);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

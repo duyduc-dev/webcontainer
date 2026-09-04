@@ -61,6 +61,15 @@ describe("moduleLoader", () => {
     expect(typeof result.join).toBe("function");
   });
 
+  it("resolves a per-instance builtin override (e.g. a process-specific fs)", () => {
+    const loader = createModuleLoader({
+      sources: { "/index.js": "module.exports = require('fs').marker;" },
+      builtins: { fs: { marker: "injected" } },
+    });
+
+    expect(loader.run("/index.js")).toBe("injected");
+  });
+
   it("throws a clear error for an unsupported bare (npm) specifier", () => {
     const loader = createModuleLoader({
       sources: { "/index.js": "require('left-pad');" },

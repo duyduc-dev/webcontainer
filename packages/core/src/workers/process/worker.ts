@@ -1,6 +1,17 @@
+import { createFsBuiltin } from "../../runtime/builtins/fs";
+import type { FsBuiltin, FsBuiltinIO } from "../../runtime/builtins/fs";
 import { createEventLoop } from "../../runtime/eventLoop";
 import { createModuleLoader } from "../../runtime/moduleLoader";
+import { runShellLine } from "../../shell/Shell";
+import { callSyncFs } from "./syncFsClient";
+import type { SyncFsChannel } from "./syncFsClient";
 import { postEvent } from "./service";
+
+interface SyncFsChannelPayload {
+  port: MessagePort;
+  control: SharedArrayBuffer;
+  data: SharedArrayBuffer;
+}
 
 interface BootPayload {
   entryPath: string;
@@ -8,6 +19,13 @@ interface BootPayload {
   argv: string[];
   env: Record<string, string>;
   cwd: string;
+  syncFs: SyncFsChannelPayload | null;
+}
+
+interface BootShellPayload {
+  line: string;
+  cwd: string;
+  syncFs: SyncFsChannelPayload | null;
 }
 
 const encoder = new TextEncoder();
@@ -23,6 +41,17 @@ const exitProcess = (code: number): void => {
 
 const write = (stream: "stdout" | "stderr", text: string): void => {
   postEvent(stream, { chunk: encoder.encode(text) });
+};
+
+const createFsBuiltinFromPayload = (syncFs: SyncFsChannelPayload | null): FsBuiltin => {
+  const io: FsBuiltinIO = {};
+
+  if (syncFs) {
+    const channel: SyncFsChannel = { port: syncFs.port, control: new Int32Array(syncFs.control), data: syncFs.data };
+    io.callSync = (request) => callSyncFs(channel, request);
+  }
+
+  return createFsBuiltin(io);
 };
 
 const boot = (payload: BootPayload): void => {
@@ -56,7 +85,10 @@ const boot = (payload: BootPayload): void => {
     clearImmediate: eventLoop.clearImmediate,
   });
 
-  const moduleLoader = createModuleLoader({ sources: payload.sources });
+  const moduleLoader = createModuleLoader({
+    sources: payload.sources,
+    builtins: { fs: createFsBuiltinFromPayload(payload.syncFs) },
+  });
 
   try {
     moduleLoader.run(payload.entryPath);
@@ -69,6 +101,16 @@ const boot = (payload: BootPayload): void => {
   void drain(eventLoop).then(() => exitProcess(exitCode));
 };
 
+const bootShell = (payload: BootShellPayload): void => {
+  try {
+    const fs = createFsBuiltinFromPayload(payload.syncFs);
+    const result = runShellLine(payload.line, payload.cwd, fs);
+    postEvent("shell-result", result);
+  } catch (error) {
+    postEvent("shell-error", { message: error instanceof Error ? error.message : String(error) });
+  }
+};
+
 const drain = async (eventLoop: ReturnType<typeof createEventLoop>): Promise<void> => {
   while (eventLoop.hasPendingWork()) {
     const didWork = await eventLoop.runOnce();
@@ -78,4 +120,5 @@ const drain = async (eventLoop: ReturnType<typeof createEventLoop>): Promise<voi
 
 self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   if (event.data.type === "boot") boot(event.data.payload as BootPayload);
+  else if (event.data.type === "boot-shell") bootShell(event.data.payload as BootShellPayload);
 };

@@ -4,6 +4,8 @@ import { relativeModuleCandidates } from "./resolveSpecifier";
 
 interface ModuleLoaderOptions {
   sources: Record<string, string>;
+  /** Extra/overriding builtins (e.g. a per-process `fs`) merged over the static registry. */
+  builtins?: Record<string, unknown>;
 }
 
 interface ModuleRecord {
@@ -29,15 +31,16 @@ const resolveRelative = (fromPath: string, specifier: string, sources: Record<st
  */
 const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
   const { sources } = options;
+  const builtins = { ...builtinModules, ...options.builtins };
   const cache = new Map<string, ModuleRecord>();
 
   const createRequire = (fromPath: string) => {
     return (specifier: string): unknown => {
-      if (specifier in builtinModules) return builtinModules[specifier];
+      if (specifier in builtins) return builtins[specifier];
 
       if (!specifier.startsWith(".")) {
         throw new Error(
-          `Cannot find module '${specifier}': only relative requires and builtins (${Object.keys(builtinModules).join(", ")}) are supported`,
+          `Cannot find module '${specifier}': only relative requires and builtins (${Object.keys(builtins).join(", ")}) are supported`,
         );
       }
 

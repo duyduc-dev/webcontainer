@@ -1,6 +1,7 @@
 import { FSError } from "../../kernel/fs/FSError";
 import type { FileSystemTree } from "../../kernel/fs/mount";
 import { mount } from "../../kernel/fs/mount";
+import { serviceSyncFsRequest } from "../../kernel/fs/syncServer";
 import { createVirtualFileSystem } from "../../kernel/fs/VirtualFileSystem";
 import type { RequestEnvelope } from "../../protocol/envelope";
 import { ERR_INTERNAL } from "../../protocol/errors";
@@ -49,9 +50,28 @@ const handleFsRequest = (payload: FsRequestPayload): unknown => {
   }
 };
 
-self.onmessage = (event: MessageEvent<RequestEnvelope<FsRequestPayload>>) => {
-  const { id, payload } = event.data;
+interface AttachSyncChannelPayload {
+  port: MessagePort;
+  control: SharedArrayBuffer;
+  data: SharedArrayBuffer;
+}
 
+const attachSyncChannel = (payload: AttachSyncChannelPayload): void => {
+  const control = new Int32Array(payload.control);
+  payload.port.onmessage = () => serviceSyncFsRequest(vfs, control, payload.data);
+};
+
+type AttachSyncChannelMessage = { type: "ATTACH_SYNC_CHANNEL"; payload: AttachSyncChannelPayload };
+
+self.onmessage = (event: MessageEvent<RequestEnvelope<FsRequestPayload> | AttachSyncChannelMessage>) => {
+  const data = event.data;
+
+  if (data.type === "ATTACH_SYNC_CHANNEL") {
+    attachSyncChannel((data as AttachSyncChannelMessage).payload);
+    return;
+  }
+
+  const { id, payload } = data as RequestEnvelope<FsRequestPayload>;
   try {
     postReply(id, handleFsRequest(payload as FsRequestPayload));
   } catch (error) {

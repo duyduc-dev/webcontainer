@@ -4,8 +4,16 @@ import { DWCError } from "../../protocol/errors";
 import { postWithTransfer } from "../../protocol/transfer";
 import { spawnChildWorker } from "./spawn";
 
+interface SyncChannelPayload {
+  port: MessagePort;
+  control: SharedArrayBuffer;
+  data: SharedArrayBuffer;
+}
+
 interface FsClient {
   request<T = unknown>(payload: unknown): Promise<T>;
+  /** Fire-and-forget: hands the FS Worker its half of a per-process sync fs channel. */
+  attachSyncChannel(payload: SyncChannelPayload): void;
 }
 
 /** Lazily spawns the FS Worker on first use and proxies FS_REQUEST envelopes to it. */
@@ -41,6 +49,10 @@ const createFsClient = (): FsClient => {
         pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
         postWithTransfer(fsWorker, createRequest(id, "FS_REQUEST", payload));
       });
+    },
+    attachSyncChannel(payload: SyncChannelPayload): void {
+      const fsWorker = ensureWorker();
+      postWithTransfer(fsWorker, { type: "ATTACH_SYNC_CHANNEL", payload }, [payload.port]);
     },
   };
 };
