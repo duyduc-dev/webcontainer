@@ -88,6 +88,7 @@ const boot = (payload: BootPayload): void => {
   const moduleLoader = createModuleLoader({
     sources: payload.sources,
     builtins: { fs: createFsBuiltinFromPayload(payload.syncFs) },
+    process: processGlobal,
   });
 
   try {

@@ -1,4 +1,4 @@
-import { builtinModules } from "./builtins";
+import { isBuiltinSpecifier } from "./builtins";
 import { relativeModuleCandidates } from "./resolveSpecifier";
 
 type ReadFile = (path: string) => Promise<string>;
@@ -46,7 +46,7 @@ const preloadModuleGraph = async (entryPath: string, readFile: ReadFile): Promis
     const source = sources[path];
 
     for (const specifier of extractRequireSpecifiers(source)) {
-      if (specifier in builtinModules || !specifier.startsWith(".")) continue;
+      if (isBuiltinSpecifier(specifier) || !specifier.startsWith(".")) continue;
 
       const resolved = await tryReadFirstExisting(relativeModuleCandidates(path, specifier), readFile);
       if (!resolved || seen.has(resolved.path)) continue;
