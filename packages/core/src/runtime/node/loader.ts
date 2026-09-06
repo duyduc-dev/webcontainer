@@ -23,6 +23,11 @@ import streamConsumersFactory from "./lib/stream/consumers";
 import streamPromisesFactory from "./lib/stream/promises";
 import bufferFactory from "./lib/buffer";
 import stringDecoderFactory from "./lib/string_decoder";
+import httpFactory from "./lib/http";
+import httpsFactory from "./lib/https";
+import cryptoFactory from "./lib/crypto";
+import zlibFactory from "./lib/zlib";
+import asyncHooksFactory from "./lib/async_hooks";
 
 import internalBufferFactory from "./internal/buffer";
 import utilFactory from "./internal/util";
@@ -43,6 +48,7 @@ import webstreamsAdaptersFactory from "./internal/webstreams/adapters";
 import blobFactory from "./internal/blob";
 import optionsFactory from "./internal/options";
 import startupSnapshotFactory from "./internal/v8/startup_snapshot";
+import fetchTransportFactory from "./internal/fetch-transport";
 
 import streamsAddAbortSignalFactory from "./internal/streams/add-abort-signal";
 import streamsComposeFactory from "./internal/streams/compose";
@@ -80,6 +86,11 @@ const FACTORIES: Record<string, NodeFactory> = {
   "stream/promises": streamPromisesFactory,
   buffer: bufferFactory,
   string_decoder: stringDecoderFactory,
+  http: httpFactory,
+  https: httpsFactory,
+  crypto: cryptoFactory,
+  zlib: zlibFactory,
+  async_hooks: asyncHooksFactory,
 
   "internal/buffer": internalBufferFactory,
   "internal/util": utilFactory,
@@ -101,6 +112,7 @@ const FACTORIES: Record<string, NodeFactory> = {
   "internal/blob": blobFactory,
   "internal/options": optionsFactory,
   "internal/v8/startup_snapshot": startupSnapshotFactory,
+  "internal/fetch-transport": fetchTransportFactory,
 
   "internal/streams/add-abort-signal": streamsAddAbortSignalFactory,
   "internal/streams/compose": streamsComposeFactory,

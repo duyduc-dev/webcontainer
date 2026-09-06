@@ -26,6 +26,12 @@ interface EventLoop {
    * the whole immediate queue. Returns false when nothing is ready right now.
    */
   runOnce(): Promise<boolean>;
+  /** Marks one external async operation (e.g. an in-flight network request) as
+   * keeping the loop alive, mirroring Node's active-handle refcount — otherwise
+   * a request awaited only via a native Promise (no nextTick/timer/immediate of
+   * its own until the reply arrives) would look like "no work" and exit early. */
+  ref(): void;
+  unref(): void;
 }
 
 interface CreateEventLoopOptions {
@@ -39,9 +45,24 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
   const timers = new Map<number, Timer>();
   const immediates = new Map<number, Immediate>();
   let nextId = 1;
+  let activeHandles = 0;
+  let wakeResolvers: (() => void)[] = [];
+
+  /** Resolves every pending waitForWake() call — used whenever new work appears
+   * (a nextTick/immediate) or an active handle's work finishes, so runOnce()'s
+   * "wait for an active handle" branch doesn't hang past the point of interest. */
+  const wake = (): void => {
+    if (wakeResolvers.length === 0) return;
+    const resolvers = wakeResolvers;
+    wakeResolvers = [];
+    for (const resolve of resolvers) resolve();
+  };
+
+  const waitForWake = (): Promise<void> => new Promise((resolve) => wakeResolvers.push(resolve));
 
   const nextTick = (fn: Task, ...args: unknown[]): void => {
     nextTickQueue.push({ fn, args });
+    wake();
   };
 
   const setTimeoutFn = (fn: Task, delayMs = 0, ...args: unknown[]): number => {
@@ -57,6 +78,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
   const setImmediateFn = (fn: Task, ...args: unknown[]): number => {
     const id = nextId++;
     immediates.set(id, { id, fn, args });
+    wake();
     return id;
   };
 
@@ -64,7 +86,8 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
     immediates.delete(id);
   };
 
-  const hasPendingWork = (): boolean => nextTickQueue.length > 0 || timers.size > 0 || immediates.size > 0;
+  const hasPendingWork = (): boolean =>
+    nextTickQueue.length > 0 || timers.size > 0 || immediates.size > 0 || activeHandles > 0;
 
   const yieldToMicrotasks = (): Promise<void> =>
     new Promise((resolve) => {
@@ -106,7 +129,25 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
       return true;
     }
 
+    // Nothing is ready to run right now, but an active handle (e.g. an in-flight
+    // network request) means the loop isn't actually done — its reply arrives via
+    // a real message from another worker, not anything already queued here, so
+    // wait for that to happen (it will call nextTick/unref, both of which wake()).
+    if (activeHandles > 0) {
+      await waitForWake();
+      return true;
+    }
+
     return false;
+  };
+
+  const ref = (): void => {
+    activeHandles++;
+  };
+
+  const unref = (): void => {
+    activeHandles = Math.max(0, activeHandles - 1);
+    wake();
   };
 
   return {
@@ -117,6 +158,8 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
     clearImmediate: clearImmediateFn,
     hasPendingWork,
     runOnce,
+    ref,
+    unref,
   };
 };
 

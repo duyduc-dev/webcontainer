@@ -2,6 +2,8 @@ import { DWCError, ERR_INTERNAL } from "../../protocol/errors";
 import type { RequestEnvelope } from "../../protocol/envelope";
 import { createProcessTable } from "../../kernel/processTable";
 import { createRouter } from "../../kernel/router";
+import { createFetcherClient } from "./fetcherClient";
+import type { NetRequestPayload } from "./fetcherClient";
 import { createFsClient } from "./fsClient";
 import { createProcessClient } from "./processClient";
 import type { ShellExecPayload, SpawnPayload } from "./processClient";
@@ -10,7 +12,8 @@ import { postErrorReply, postReply } from "./service";
 const processTable = createProcessTable();
 const router = createRouter();
 const fsClient = createFsClient();
-const processClient = createProcessClient(fsClient, processTable);
+const fetcherClient = createFetcherClient();
+const processClient = createProcessClient(fsClient, processTable, fetcherClient);
 
 router.handle("PING", () => "PONG");
 router.handle("INITIALIZE", () => {
@@ -19,6 +22,7 @@ router.handle("INITIALIZE", () => {
 });
 router.handle("PROCESS_LIST", () => processTable.list());
 router.handle("FS_REQUEST", (payload) => fsClient.request(payload));
+router.handle("NET_REQUEST", (payload) => fetcherClient.request(payload as NetRequestPayload));
 router.handle("PROCESS_SPAWN", (payload) => processClient.spawn(payload as SpawnPayload));
 router.handle("SHELL_EXEC", (payload) => processClient.runShell(payload as ShellExecPayload));
 
@@ -38,3 +42,4 @@ self.onmessage = async (event: MessageEvent<RequestEnvelope>) => {
 };
 
 function initialize() {}
+

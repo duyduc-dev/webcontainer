@@ -1,7 +1,9 @@
 import type { ProcessTable } from "../../kernel/processTable";
 import { FS_SYNC_CONTROL_LENGTH, FS_SYNC_DATA_BUFFER_SIZE } from "../../kernel/fs/syncWireFormat";
+import { DWCError, ERR_INTERNAL } from "../../protocol/errors";
 import { postWithTransfer } from "../../protocol/transfer";
 import { preloadModuleGraph } from "../../runtime/preload";
+import type { FetcherClient, NetRequestPayload } from "./fetcherClient";
 import type { FsClient } from "./fsClient";
 import { postEvent } from "./service";
 import { spawnChildWorker } from "./spawn";
@@ -48,8 +50,24 @@ const createSyncFsChannelFor = (fsClient: FsClient): { port: MessagePort; contro
   return { port: port1, control, data };
 };
 
+/** Forwards a spawned process's outbound "net-request" messages to the Fetcher
+ * Worker (via the kernel's fetcherClient) and relays the reply back as a
+ * "net-response" — the process worker has no channel of its own to the
+ * network, only this bidirectional link back to whoever spawned it. */
+const forwardNetRequest = (worker: Worker, fetcherClient: FetcherClient, eventPayload: { id: string; [key: string]: unknown }): void => {
+  const { id: netId, ...netPayload } = eventPayload;
+  fetcherClient
+    .request(netPayload as unknown as NetRequestPayload)
+    .then((result) => worker.postMessage({ type: "net-response", payload: { id: netId, ok: true, result } }))
+    .catch((error: unknown) => {
+      const code = error instanceof DWCError ? error.code : ERR_INTERNAL;
+      const message = error instanceof Error ? error.message : String(error);
+      worker.postMessage({ type: "net-response", payload: { id: netId, ok: false, error: { code, message } } });
+    });
+};
+
 /** Preloads the require() graph via the FS worker, then spawns a Process Worker to run it. */
-const createProcessClient = (fsClient: FsClient, processTable: ProcessTable): ProcessClient => {
+const createProcessClient = (fsClient: FsClient, processTable: ProcessTable, fetcherClient: FetcherClient): ProcessClient => {
   const spawn = async (payload: SpawnPayload): Promise<{ processId: string }> => {
     const { entryPath, argv = [], env = {}, cwd = "/" } = payload;
 
@@ -65,6 +83,11 @@ const createProcessClient = (fsClient: FsClient, processTable: ProcessTable): Pr
 
       if (type === "stdout" || type === "stderr") {
         postEvent(`process:${type}`, { processId, chunk: eventPayload.chunk });
+        return;
+      }
+
+      if (type === "net-request") {
+        forwardNetRequest(worker, fetcherClient, eventPayload);
         return;
       }
 

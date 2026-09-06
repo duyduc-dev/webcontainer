@@ -28,10 +28,65 @@ interface BootShellPayload {
   syncFs: SyncFsChannelPayload | null;
 }
 
+interface NetReply {
+  status: number;
+  statusText: string;
+  ok: boolean;
+  headers: Record<string, string>;
+  bodyBytes: ArrayBuffer;
+}
+
+interface NetRequestInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: Uint8Array;
+}
+
 const encoder = new TextEncoder();
 
 let exitCode = 0;
 let exited = false;
+const pendingNetRequests = new Map<string, { resolve: (reply: NetReply) => void; reject: (error: unknown) => void }>();
+
+/** Bridges the guest realm's globalThis.__dwcFetchAsync (see internal/fetch-transport.js)
+ * up through the kernel to the Fetcher Worker — the only place with real network access.
+ * Refs the event loop for the duration, since a reply arrives via a real message from
+ * another worker, not anything the loop already tracks (a timer/immediate/nextTick). */
+const createNetRequest = (eventLoop: ReturnType<typeof createEventLoop>) => {
+  return (url: string, init: NetRequestInit = {}): Promise<NetReply> => {
+    const id = crypto.randomUUID();
+    eventLoop.ref();
+    return new Promise<NetReply>((resolve, reject) => {
+      pendingNetRequests.set(id, {
+        resolve: (reply) => {
+          eventLoop.unref();
+          resolve(reply);
+        },
+        reject: (error) => {
+          eventLoop.unref();
+          reject(error);
+        },
+      });
+      // Copy (never transfer) the body: a Node Buffer may be a view over a
+      // shared/pooled ArrayBuffer, and transferring it would detach that pool
+      // out from under any other Buffer still referencing it.
+      const body = init.body ? init.body.slice().buffer : undefined;
+      self.postMessage({
+        type: "net-request",
+        payload: { id, url, method: init.method, headers: init.headers, body },
+      });
+    });
+  };
+};
+
+const handleNetResponse = (payload: { id: string; ok: boolean; result?: NetReply; error?: { code: string; message: string } }): void => {
+  const waiting = pendingNetRequests.get(payload.id);
+  if (!waiting) return;
+  pendingNetRequests.delete(payload.id);
+
+  if (payload.ok) waiting.resolve(payload.result!);
+  else waiting.reject(Object.assign(new Error(payload.error!.message), { code: payload.error!.code }));
+};
 
 const exitProcess = (code: number): void => {
   if (exited) return;
@@ -83,6 +138,7 @@ const boot = (payload: BootPayload): void => {
     clearTimeout: eventLoop.clearTimeout,
     setImmediate: eventLoop.setImmediate,
     clearImmediate: eventLoop.clearImmediate,
+    __dwcFetchAsync: createNetRequest(eventLoop),
   });
 
   const moduleLoader = createModuleLoader({
@@ -122,4 +178,5 @@ const drain = async (eventLoop: ReturnType<typeof createEventLoop>): Promise<voi
 self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   if (event.data.type === "boot") boot(event.data.payload as BootPayload);
   else if (event.data.type === "boot-shell") bootShell(event.data.payload as BootShellPayload);
+  else if (event.data.type === "net-response") handleNetResponse(event.data.payload as Parameters<typeof handleNetResponse>[0]);
 };

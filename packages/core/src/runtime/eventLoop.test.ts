@@ -82,6 +82,47 @@ describe("eventLoop", () => {
     expect(loop.hasPendingWork()).toBe(true);
   });
 
+  it("ref() keeps hasPendingWork() true with nothing else queued", () => {
+    const loop = createEventLoop();
+    expect(loop.hasPendingWork()).toBe(false);
+
+    loop.ref();
+    expect(loop.hasPendingWork()).toBe(true);
+
+    loop.unref();
+    expect(loop.hasPendingWork()).toBe(false);
+  });
+
+  it("unref() never goes negative", () => {
+    const loop = createEventLoop();
+    loop.unref();
+    loop.unref();
+    loop.ref();
+    expect(loop.hasPendingWork()).toBe(true);
+    loop.unref();
+    expect(loop.hasPendingWork()).toBe(false);
+  });
+
+  it("drain() waits on an active handle instead of exiting early, and proceeds once a reply arrives", async () => {
+    const order: string[] = [];
+    const loop = createEventLoop();
+
+    loop.ref();
+    // Simulates a reply arriving asynchronously later (e.g. a network response
+    // delivered via postMessage from another worker) - nothing queues a
+    // nextTick/timer/immediate of its own until this fires.
+    setTimeout(() => {
+      order.push("reply");
+      loop.nextTick(() => order.push("continuation"));
+      loop.unref();
+    }, 0);
+
+    await drain(loop);
+
+    expect(order).toEqual(["reply", "continuation"]);
+    expect(loop.hasPendingWork()).toBe(false);
+  });
+
   it("clearTimeout and clearImmediate cancel pending work", async () => {
     const order: string[] = [];
     const loop = createEventLoop();

@@ -85,7 +85,7 @@ describe("vendored Node builtins (events + stream) via the factory loader", () =
 
   it("throws a clear error for a builtin outside this phase's vendored set", () => {
     const { require } = createNodeModules(fakeProcess());
-    expect(() => require("http")).toThrow(/no vendored Node builtin 'http'/);
+    expect(() => require("net")).toThrow(/no vendored Node builtin 'net'/);
   });
 
   it("reports has() for both public and internal ids", () => {
@@ -93,6 +93,7 @@ describe("vendored Node builtins (events + stream) via the factory loader", () =
     expect(has("events")).toBe(true);
     expect(has("node:events")).toBe(true);
     expect(has("internal/streams/readable")).toBe(true);
-    expect(has("http")).toBe(false);
+    expect(has("http")).toBe(true);
+    expect(has("net")).toBe(false);
   });
 });
