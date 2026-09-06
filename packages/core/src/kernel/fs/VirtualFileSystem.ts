@@ -5,12 +5,14 @@ interface FileNode {
   type: "file";
   contents: Uint8Array;
   mtimeMs: number;
+  mode: number;
 }
 
 interface DirNode {
   type: "dir";
   children: Map<string, Node>;
   mtimeMs: number;
+  mode: number;
 }
 
 interface SymlinkNode {
@@ -28,6 +30,7 @@ interface Stat {
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
   size: number;
+  mode: number;
   mtimeMs: number;
 }
 
@@ -46,6 +49,7 @@ interface VirtualFileSystem {
   readdir(path: string): string[];
   stat(path: string): Stat;
   lstat(path: string): Stat;
+  chmod(path: string, mode: number): void;
   symlink(target: string, path: string): void;
   readlink(path: string): string;
   rm(path: string, options?: RmOptions): void;
@@ -60,7 +64,7 @@ const encoder = new TextEncoder();
 const MAX_SYMLINK_DEPTH = 40;
 
 const createVirtualFileSystem = (): VirtualFileSystem => {
-  const root: DirNode = { type: "dir", children: new Map(), mtimeMs: Date.now() };
+  const root: DirNode = { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 };
 
   /**
    * Resolves a path to a fully symlink-free absolute path string, following
@@ -155,7 +159,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     if (!options.recursive) {
       const { parent, name } = resolveParent(normalized);
       if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
-      parent.children.set(name, { type: "dir", children: new Map(), mtimeMs: Date.now() });
+      parent.children.set(name, { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 });
       return;
     }
 
@@ -168,7 +172,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     for (const segment of segs) {
       let child = dir.children.get(segment);
       if (!child) {
-        child = { type: "dir", children: new Map(), mtimeMs: Date.now() };
+        child = { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 };
         dir.children.set(segment, child);
       } else if (child.type !== "dir") {
         throw new FSError("ENOTDIR", normalized);
@@ -184,8 +188,13 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     const existing = parent.children.get(name);
     if (existing && existing.type === "dir") throw new FSError("EISDIR", normalized);
 
+    // A rewrite of an existing file keeps its mode (matches real
+    // fs.writeFileSync - only a brand new file gets the default), so a
+    // chmod'd .bin shim doesn't silently lose +x if its contents are
+    // rewritten afterward.
+    const mode = existing?.type === "file" ? existing.mode : 0o644;
     const bytes = typeof contents === "string" ? encoder.encode(contents) : contents;
-    parent.children.set(name, { type: "file", contents: bytes, mtimeMs: Date.now() });
+    parent.children.set(name, { type: "file", contents: bytes, mtimeMs: Date.now(), mode });
   };
 
   const readFile = (path: string): Uint8Array => {
@@ -207,6 +216,9 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     isDirectory: () => node.type === "dir",
     isSymbolicLink: () => node.type === "symlink",
     size: node.type === "file" ? node.contents.byteLength : 0,
+    // A symlink's own permissions aren't meaningfully enforced on any real
+    // filesystem either - lrwxrwxrwx (0o777) is the universal convention.
+    mode: node.type === "symlink" ? 0o777 : node.mode,
     mtimeMs: node.mtimeMs,
   });
 
@@ -218,6 +230,16 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
   const lstat = (path: string): Stat => {
     const normalized = normalize(path);
     return statOf(normalized, resolveNode(normalized, false));
+  };
+
+  const chmod = (path: string, mode: number): void => {
+    const normalized = normalize(path);
+    // Follows symlinks, matching real fs.chmodSync - resolveNode's default
+    // never actually returns a raw symlink node (see its own doc comment),
+    // so the type check below is unreachable, just satisfying the type.
+    const node = resolveNode(normalized);
+    if (node.type === "symlink") throw new FSError("EINVAL", normalized, "Cannot chmod a symlink");
+    node.mode = mode;
   };
 
   const symlink = (target: string, path: string): void => {
@@ -267,7 +289,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     }
   };
 
-  return { mkdir, writeFile, readFile, readdir, stat, lstat, symlink, readlink, rm, rename, exists };
+  return { mkdir, writeFile, readFile, readdir, stat, lstat, chmod, symlink, readlink, rm, rename, exists };
 };
 
 export { createVirtualFileSystem };

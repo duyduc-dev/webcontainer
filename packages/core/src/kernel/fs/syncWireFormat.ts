@@ -27,6 +27,7 @@ enum FsOp {
   SYMLINK = 9,
   READLINK = 10,
   LSTAT = 11,
+  CHMOD = 12,
 }
 
 type FsRequest =
@@ -40,7 +41,8 @@ type FsRequest =
   | { op: FsOp.EXISTS; path: string }
   | { op: FsOp.SYMLINK; target: string; path: string }
   | { op: FsOp.READLINK; path: string }
-  | { op: FsOp.LSTAT; path: string };
+  | { op: FsOp.LSTAT; path: string }
+  | { op: FsOp.CHMOD; path: string; mode: number };
 
 type FsResponseOk =
   | { ok: true; op: FsOp.READ_FILE; contents: Uint8Array }
@@ -54,13 +56,15 @@ type FsResponseOk =
       isDirectory: boolean;
       isSymbolicLink: boolean;
       size: number;
+      mode: number;
       mtimeMs: number;
     }
   | { ok: true; op: FsOp.RM }
   | { ok: true; op: FsOp.RENAME }
   | { ok: true; op: FsOp.EXISTS; exists: boolean }
   | { ok: true; op: FsOp.SYMLINK }
-  | { ok: true; op: FsOp.READLINK; target: string };
+  | { ok: true; op: FsOp.READLINK; target: string }
+  | { ok: true; op: FsOp.CHMOD };
 
 type FsResponseError = { ok: false; code: FSErrorCode; path: string; message: string };
 
@@ -178,6 +182,10 @@ const encodeFsRequest = (request: FsRequest, buffer: ArrayBufferLike, byteOffset
       writer.writeString(request.target);
       writer.writeString(request.path);
       break;
+    case FsOp.CHMOD:
+      writer.writeString(request.path);
+      writer.writeUint32(request.mode);
+      break;
   }
 
   return writer.bytesWritten;
@@ -204,6 +212,8 @@ const decodeFsRequest = (buffer: ArrayBufferLike, byteOffset = 0): FsRequest => 
       return { op, from: reader.readString(), to: reader.readString() };
     case FsOp.SYMLINK:
       return { op, target: reader.readString(), path: reader.readString() };
+    case FsOp.CHMOD:
+      return { op, path: reader.readString(), mode: reader.readUint32() };
     default:
       throw new Error(`Unknown FsOp: ${op}`);
   }
@@ -235,6 +245,7 @@ const encodeFsResponse = (response: FsResponse, buffer: ArrayBufferLike, byteOff
       writer.writeUint8(response.isDirectory ? 1 : 0);
       writer.writeUint8(response.isSymbolicLink ? 1 : 0);
       writer.writeFloat64(response.size);
+      writer.writeUint32(response.mode);
       writer.writeFloat64(response.mtimeMs);
       break;
     case FsOp.EXISTS:
@@ -248,6 +259,7 @@ const encodeFsResponse = (response: FsResponse, buffer: ArrayBufferLike, byteOff
     case FsOp.RM:
     case FsOp.RENAME:
     case FsOp.SYMLINK:
+    case FsOp.CHMOD:
       break;
   }
 
@@ -286,6 +298,7 @@ const decodeFsResponse = (buffer: ArrayBufferLike, byteOffset = 0): FsResponse =
         isDirectory: reader.readUint8() === 1,
         isSymbolicLink: reader.readUint8() === 1,
         size: reader.readFloat64(),
+        mode: reader.readUint32(),
         mtimeMs: reader.readFloat64(),
       };
     case FsOp.EXISTS:
@@ -297,6 +310,7 @@ const decodeFsResponse = (buffer: ArrayBufferLike, byteOffset = 0): FsResponse =
     case FsOp.RM:
     case FsOp.RENAME:
     case FsOp.SYMLINK:
+    case FsOp.CHMOD:
       return { ok: true, op };
     default:
       throw new Error(`Unknown FsOp: ${op}`);

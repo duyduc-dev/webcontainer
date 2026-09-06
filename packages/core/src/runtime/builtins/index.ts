@@ -1,5 +1,6 @@
 import { createNodeModules } from "../node/loader";
 import type { NodeModulesContext } from "../node/loader";
+import { createOsModule } from "./os";
 import pathModule from "./path";
 import utilModule from "./util";
 
@@ -17,6 +18,7 @@ interface ProcessLike {
 const BUILTIN_NAMES = new Set([
   "path",
   "util",
+  "os",
   "events",
   "stream",
   "buffer",
@@ -54,6 +56,7 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
   return {
     path: pathModule,
     util: utilModule,
+    os: createOsModule(process),
     events: nodeModules.require("events"),
     stream: nodeModules.require("stream"),
     buffer: nodeModules.require("buffer"),

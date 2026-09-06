@@ -195,6 +195,34 @@ test("VFS symlink support: readFile follows a symlink, and lstat/stat correctly 
   expect(pageErrors).toEqual([]);
 });
 
+test("real-npm-boot gaps: os module, \"node:\"/absolute-path require(), fs.chmod, and process as an EventEmitter", async ({ page }) => {
+  const consoleMessages: string[] = [];
+  const pageErrors: string[] = [];
+
+  page.on("console", (message) => consoleMessages.push(message.text()));
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto("/");
+
+  await expect
+    .poll(() => consoleMessages.some((text) => text.includes("gaps-demo exited with code 42")), { timeout: 15000 })
+    .toBe(true);
+
+  const terminalText = await page.locator("#terminal").innerText();
+  expect(terminalText).toContain("[os] platform -> linux");
+  expect(terminalText).toContain("[os] homedir -> /home/user");
+  expect(terminalText).toContain("[os] availableParallelism >= 1 -> true");
+  expect(terminalText).toContain("[require] node: prefix -> true");
+  expect(terminalText).toContain("[require] absolute path -> absolute-ok");
+  expect(terminalText).toContain("[fs] chmod mode -> 755");
+  // The exit code (42, asserted above via the console message) came from the
+  // guest's OWN 'uncaughtException' listener calling process.exit(42) -
+  // proof process is a real EventEmitter, not just that a message printed.
+  expect(terminalText).toContain("[process] caught uncaughtException: boom");
+
+  expect(pageErrors).toEqual([]);
+});
+
 test("dwc.fs mounts a declarative tree and reads it back through the FS worker", async ({ page }) => {
   const consoleMessages: string[] = [];
   const pageErrors: string[] = [];

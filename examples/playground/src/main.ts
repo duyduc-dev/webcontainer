@@ -15,7 +15,12 @@ function pipeToTerminal(stream: ReadableStream<Uint8Array>, terminal: Terminal):
 }
 
 async function main() {
-  const terminal = new Terminal({ convertEol: true });
+  // rows is generous on purpose: this demo's cumulative output has grown
+  // across many phases, and xterm's DOM only reflects the visible viewport
+  // (not full scrollback), so anything past the default 24 rows would
+  // silently scroll out of what Playwright's innerText()-based e2e
+  // assertions (and a human watching it live) can actually see.
+  const terminal = new Terminal({ convertEol: true, rows: 200 });
   terminal.open(document.getElementById("terminal")!);
 
   try {
@@ -295,6 +300,44 @@ async function main() {
     pipeToTerminal(symlinkDemo.stderr, terminal);
     const symlinkDemoExit = await symlinkDemo.exit;
     console.log("[dwc] symlink-demo exited with code", symlinkDemoExit);
+
+    // Real-npm-boot gaps demo: the `os` module, "node:"-prefixed and
+    // absolute-path require(), fs.chmod, and process as a real EventEmitter
+    // (an 'uncaughtException' listener that calls process.exit() itself,
+    // whose exit code must win over the runtime's own default fallback).
+    await dwc.fs.mount({
+      vendor: { directory: { "absolute-required.js": { file: { contents: "module.exports = 'absolute-ok';\n" } } } },
+    });
+    await dwc.fs.writeFile(
+      "/gaps-demo.js",
+      [
+        "const os = require('node:os');",
+        "const path = require('path');",
+        "const fs = require('fs');",
+        "",
+        "console.log('[os] platform ->', os.platform());",
+        "console.log('[os] homedir ->', os.homedir());",
+        "console.log('[os] availableParallelism >= 1 ->', os.availableParallelism() >= 1);",
+        "console.log('[require] node: prefix ->', typeof path.join === 'function');",
+        "console.log('[require] absolute path ->', require('/vendor/absolute-required.js'));",
+        "",
+        "fs.writeFileSync('/gaps-chmod-test.sh', '#!/bin/sh\\n');",
+        "fs.chmodSync('/gaps-chmod-test.sh', 0o755);",
+        "console.log('[fs] chmod mode ->', fs.statSync('/gaps-chmod-test.sh').mode.toString(8));",
+        "",
+        "process.on('uncaughtException', (err) => {",
+        "  console.log('[process] caught uncaughtException:', err.message);",
+        "  process.exit(42);",
+        "});",
+        "setTimeout(() => { throw new Error('boom'); }, 0);",
+        "",
+      ].join("\n"),
+    );
+    const gapsDemo = await dwc.process.spawn("/gaps-demo.js");
+    pipeToTerminal(gapsDemo.stdout, terminal);
+    pipeToTerminal(gapsDemo.stderr, terminal);
+    const gapsDemoExit = await gapsDemo.exit;
+    console.log("[dwc] gaps-demo exited with code", gapsDemoExit);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

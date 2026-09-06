@@ -94,12 +94,17 @@ const preloadModuleGraph = async (entryPath: string, readFile: ReadFile): Promis
     const path = queue.shift()!;
     const source = sources[path];
 
-    for (const specifier of extractRequireSpecifiers(source)) {
+    for (const rawSpecifier of extractRequireSpecifiers(source)) {
+      // Mirrors moduleLoader.ts's createRequire(): a "node:"-prefixed
+      // specifier names the same builtin/file a bare one would.
+      const specifier = rawSpecifier.startsWith("node:") ? rawSpecifier.slice(5) : rawSpecifier;
       if (isBuiltinSpecifier(specifier)) continue;
 
       const resolved = specifier.startsWith(".")
         ? await tryReadFirstExisting(relativeModuleCandidates(path, specifier), readFile)
-        : await resolveBareSpecifier(path, specifier, readFile, sources);
+        : specifier.startsWith("/")
+          ? await tryReadFirstExisting(fileCandidates(specifier), readFile)
+          : await resolveBareSpecifier(path, specifier, readFile, sources);
       if (!resolved || seen.has(resolved.path)) continue;
 
       seen.add(resolved.path);

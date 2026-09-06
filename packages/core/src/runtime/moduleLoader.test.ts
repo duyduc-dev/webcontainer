@@ -10,6 +10,24 @@ describe("moduleLoader", () => {
     expect(loader.run("/index.js")).toBe(42);
   });
 
+  it("resolves a \"node:\"-prefixed builtin the same as its bare name", () => {
+    const loader = createModuleLoader({
+      sources: { "/index.js": "module.exports = require('node:path');" },
+    });
+    const result = loader.run("/index.js") as { join: unknown };
+    expect(typeof result.join).toBe("function");
+  });
+
+  it("resolves an absolute-path specifier directly, like a real npm shim requiring its own vendored bin", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/bin/npm.js": "module.exports = require('/usr/lib/node_modules/npm/bin/npm-cli.js');",
+        "/usr/lib/node_modules/npm/bin/npm-cli.js": "module.exports = 'real-npm';",
+      },
+    });
+    expect(loader.run("/bin/npm.js")).toBe("real-npm");
+  });
+
   it("resolves a relative require and caches the module (single execution)", () => {
     const loader = createModuleLoader({
       sources: {

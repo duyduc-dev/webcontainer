@@ -16,6 +16,7 @@ interface StatResult {
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
   size: number;
+  mode: number;
   mtimeMs: number;
 }
 
@@ -26,6 +27,7 @@ interface FileSystemAPI {
   readdir(path: string): Promise<string[]>;
   stat(path: string): Promise<StatResult>;
   lstat(path: string): Promise<StatResult>;
+  chmod(path: string, mode: number): Promise<void>;
   symlink(target: string, path: string): Promise<void>;
   readlink(path: string): Promise<string>;
   rm(path: string, options?: RmOptions): Promise<void>;
@@ -55,7 +57,7 @@ const createFileSystemAPI = (request: Requester): FileSystemAPI => {
     readFile: (path) => call<Uint8Array>("readFile", { path }),
     readdir: (path) => call<string[]>("readdir", { path }),
     stat: async (path) => {
-      const result = await call<{ isFile: boolean; isDirectory: boolean; isSymbolicLink: boolean; size: number; mtimeMs: number }>(
+      const result = await call<{ isFile: boolean; isDirectory: boolean; isSymbolicLink: boolean; size: number; mode: number; mtimeMs: number }>(
         "stat",
         { path },
       );
@@ -64,11 +66,12 @@ const createFileSystemAPI = (request: Requester): FileSystemAPI => {
         isDirectory: () => result.isDirectory,
         isSymbolicLink: () => result.isSymbolicLink,
         size: result.size,
+        mode: result.mode,
         mtimeMs: result.mtimeMs,
       };
     },
     lstat: async (path) => {
-      const result = await call<{ isFile: boolean; isDirectory: boolean; isSymbolicLink: boolean; size: number; mtimeMs: number }>(
+      const result = await call<{ isFile: boolean; isDirectory: boolean; isSymbolicLink: boolean; size: number; mode: number; mtimeMs: number }>(
         "lstat",
         { path },
       );
@@ -77,9 +80,11 @@ const createFileSystemAPI = (request: Requester): FileSystemAPI => {
         isDirectory: () => result.isDirectory,
         isSymbolicLink: () => result.isSymbolicLink,
         size: result.size,
+        mode: result.mode,
         mtimeMs: result.mtimeMs,
       };
     },
+    chmod: (path, mode) => call("chmod", { path, mode }),
     symlink: (target, path) => call("symlink", { target, path }),
     readlink: (path) => call<string>("readlink", { path }),
     rm: (path, options) => call("rm", { path, recursive: options?.recursive }),

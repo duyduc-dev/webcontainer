@@ -72,4 +72,13 @@ describe("createFsBuiltin", () => {
     expect(fs.statSync("/link.txt").isSymbolicLink()).toBe(false);
     expect(fs.statSync("/link.txt").isFile()).toBe(true);
   });
+
+  it("chmodSync changes the mode statSync reports", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/a.sh", "#!/bin/sh\n");
+    expect(fs.statSync("/a.sh").mode).toBe(0o644);
+
+    fs.chmodSync("/a.sh", 0o755);
+    expect(fs.statSync("/a.sh").mode).toBe(0o755);
+  });
 });

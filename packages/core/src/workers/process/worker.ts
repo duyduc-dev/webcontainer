@@ -258,18 +258,27 @@ const createFsBuiltinFromPayload = (syncFs: SyncFsChannelPayload | null): FsBuil
 const boot = (payload: BootPayload): void => {
   const eventLoop = createEventLoop();
 
-  const processGlobal = {
+  const processGlobal: { nextTick: typeof eventLoop.nextTick; env: Record<string, string>; [key: string]: unknown } = {
     argv: ["node", payload.entryPath, ...payload.argv],
     env: payload.env,
     cwd: () => payload.cwd,
     exitCode: 0,
     exit(code = 0) {
-      exitCode = code;
+      exitCode = code as number;
       exitProcess(exitCode);
     },
     nextTick: eventLoop.nextTick,
     stdout: createWritableStream("stdout"),
     stderr: createWritableStream("stderr"),
+    title: "node",
+    // Matches the pinned version the vendored lib/*.js sources actually come
+    // from (see e.g. lib/net.js's own "VENDORED VERBATIM from Node.js
+    // v24.18.0" header) - the most honest answer for anything (like npm's own
+    // engines check) that compares process.version against what's running.
+    version: "v24.18.0",
+    versions: { node: "24.18.0" },
+    platform: "linux",
+    arch: "x64",
   };
 
   // 'net' needs the loop's close phase + liveness ref/unref (see eventLoop.ts's
@@ -288,6 +297,18 @@ const boot = (payload: BootPayload): void => {
     childProcessBridge: createChildProcessBridge(eventLoop),
   };
   const vendoredBuiltins = createBuiltinModules(processGlobal, netContext);
+
+  // Real Node's process is an EventEmitter (uncaughtException/unhandledRejection
+  // listeners, npm's own proc-log wiring via process.emit('log'/'output', ...)) -
+  // ours was a plain object until now, which every one of those calls would throw
+  // on. Mixed in AFTER building vendoredBuiltins (which only ever needed the
+  // narrow {nextTick, env} shape above) so the real vendored EventEmitter class
+  // is available; applied to the SAME object every other reference below already
+  // points at, not a new one, since Object.assign(self, {process: processGlobal})
+  // hasn't run yet.
+  const EventEmitter = vendoredBuiltins.events as new () => { emit(event: string, ...args: unknown[]): boolean };
+  Object.setPrototypeOf(processGlobal, EventEmitter.prototype);
+  EventEmitter.call(processGlobal as unknown as InstanceType<typeof EventEmitter>);
 
   // The module wrapper (new Function) closes over the global scope, so console/process/
   // timers must be real globals here rather than parameters threaded through requires.
@@ -323,11 +344,24 @@ const boot = (payload: BootPayload): void => {
     process: processGlobal,
   });
 
+  // Real Node emits 'uncaughtException' on `process` before its own default
+  // reporting - real npm relies on this (its ExitHandler installs a listener
+  // that prints its own message and calls process.exit() itself). Emitted
+  // unconditionally (a no-op if nothing's listening); the write+exitProcess(1)
+  // fallback below still runs either way, but is itself a no-op once a
+  // listener has already called exit() (exitProcess() guards on `exited`), so
+  // a listener's own exit code always wins over this default.
+  const reportUncaught = (error: unknown): void => {
+    const errorObj = error instanceof Error ? error : new Error(String(error));
+    (processGlobal as unknown as { emit(event: string, ...args: unknown[]): boolean }).emit("uncaughtException", errorObj);
+    write("stderr", `${errorObj.stack ?? errorObj.message}\n`);
+    exitProcess(1);
+  };
+
   try {
     moduleLoader.run(payload.entryPath);
   } catch (error) {
-    write("stderr", `${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
-    exitProcess(1);
+    reportUncaught(error);
     return;
   }
 
@@ -338,8 +372,7 @@ const boot = (payload: BootPayload): void => {
       // dns.lookup()->connect() chain) can throw same as top-level code can;
       // uncaught, it would otherwise just reject this promise silently, with
       // nothing to report it and the process never exiting.
-      write("stderr", `${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
-      exitProcess(1);
+      reportUncaught(error);
     });
 };
 

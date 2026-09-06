@@ -20,7 +20,8 @@ type FsRequestPayload =
   | { action: "mount"; tree: FileSystemTree; basePath?: string }
   | { action: "symlink"; target: string; path: string }
   | { action: "readlink"; path: string }
-  | { action: "lstat"; path: string };
+  | { action: "lstat"; path: string }
+  | { action: "chmod"; path: string; mode: number };
 
 const vfs = createVirtualFileSystem();
 
@@ -55,6 +56,7 @@ const handleFsRequest = (payload: FsRequestPayload): unknown => {
         isDirectory: stat.isDirectory(),
         isSymbolicLink: stat.isSymbolicLink(),
         size: stat.size,
+        mode: stat.mode,
         mtimeMs: stat.mtimeMs,
       };
     }
@@ -65,6 +67,7 @@ const handleFsRequest = (payload: FsRequestPayload): unknown => {
         isDirectory: stat.isDirectory(),
         isSymbolicLink: stat.isSymbolicLink(),
         size: stat.size,
+        mode: stat.mode,
         mtimeMs: stat.mtimeMs,
       };
     }
@@ -84,6 +87,9 @@ const handleFsRequest = (payload: FsRequestPayload): unknown => {
       return undefined;
     case "readlink":
       return vfs.readlink(payload.path);
+    case "chmod":
+      vfs.chmod(payload.path, payload.mode);
+      return undefined;
   }
 };
 

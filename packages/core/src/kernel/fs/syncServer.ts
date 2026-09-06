@@ -33,6 +33,7 @@ const executeFsRequest = (vfs: VirtualFileSystem, request: FsRequest): FsRespons
         isDirectory: stat.isDirectory(),
         isSymbolicLink: stat.isSymbolicLink(),
         size: stat.size,
+        mode: stat.mode,
         mtimeMs: stat.mtimeMs,
       };
     }
@@ -49,6 +50,9 @@ const executeFsRequest = (vfs: VirtualFileSystem, request: FsRequest): FsRespons
       return { ok: true, op: FsOp.SYMLINK };
     case FsOp.READLINK:
       return { ok: true, op: FsOp.READLINK, target: vfs.readlink(request.path) };
+    case FsOp.CHMOD:
+      vfs.chmod(request.path, request.mode);
+      return { ok: true, op: FsOp.CHMOD };
   }
 };
 

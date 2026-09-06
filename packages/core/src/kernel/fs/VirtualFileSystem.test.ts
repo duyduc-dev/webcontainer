@@ -213,4 +213,42 @@ describe("VirtualFileSystem", () => {
     vfs.writeFile("/taken", "x");
     expect(() => vfs.symlink("/anything", "/taken")).toThrow(expect.objectContaining({ code: "EEXIST" }));
   });
+
+  it("new files default to mode 0o644 and directories to 0o755", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/a.txt", "x");
+    vfs.mkdir("/dir");
+    expect(vfs.stat("/a.txt").mode).toBe(0o644);
+    expect(vfs.stat("/dir").mode).toBe(0o755);
+  });
+
+  it("chmod changes the reported mode", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/a.sh", "#!/bin/sh\n");
+    vfs.chmod("/a.sh", 0o755);
+    expect(vfs.stat("/a.sh").mode).toBe(0o755);
+  });
+
+  it("chmod follows a symlink to the target, matching fs.chmodSync", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.sh", "#!/bin/sh\n");
+    vfs.symlink("/real.sh", "/link.sh");
+    vfs.chmod("/link.sh", 0o755);
+    expect(vfs.stat("/real.sh").mode).toBe(0o755);
+  });
+
+  it("rewriting an existing file preserves its mode", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/a.sh", "old");
+    vfs.chmod("/a.sh", 0o755);
+    vfs.writeFile("/a.sh", "new");
+    expect(vfs.stat("/a.sh").mode).toBe(0o755);
+  });
+
+  it("lstat reports a fixed 0o777 mode for a symlink itself", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.txt", "hi");
+    vfs.symlink("/real.txt", "/link.txt");
+    expect(vfs.lstat("/link.txt").mode).toBe(0o777);
+  });
 });

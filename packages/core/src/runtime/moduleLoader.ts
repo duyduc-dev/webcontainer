@@ -89,11 +89,28 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
   const cache = new Map<string, ModuleRecord>();
 
   const createRequire = (fromPath: string) => {
-    return (specifier: string): unknown => {
+    return (rawSpecifier: string): unknown => {
+      // Real Node accepts a "node:"-prefixed specifier for any builtin (and,
+      // as of newer versions, requires it for a few) - strip it before every
+      // other check so `require('node:path')` and `require('path')` resolve
+      // identically.
+      const specifier = rawSpecifier.startsWith("node:") ? rawSpecifier.slice(5) : rawSpecifier;
+
       if (specifier in builtins) return builtins[specifier];
 
       if (specifier.startsWith(".")) {
         return loadModule(resolveRelative(fromPath, specifier, sources)).exports;
+      }
+
+      // An absolute-path specifier - real Node supports this directly (no
+      // node_modules walk, no "main" field, just the same file/directory
+      // candidate suffixes a relative require tries). This is how a thin
+      // `/bin/<name>.js` shim can load a real, separately-vendored program by
+      // its absolute VFS path (e.g. a vendored npm's bin/npm-cli.js).
+      if (specifier.startsWith("/")) {
+        const resolved = fileCandidates(specifier).find((candidate) => candidate in sources);
+        if (resolved) return loadModule(resolved).exports;
+        throw new Error(`Cannot find module '${specifier}'`);
       }
 
       const resolved = resolveBareSync(fromPath, specifier, sources);

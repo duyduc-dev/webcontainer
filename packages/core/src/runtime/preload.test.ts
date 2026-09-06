@@ -43,6 +43,25 @@ describe("preloadModuleGraph", () => {
     expect(Object.keys(sources)).toEqual(["/index.js"]);
   });
 
+  it("treats a \"node:\"-prefixed builtin the same as its bare name (no FS fetch)", async () => {
+    const files = { "/index.js": "require('node:path');" };
+
+    const { sources } = await preloadModuleGraph("/index.js", readFileFrom(files));
+
+    expect(Object.keys(sources)).toEqual(["/index.js"]);
+  });
+
+  it("preloads an absolute-path specifier directly, like a real npm shim requiring its own vendored bin", async () => {
+    const files = {
+      "/bin/npm.js": "require('/usr/lib/node_modules/npm/bin/npm-cli.js');",
+      "/usr/lib/node_modules/npm/bin/npm-cli.js": "1;",
+    };
+
+    const { sources } = await preloadModuleGraph("/bin/npm.js", readFileFrom(files));
+
+    expect(Object.keys(sources).sort()).toEqual(["/bin/npm.js", "/usr/lib/node_modules/npm/bin/npm-cli.js"]);
+  });
+
   it("skips an unresolvable relative require instead of throwing", async () => {
     const files = { "/index.js": "require('./missing');" };
 

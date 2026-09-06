@@ -11,6 +11,7 @@ interface StatResult {
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
   size: number;
+  mode: number;
   mtimeMs: number;
 }
 
@@ -21,6 +22,7 @@ interface FsBuiltin {
   readdirSync(path: string): string[];
   statSync(path: string): StatResult;
   lstatSync(path: string): StatResult;
+  chmodSync(path: string, mode: number): void;
   symlinkSync(target: string, path: string): void;
   readlinkSync(path: string): string;
   rmSync(path: string, options?: { recursive?: boolean }): void;
@@ -65,6 +67,7 @@ const createFsBuiltin = (io: FsBuiltinIO): FsBuiltin => {
         isDirectory: () => response.isDirectory,
         isSymbolicLink: () => response.isSymbolicLink,
         size: response.size,
+        mode: response.mode,
         mtimeMs: response.mtimeMs,
       };
     },
@@ -75,8 +78,12 @@ const createFsBuiltin = (io: FsBuiltinIO): FsBuiltin => {
         isDirectory: () => response.isDirectory,
         isSymbolicLink: () => response.isSymbolicLink,
         size: response.size,
+        mode: response.mode,
         mtimeMs: response.mtimeMs,
       };
+    },
+    chmodSync(path, mode) {
+      call({ op: FsOp.CHMOD, path, mode });
     },
     symlinkSync(target, path) {
       call({ op: FsOp.SYMLINK, target, path });
