@@ -53,4 +53,23 @@ describe("createFsBuiltin", () => {
     const fs = createFsBuiltin({});
     expect(() => fs.readFileSync("/a.txt")).toThrow(expect.objectContaining({ code: "ERR_NOT_ISOLATED" }));
   });
+
+  it("symlinkSync + readFileSync follows the link; readlinkSync reads the raw target", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/real.txt", "hi");
+    fs.symlinkSync("/real.txt", "/link.txt");
+
+    expect(new TextDecoder().decode(fs.readFileSync("/link.txt"))).toBe("hi");
+    expect(fs.readlinkSync("/link.txt")).toBe("/real.txt");
+  });
+
+  it("lstatSync reports a symlink as a link; statSync reports what it points to", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/real.txt", "hi");
+    fs.symlinkSync("/real.txt", "/link.txt");
+
+    expect(fs.lstatSync("/link.txt").isSymbolicLink()).toBe(true);
+    expect(fs.statSync("/link.txt").isSymbolicLink()).toBe(false);
+    expect(fs.statSync("/link.txt").isFile()).toBe(true);
+  });
 });

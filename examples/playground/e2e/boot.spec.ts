@@ -173,6 +173,28 @@ test("node_modules require() resolution: a bare specifier resolves through packa
   expect(pageErrors).toEqual([]);
 });
 
+test("VFS symlink support: readFile follows a symlink, and lstat/stat correctly distinguish the link from its target", async ({ page }) => {
+  const consoleMessages: string[] = [];
+  const pageErrors: string[] = [];
+
+  page.on("console", (message) => consoleMessages.push(message.text()));
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto("/");
+
+  await expect
+    .poll(() => consoleMessages.some((text) => text.includes("symlink-demo exited with code 0")), { timeout: 15000 })
+    .toBe(true);
+
+  const terminalText = await page.locator("#terminal").innerText();
+  expect(terminalText).toContain("[symlink] readFile -> hello through a symlink");
+  expect(terminalText).toContain("[symlink] lstat.isSymbolicLink -> true");
+  expect(terminalText).toContain("[symlink] stat.isSymbolicLink -> false");
+  expect(terminalText).toContain("[symlink] readlink -> /symlink-target.txt");
+
+  expect(pageErrors).toEqual([]);
+});
+
 test("dwc.fs mounts a declarative tree and reads it back through the FS worker", async ({ page }) => {
   const consoleMessages: string[] = [];
   const pageErrors: string[] = [];

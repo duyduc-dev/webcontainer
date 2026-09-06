@@ -17,7 +17,10 @@ type FsRequestPayload =
   | { action: "rm"; path: string; recursive?: boolean }
   | { action: "rename"; from: string; to: string }
   | { action: "exists"; path: string }
-  | { action: "mount"; tree: FileSystemTree; basePath?: string };
+  | { action: "mount"; tree: FileSystemTree; basePath?: string }
+  | { action: "symlink"; target: string; path: string }
+  | { action: "readlink"; path: string }
+  | { action: "lstat"; path: string };
 
 const vfs = createVirtualFileSystem();
 
@@ -47,7 +50,23 @@ const handleFsRequest = (payload: FsRequestPayload): unknown => {
       return vfs.readdir(payload.path);
     case "stat": {
       const stat = vfs.stat(payload.path);
-      return { isFile: stat.isFile(), isDirectory: stat.isDirectory(), size: stat.size, mtimeMs: stat.mtimeMs };
+      return {
+        isFile: stat.isFile(),
+        isDirectory: stat.isDirectory(),
+        isSymbolicLink: stat.isSymbolicLink(),
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+      };
+    }
+    case "lstat": {
+      const stat = vfs.lstat(payload.path);
+      return {
+        isFile: stat.isFile(),
+        isDirectory: stat.isDirectory(),
+        isSymbolicLink: stat.isSymbolicLink(),
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+      };
     }
     case "rm":
       vfs.rm(payload.path, { recursive: payload.recursive });
@@ -60,6 +79,11 @@ const handleFsRequest = (payload: FsRequestPayload): unknown => {
     case "mount":
       mount(vfs, payload.tree, payload.basePath ?? "/");
       return undefined;
+    case "symlink":
+      vfs.symlink(payload.target, payload.path);
+      return undefined;
+    case "readlink":
+      return vfs.readlink(payload.path);
   }
 };
 

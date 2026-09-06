@@ -24,6 +24,9 @@ enum FsOp {
   RM = 6,
   RENAME = 7,
   EXISTS = 8,
+  SYMLINK = 9,
+  READLINK = 10,
+  LSTAT = 11,
 }
 
 type FsRequest =
@@ -34,17 +37,30 @@ type FsRequest =
   | { op: FsOp.STAT; path: string }
   | { op: FsOp.RM; path: string; recursive: boolean }
   | { op: FsOp.RENAME; from: string; to: string }
-  | { op: FsOp.EXISTS; path: string };
+  | { op: FsOp.EXISTS; path: string }
+  | { op: FsOp.SYMLINK; target: string; path: string }
+  | { op: FsOp.READLINK; path: string }
+  | { op: FsOp.LSTAT; path: string };
 
 type FsResponseOk =
   | { ok: true; op: FsOp.READ_FILE; contents: Uint8Array }
   | { ok: true; op: FsOp.WRITE_FILE }
   | { ok: true; op: FsOp.MKDIR }
   | { ok: true; op: FsOp.READDIR; entries: string[] }
-  | { ok: true; op: FsOp.STAT; isFile: boolean; isDirectory: boolean; size: number; mtimeMs: number }
+  | {
+      ok: true;
+      op: FsOp.STAT | FsOp.LSTAT;
+      isFile: boolean;
+      isDirectory: boolean;
+      isSymbolicLink: boolean;
+      size: number;
+      mtimeMs: number;
+    }
   | { ok: true; op: FsOp.RM }
   | { ok: true; op: FsOp.RENAME }
-  | { ok: true; op: FsOp.EXISTS; exists: boolean };
+  | { ok: true; op: FsOp.EXISTS; exists: boolean }
+  | { ok: true; op: FsOp.SYMLINK }
+  | { ok: true; op: FsOp.READLINK; target: string };
 
 type FsResponseError = { ok: false; code: FSErrorCode; path: string; message: string };
 
@@ -141,6 +157,8 @@ const encodeFsRequest = (request: FsRequest, buffer: ArrayBufferLike, byteOffset
     case FsOp.READDIR:
     case FsOp.STAT:
     case FsOp.EXISTS:
+    case FsOp.READLINK:
+    case FsOp.LSTAT:
       writer.writeString(request.path);
       break;
     case FsOp.WRITE_FILE:
@@ -156,6 +174,10 @@ const encodeFsRequest = (request: FsRequest, buffer: ArrayBufferLike, byteOffset
       writer.writeString(request.from);
       writer.writeString(request.to);
       break;
+    case FsOp.SYMLINK:
+      writer.writeString(request.target);
+      writer.writeString(request.path);
+      break;
   }
 
   return writer.bytesWritten;
@@ -170,6 +192,8 @@ const decodeFsRequest = (buffer: ArrayBufferLike, byteOffset = 0): FsRequest => 
     case FsOp.READDIR:
     case FsOp.STAT:
     case FsOp.EXISTS:
+    case FsOp.READLINK:
+    case FsOp.LSTAT:
       return { op, path: reader.readString() };
     case FsOp.WRITE_FILE:
       return { op, path: reader.readString(), contents: reader.readBytes() };
@@ -178,6 +202,8 @@ const decodeFsRequest = (buffer: ArrayBufferLike, byteOffset = 0): FsRequest => 
       return { op, path: reader.readString(), recursive: reader.readUint8() === 1 };
     case FsOp.RENAME:
       return { op, from: reader.readString(), to: reader.readString() };
+    case FsOp.SYMLINK:
+      return { op, target: reader.readString(), path: reader.readString() };
     default:
       throw new Error(`Unknown FsOp: ${op}`);
   }
@@ -204,18 +230,24 @@ const encodeFsResponse = (response: FsResponse, buffer: ArrayBufferLike, byteOff
       for (const entry of response.entries) writer.writeString(entry);
       break;
     case FsOp.STAT:
+    case FsOp.LSTAT:
       writer.writeUint8(response.isFile ? 1 : 0);
       writer.writeUint8(response.isDirectory ? 1 : 0);
+      writer.writeUint8(response.isSymbolicLink ? 1 : 0);
       writer.writeFloat64(response.size);
       writer.writeFloat64(response.mtimeMs);
       break;
     case FsOp.EXISTS:
       writer.writeUint8(response.exists ? 1 : 0);
       break;
+    case FsOp.READLINK:
+      writer.writeString(response.target);
+      break;
     case FsOp.WRITE_FILE:
     case FsOp.MKDIR:
     case FsOp.RM:
     case FsOp.RENAME:
+    case FsOp.SYMLINK:
       break;
   }
 
@@ -246,20 +278,25 @@ const decodeFsResponse = (buffer: ArrayBufferLike, byteOffset = 0): FsResponse =
       return { ok: true, op, entries };
     }
     case FsOp.STAT:
+    case FsOp.LSTAT:
       return {
         ok: true,
         op,
         isFile: reader.readUint8() === 1,
         isDirectory: reader.readUint8() === 1,
+        isSymbolicLink: reader.readUint8() === 1,
         size: reader.readFloat64(),
         mtimeMs: reader.readFloat64(),
       };
     case FsOp.EXISTS:
       return { ok: true, op, exists: reader.readUint8() === 1 };
+    case FsOp.READLINK:
+      return { ok: true, op, target: reader.readString() };
     case FsOp.WRITE_FILE:
     case FsOp.MKDIR:
     case FsOp.RM:
     case FsOp.RENAME:
+    case FsOp.SYMLINK:
       return { ok: true, op };
     default:
       throw new Error(`Unknown FsOp: ${op}`);

@@ -65,4 +65,40 @@ describe("serviceSyncFsRequest", () => {
 
     expect(new TextDecoder().decode(vfs.readFile("/out.txt"))).toBe("hi");
   });
+
+  it("services a SYMLINK request, then LSTAT reports it as a link and STAT follows it", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.txt", "hi");
+    const { control, data } = makeChannel();
+
+    encodeFsRequest({ op: FsOp.SYMLINK, target: "/real.txt", path: "/link.txt" }, data);
+    Atomics.store(control, FS_SYNC_STATE_INDEX, FS_SYNC_STATE_REQUESTED);
+    serviceSyncFsRequest(vfs, control, data);
+    expect(decodeFsResponse(data)).toEqual({ ok: true, op: FsOp.SYMLINK });
+
+    encodeFsRequest({ op: FsOp.LSTAT, path: "/link.txt" }, data);
+    Atomics.store(control, FS_SYNC_STATE_INDEX, FS_SYNC_STATE_REQUESTED);
+    serviceSyncFsRequest(vfs, control, data);
+    const lstat = decodeFsResponse(data);
+    expect(lstat).toMatchObject({ ok: true, op: FsOp.LSTAT, isSymbolicLink: true, isFile: false });
+
+    encodeFsRequest({ op: FsOp.STAT, path: "/link.txt" }, data);
+    Atomics.store(control, FS_SYNC_STATE_INDEX, FS_SYNC_STATE_REQUESTED);
+    serviceSyncFsRequest(vfs, control, data);
+    const stat = decodeFsResponse(data);
+    expect(stat).toMatchObject({ ok: true, op: FsOp.STAT, isSymbolicLink: false, isFile: true });
+  });
+
+  it("services a READLINK request", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.mkdir("/a");
+    vfs.symlink("../real.txt", "/a/link.txt");
+    const { control, data } = makeChannel();
+
+    encodeFsRequest({ op: FsOp.READLINK, path: "/a/link.txt" }, data);
+    Atomics.store(control, FS_SYNC_STATE_INDEX, FS_SYNC_STATE_REQUESTED);
+    serviceSyncFsRequest(vfs, control, data);
+
+    expect(decodeFsResponse(data)).toEqual({ ok: true, op: FsOp.READLINK, target: "../real.txt" });
+  });
 });

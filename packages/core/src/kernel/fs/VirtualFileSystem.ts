@@ -13,11 +13,20 @@ interface DirNode {
   mtimeMs: number;
 }
 
-type Node = FileNode | DirNode;
+interface SymlinkNode {
+  type: "symlink";
+  /** Stored exactly as given to symlink() - relative (resolved against the
+   * link's own containing directory) or absolute, matching fs.symlinkSync. */
+  target: string;
+  mtimeMs: number;
+}
+
+type Node = FileNode | DirNode | SymlinkNode;
 
 interface Stat {
   isFile(): boolean;
   isDirectory(): boolean;
+  isSymbolicLink(): boolean;
   size: number;
   mtimeMs: number;
 }
@@ -36,6 +45,9 @@ interface VirtualFileSystem {
   readFile(path: string): Uint8Array;
   readdir(path: string): string[];
   stat(path: string): Stat;
+  lstat(path: string): Stat;
+  symlink(target: string, path: string): void;
+  readlink(path: string): string;
   rm(path: string, options?: RmOptions): void;
   rename(from: string, to: string): void;
   exists(path: string): boolean;
@@ -43,29 +55,90 @@ interface VirtualFileSystem {
 
 const encoder = new TextEncoder();
 
+// A cyclic symlink chain must fail (ELOOP) rather than recurse forever; this
+// bound is well past anything a real filesystem tree would legitimately nest.
+const MAX_SYMLINK_DEPTH = 40;
+
 const createVirtualFileSystem = (): VirtualFileSystem => {
   const root: DirNode = { type: "dir", children: new Map(), mtimeMs: Date.now() };
 
+  /**
+   * Resolves a path to a fully symlink-free absolute path string, following
+   * every symlink found at a non-final segment (POSIX never treats an
+   * intermediate symlink specially) and the final segment only when
+   * `followFinal` is true. Everything else (resolveNode/resolveParent) walks
+   * the tree directly on the string this returns, so none of the existing
+   * tree-walking logic needs to know about symlinks at all.
+   */
+  const resolveRealPath = (normalized: string, followFinal: boolean, depth = 0): string => {
+    if (depth > MAX_SYMLINK_DEPTH) throw new FSError("ELOOP", normalized);
+
+    const segs = pathSegments(normalized);
+    let dir: DirNode = root;
+    const resolvedSegs: string[] = [];
+
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]!;
+      const isLast = i === segs.length - 1;
+
+      const child = dir.children.get(seg);
+      if (!child) throw new FSError("ENOENT", normalized);
+
+      if (child.type === "symlink" && (!isLast || followFinal)) {
+        const currentDir = resolvedSegs.length === 0 ? "/" : `/${resolvedSegs.join("/")}`;
+        const targetPath = child.target.startsWith("/") ? child.target : normalize(`${currentDir}/${child.target}`);
+        const resolvedTarget = resolveRealPath(targetPath, true, depth + 1);
+        if (isLast) return resolvedTarget;
+        const remaining = segs.slice(i + 1).join("/");
+        return resolveRealPath(normalize(`${resolvedTarget}/${remaining}`), followFinal, depth + 1);
+      }
+
+      resolvedSegs.push(seg);
+      if (!isLast) {
+        if (child.type !== "dir") throw new FSError("ENOTDIR", normalized);
+        dir = child;
+      }
+    }
+
+    return resolvedSegs.length === 0 ? "/" : `/${resolvedSegs.join("/")}`;
+  };
+
+  /**
+   * Unlike resolveNode, the final segment here is NOT required to exist (this
+   * is how a new file/dir/symlink gets created, or an existing one is
+   * inspected before being replaced/removed) - so only the CONTAINING
+   * directory (everything but the last segment) is resolved through
+   * resolveRealPath (which does require every segment along the way to
+   * exist), following any symlinks within it. The final segment is never
+   * looked up or dereferenced here; callers decide what to do with whatever
+   * (if anything) already occupies that name.
+   */
   const resolveParent = (normalized: string): { parent: DirNode; name: string } => {
     const segs = pathSegments(normalized);
     if (segs.length === 0) {
       throw new FSError("EINVAL", normalized, "Cannot operate on the root directory");
     }
+    const name = segs[segs.length - 1]!;
+    if (segs.length === 1) return { parent: root, name };
 
-    const name = segs[segs.length - 1];
-    let dir = root;
-    for (let i = 0; i < segs.length - 1; i++) {
-      const child = dir.children.get(segs[i]);
+    const dirPath = `/${segs.slice(0, -1).join("/")}`;
+    const realDirPath = resolveRealPath(dirPath, true);
+
+    let dir: Node = root;
+    for (const segment of pathSegments(realDirPath)) {
+      if (dir.type !== "dir") throw new FSError("ENOTDIR", normalized);
+      const child = dir.children.get(segment);
       if (!child) throw new FSError("ENOENT", normalized);
-      if (child.type !== "dir") throw new FSError("ENOTDIR", normalized);
       dir = child;
     }
+    if (dir.type !== "dir") throw new FSError("ENOTDIR", normalized);
     return { parent: dir, name };
   };
 
-  const resolveNode = (normalized: string): Node => {
+  const resolveNode = (normalized: string, followSymlinks = true): Node => {
+    const real = resolveRealPath(normalized, followSymlinks);
     let node: Node = root;
-    for (const segment of pathSegments(normalized)) {
+    for (const segment of pathSegments(real)) {
       if (node.type !== "dir") throw new FSError("ENOTDIR", normalized);
       const child = node.children.get(segment);
       if (!child) throw new FSError("ENOENT", normalized);
@@ -86,6 +159,11 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
       return;
     }
 
+    // Does not resolve an intermediate symlink (an already-existing one
+    // pointing at a real directory would incorrectly ENOTDIR here) - not
+    // exercised by how this runtime's own tooling creates directories, since
+    // symlinks are only ever created as leaf entries (e.g. node_modules/.bin
+    // shims), never as a directory a later mkdir -p walks through.
     let dir = root;
     for (const segment of segs) {
       let child = dir.children.get(segment);
@@ -124,15 +202,36 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     return [...node.children.keys()].sort();
   };
 
+  const statOf = (normalized: string, node: Node): Stat => ({
+    isFile: () => node.type === "file",
+    isDirectory: () => node.type === "dir",
+    isSymbolicLink: () => node.type === "symlink",
+    size: node.type === "file" ? node.contents.byteLength : 0,
+    mtimeMs: node.mtimeMs,
+  });
+
   const stat = (path: string): Stat => {
     const normalized = normalize(path);
-    const node = resolveNode(normalized);
-    return {
-      isFile: () => node.type === "file",
-      isDirectory: () => node.type === "dir",
-      size: node.type === "file" ? node.contents.byteLength : 0,
-      mtimeMs: node.mtimeMs,
-    };
+    return statOf(normalized, resolveNode(normalized));
+  };
+
+  const lstat = (path: string): Stat => {
+    const normalized = normalize(path);
+    return statOf(normalized, resolveNode(normalized, false));
+  };
+
+  const symlink = (target: string, path: string): void => {
+    const normalized = normalize(path);
+    const { parent, name } = resolveParent(normalized);
+    if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
+    parent.children.set(name, { type: "symlink", target, mtimeMs: Date.now() });
+  };
+
+  const readlink = (path: string): string => {
+    const normalized = normalize(path);
+    const node = resolveNode(normalized, false);
+    if (node.type !== "symlink") throw new FSError("EINVAL", normalized, "Not a symbolic link");
+    return node.target;
   };
 
   const rm = (path: string, options: RmOptions = {}): void => {
@@ -168,8 +267,8 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     }
   };
 
-  return { mkdir, writeFile, readFile, readdir, stat, rm, rename, exists };
+  return { mkdir, writeFile, readFile, readdir, stat, lstat, symlink, readlink, rm, rename, exists };
 };
 
 export { createVirtualFileSystem };
-export type { DirNode, FileNode, MkdirOptions, Node, RmOptions, Stat, VirtualFileSystem };
+export type { DirNode, FileNode, MkdirOptions, Node, RmOptions, Stat, SymlinkNode, VirtualFileSystem };

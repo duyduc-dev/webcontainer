@@ -23,13 +23,15 @@ const executeFsRequest = (vfs: VirtualFileSystem, request: FsRequest): FsRespons
       return { ok: true, op: FsOp.MKDIR };
     case FsOp.READDIR:
       return { ok: true, op: FsOp.READDIR, entries: vfs.readdir(request.path) };
-    case FsOp.STAT: {
-      const stat = vfs.stat(request.path);
+    case FsOp.STAT:
+    case FsOp.LSTAT: {
+      const stat = request.op === FsOp.STAT ? vfs.stat(request.path) : vfs.lstat(request.path);
       return {
         ok: true,
-        op: FsOp.STAT,
+        op: request.op,
         isFile: stat.isFile(),
         isDirectory: stat.isDirectory(),
+        isSymbolicLink: stat.isSymbolicLink(),
         size: stat.size,
         mtimeMs: stat.mtimeMs,
       };
@@ -42,6 +44,11 @@ const executeFsRequest = (vfs: VirtualFileSystem, request: FsRequest): FsRespons
       return { ok: true, op: FsOp.RENAME };
     case FsOp.EXISTS:
       return { ok: true, op: FsOp.EXISTS, exists: vfs.exists(request.path) };
+    case FsOp.SYMLINK:
+      vfs.symlink(request.target, request.path);
+      return { ok: true, op: FsOp.SYMLINK };
+    case FsOp.READLINK:
+      return { ok: true, op: FsOp.READLINK, target: vfs.readlink(request.path) };
   }
 };
 

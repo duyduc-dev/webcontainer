@@ -75,6 +75,22 @@ describe("syncWireFormat requests", () => {
     expect(roundTripRequest({ op: FsOp.EXISTS, path: "/a" })).toEqual({ op: FsOp.EXISTS, path: "/a" });
   });
 
+  it("round-trips SYMLINK", () => {
+    expect(roundTripRequest({ op: FsOp.SYMLINK, target: "../real.txt", path: "/a/link.txt" })).toEqual({
+      op: FsOp.SYMLINK,
+      target: "../real.txt",
+      path: "/a/link.txt",
+    });
+  });
+
+  it("round-trips READLINK", () => {
+    expect(roundTripRequest({ op: FsOp.READLINK, path: "/link.txt" })).toEqual({ op: FsOp.READLINK, path: "/link.txt" });
+  });
+
+  it("round-trips LSTAT", () => {
+    expect(roundTripRequest({ op: FsOp.LSTAT, path: "/link.txt" })).toEqual({ op: FsOp.LSTAT, path: "/link.txt" });
+  });
+
   it("round-trips a unicode path", () => {
     expect(roundTripRequest({ op: FsOp.READ_FILE, path: "/日本語/файл.txt" })).toEqual({
       op: FsOp.READ_FILE,
@@ -107,10 +123,36 @@ describe("syncWireFormat responses", () => {
       op: FsOp.STAT,
       isFile: true,
       isDirectory: false,
+      isSymbolicLink: false,
       size: 1234,
       mtimeMs: Date.now(),
     };
     expect(roundTripResponse(response)).toEqual(response);
+  });
+
+  it("round-trips an LSTAT success response reporting a symlink", () => {
+    const response: FsResponse = {
+      ok: true,
+      op: FsOp.LSTAT,
+      isFile: false,
+      isDirectory: false,
+      isSymbolicLink: true,
+      size: 0,
+      mtimeMs: Date.now(),
+    };
+    expect(roundTripResponse(response)).toEqual(response);
+  });
+
+  it("round-trips a SYMLINK success response", () => {
+    expect(roundTripResponse({ ok: true, op: FsOp.SYMLINK })).toEqual({ ok: true, op: FsOp.SYMLINK });
+  });
+
+  it("round-trips a READLINK success response", () => {
+    expect(roundTripResponse({ ok: true, op: FsOp.READLINK, target: "../real.txt" })).toEqual({
+      ok: true,
+      op: FsOp.READLINK,
+      target: "../real.txt",
+    });
   });
 
   it("round-trips an EXISTS success response", () => {

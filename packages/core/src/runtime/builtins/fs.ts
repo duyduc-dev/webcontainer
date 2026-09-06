@@ -9,6 +9,7 @@ interface FsBuiltinIO {
 interface StatResult {
   isFile(): boolean;
   isDirectory(): boolean;
+  isSymbolicLink(): boolean;
   size: number;
   mtimeMs: number;
 }
@@ -19,6 +20,9 @@ interface FsBuiltin {
   mkdirSync(path: string, options?: { recursive?: boolean }): void;
   readdirSync(path: string): string[];
   statSync(path: string): StatResult;
+  lstatSync(path: string): StatResult;
+  symlinkSync(target: string, path: string): void;
+  readlinkSync(path: string): string;
   rmSync(path: string, options?: { recursive?: boolean }): void;
   renameSync(from: string, to: string): void;
   existsSync(path: string): boolean;
@@ -55,13 +59,31 @@ const createFsBuiltin = (io: FsBuiltinIO): FsBuiltin => {
       return response.entries;
     },
     statSync(path) {
-      const response = call({ op: FsOp.STAT, path }) as Extract<FsResponseOk, { op: FsOp.STAT }>;
+      const response = call({ op: FsOp.STAT, path }) as Extract<FsResponseOk, { op: FsOp.STAT | FsOp.LSTAT }>;
       return {
         isFile: () => response.isFile,
         isDirectory: () => response.isDirectory,
+        isSymbolicLink: () => response.isSymbolicLink,
         size: response.size,
         mtimeMs: response.mtimeMs,
       };
+    },
+    lstatSync(path) {
+      const response = call({ op: FsOp.LSTAT, path }) as Extract<FsResponseOk, { op: FsOp.STAT | FsOp.LSTAT }>;
+      return {
+        isFile: () => response.isFile,
+        isDirectory: () => response.isDirectory,
+        isSymbolicLink: () => response.isSymbolicLink,
+        size: response.size,
+        mtimeMs: response.mtimeMs,
+      };
+    },
+    symlinkSync(target, path) {
+      call({ op: FsOp.SYMLINK, target, path });
+    },
+    readlinkSync(path) {
+      const response = call({ op: FsOp.READLINK, path }) as Extract<FsResponseOk, { op: FsOp.READLINK }>;
+      return response.target;
     },
     rmSync(path, options = {}) {
       call({ op: FsOp.RM, path, recursive: options.recursive ?? false });

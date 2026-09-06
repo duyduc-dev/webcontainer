@@ -1,4 +1,4 @@
-type FSErrorCode = "ENOENT" | "EEXIST" | "ENOTDIR" | "EISDIR" | "ENOTEMPTY" | "EINVAL" | "EFBIG";
+type FSErrorCode = "ENOENT" | "EEXIST" | "ENOTDIR" | "EISDIR" | "ENOTEMPTY" | "EINVAL" | "EFBIG" | "ELOOP";
 
 class FSError extends Error {
   code: FSErrorCode;

@@ -123,4 +123,94 @@ describe("VirtualFileSystem", () => {
     const vfs = createVirtualFileSystem();
     expect(vfs.exists("/nope")).toBe(false);
   });
+
+  it("readFile follows a symlink to a file (absolute target)", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.txt", "hi");
+    vfs.symlink("/real.txt", "/link.txt");
+    expect(new TextDecoder().decode(vfs.readFile("/link.txt"))).toBe("hi");
+  });
+
+  it("readFile follows a symlink with a relative target, resolved against the link's own directory", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.mkdir("/a", { recursive: true });
+    vfs.mkdir("/b", { recursive: true });
+    vfs.writeFile("/b/real.txt", "hi");
+    vfs.symlink("../b/real.txt", "/a/link.txt");
+    expect(new TextDecoder().decode(vfs.readFile("/a/link.txt"))).toBe("hi");
+  });
+
+  it("follows a symlink to a directory as an intermediate path segment", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.mkdir("/real-dir", { recursive: true });
+    vfs.writeFile("/real-dir/file.txt", "hi");
+    vfs.symlink("/real-dir", "/link-dir");
+    expect(new TextDecoder().decode(vfs.readFile("/link-dir/file.txt"))).toBe("hi");
+    expect(vfs.readdir("/link-dir")).toEqual(["file.txt"]);
+  });
+
+  it("throws ELOOP on a cyclic symlink", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.symlink("/b", "/a");
+    vfs.symlink("/a", "/b");
+    expect(() => vfs.readFile("/a")).toThrow(expect.objectContaining({ code: "ELOOP" }));
+  });
+
+  it("lstat reports a symlink as a link; stat reports what it points to", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.txt", "hi");
+    vfs.symlink("/real.txt", "/link.txt");
+
+    const link = vfs.lstat("/link.txt");
+    expect(link.isSymbolicLink()).toBe(true);
+    expect(link.isFile()).toBe(false);
+
+    const target = vfs.stat("/link.txt");
+    expect(target.isSymbolicLink()).toBe(false);
+    expect(target.isFile()).toBe(true);
+  });
+
+  it("stat throws ENOENT for a dangling symlink; lstat still succeeds", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.symlink("/does-not-exist", "/link.txt");
+
+    expect(() => vfs.stat("/link.txt")).toThrow(expect.objectContaining({ code: "ENOENT" }));
+    expect(vfs.lstat("/link.txt").isSymbolicLink()).toBe(true);
+  });
+
+  it("readlink returns the raw stored target string", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.txt", "hi");
+    vfs.symlink("./real.txt", "/link.txt");
+    expect(vfs.readlink("/link.txt")).toBe("./real.txt");
+  });
+
+  it("readlink throws EINVAL for a path that is not a symlink", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.txt", "hi");
+    expect(() => vfs.readlink("/real.txt")).toThrow(expect.objectContaining({ code: "EINVAL" }));
+  });
+
+  it("rm removes the symlink itself, not its target", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.txt", "hi");
+    vfs.symlink("/real.txt", "/link.txt");
+    vfs.rm("/link.txt");
+    expect(vfs.exists("/link.txt")).toBe(false);
+    expect(vfs.exists("/real.txt")).toBe(true);
+  });
+
+  it("readdir lists a symlink by its own name, without following it", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.mkdir("/dir", { recursive: true });
+    vfs.writeFile("/real.txt", "hi");
+    vfs.symlink("/real.txt", "/dir/link.txt");
+    expect(vfs.readdir("/dir")).toEqual(["link.txt"]);
+  });
+
+  it("symlink throws EEXIST when the path is already taken", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/taken", "x");
+    expect(() => vfs.symlink("/anything", "/taken")).toThrow(expect.objectContaining({ code: "EEXIST" }));
+  });
 });

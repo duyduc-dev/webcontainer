@@ -272,6 +272,29 @@ async function main() {
     pipeToTerminal(requireDemo.stderr, terminal);
     const requireDemoExit = await requireDemo.exit;
     console.log("[dwc] require-node-modules-demo exited with code", requireDemoExit);
+
+    // VFS symlink support demo (real-npm prerequisite: node_modules/.bin
+    // shims are symlinks) — dwc.fs.symlink() at the host level, then a
+    // spawned script's require('fs') resolves through it, and lstat/stat
+    // correctly distinguish the link from what it points to.
+    await dwc.fs.writeFile("/symlink-target.txt", "hello through a symlink");
+    await dwc.fs.symlink("/symlink-target.txt", "/symlink-link.txt");
+    await dwc.fs.writeFile(
+      "/symlink-demo.js",
+      [
+        "const fs = require('fs');",
+        "console.log('[symlink] readFile ->', new TextDecoder().decode(fs.readFileSync('/symlink-link.txt')));",
+        "console.log('[symlink] lstat.isSymbolicLink ->', fs.lstatSync('/symlink-link.txt').isSymbolicLink());",
+        "console.log('[symlink] stat.isSymbolicLink ->', fs.statSync('/symlink-link.txt').isSymbolicLink());",
+        "console.log('[symlink] readlink ->', fs.readlinkSync('/symlink-link.txt'));",
+        "",
+      ].join("\n"),
+    );
+    const symlinkDemo = await dwc.process.spawn("/symlink-demo.js");
+    pipeToTerminal(symlinkDemo.stdout, terminal);
+    pipeToTerminal(symlinkDemo.stderr, terminal);
+    const symlinkDemoExit = await symlinkDemo.exit;
+    console.log("[dwc] symlink-demo exited with code", symlinkDemoExit);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

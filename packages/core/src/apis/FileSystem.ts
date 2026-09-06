@@ -14,6 +14,7 @@ interface RmOptions {
 interface StatResult {
   isFile(): boolean;
   isDirectory(): boolean;
+  isSymbolicLink(): boolean;
   size: number;
   mtimeMs: number;
 }
@@ -24,6 +25,9 @@ interface FileSystemAPI {
   readFile(path: string): Promise<Uint8Array>;
   readdir(path: string): Promise<string[]>;
   stat(path: string): Promise<StatResult>;
+  lstat(path: string): Promise<StatResult>;
+  symlink(target: string, path: string): Promise<void>;
+  readlink(path: string): Promise<string>;
   rm(path: string, options?: RmOptions): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   exists(path: string): Promise<boolean>;
@@ -51,16 +55,33 @@ const createFileSystemAPI = (request: Requester): FileSystemAPI => {
     readFile: (path) => call<Uint8Array>("readFile", { path }),
     readdir: (path) => call<string[]>("readdir", { path }),
     stat: async (path) => {
-      const result = await call<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMs: number }>("stat", {
-        path,
-      });
+      const result = await call<{ isFile: boolean; isDirectory: boolean; isSymbolicLink: boolean; size: number; mtimeMs: number }>(
+        "stat",
+        { path },
+      );
       return {
         isFile: () => result.isFile,
         isDirectory: () => result.isDirectory,
+        isSymbolicLink: () => result.isSymbolicLink,
         size: result.size,
         mtimeMs: result.mtimeMs,
       };
     },
+    lstat: async (path) => {
+      const result = await call<{ isFile: boolean; isDirectory: boolean; isSymbolicLink: boolean; size: number; mtimeMs: number }>(
+        "lstat",
+        { path },
+      );
+      return {
+        isFile: () => result.isFile,
+        isDirectory: () => result.isDirectory,
+        isSymbolicLink: () => result.isSymbolicLink,
+        size: result.size,
+        mtimeMs: result.mtimeMs,
+      };
+    },
+    symlink: (target, path) => call("symlink", { target, path }),
+    readlink: (path) => call<string>("readlink", { path }),
     rm: (path, options) => call("rm", { path, recursive: options?.recursive }),
     rename: (from, to) => call("rename", { from, to }),
     exists: (path) => call<boolean>("exists", { path }),
