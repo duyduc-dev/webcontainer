@@ -10,9 +10,10 @@ export default defineConfig([
   },
   {
     entry: {
-      "workers/kernel/KernelWorker": "src/workers/kernel/KernelWorker.ts",
-      "workers/guest/GuestWorker": "src/workers/guest/GuestWorker.ts",
-      "workers/preview/PreviewServiceWorker": "src/workers/preview/PreviewServiceWorker.ts",
+      "workers/kernel/worker": "src/workers/kernel/worker.ts",
+      "workers/fs/worker": "src/workers/fs/worker.ts",
+      "workers/process/worker": "src/workers/process/worker.ts",
+      "workers/fetcher/worker": "src/workers/fetcher/worker.ts",
     },
     format: ["esm"],
     sourcemap: true,

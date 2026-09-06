@@ -1,0 +1,96 @@
+import type { PipeRelayMessage } from "../../runtime/node/bindings/net";
+
+/**
+ * Cross-process net relay: lets two separate guest processes (each its own
+ * Process Worker) reach each other's `net.Server`s. Same-process net.Server/
+ * net.Socket needs none of this (bindings/net.ts's in-memory loopback handles
+ * it directly) — this is only the seam for "a different process owns the
+ * port/path I'm dialing."
+ *
+ * Mirrors the Phase 7 net-request/net-response fetch bridge's shape (kernel
+ * as the only party that can reach the destination), generalized to a
+ * persistent, multi-message connection instead of one request/response:
+ * `pipeConnect` mints a connection id and remembers which two processes it
+ * joins; `relay` forwards a data/shutdown/close message to whichever end
+ * didn't send it, for the life of that connection.
+ */
+interface NetRelay {
+  registerWorker(processId: string, worker: Worker): void;
+  unregisterWorker(processId: string): void;
+  /** Fire-and-forget port/path registration — see bindings/net.ts's file
+   * header for why this can't be a synchronous, retryable kernel round-trip
+   * the way vivari's Atomics.wait-backed bridge allows. */
+  listen(processId: string, port: number): void;
+  closeServer(port: number): void;
+  pipeListen(processId: string, key: string): void;
+  pipeCloseServer(key: string): void;
+  /** Synchronous: a local Map lookup + one postMessage to the server's
+   * worker. Returns connId 0 when nobody in the VM owns `key`. */
+  pipeConnect(clientProcessId: string, key: string): number;
+  /** Forwards a relayed message to whichever end of `connId` did NOT send it. */
+  relay(fromProcessId: string, message: PipeRelayMessage): void;
+}
+
+const createNetRelay = (): NetRelay => {
+  const workers = new Map<string, Worker>();
+  const listeners = new Map<number, string>(); // port -> processId
+  const pipeListeners = new Map<string, string>(); // path/key -> processId
+  const pipeConns = new Map<number, { clientProcessId: string; serverProcessId: string }>();
+  let nextConnId = 1;
+
+  const send = (processId: string, message: { type: string; payload: unknown }): void => {
+    workers.get(processId)?.postMessage(message);
+  };
+
+  const registerWorker = (processId: string, worker: Worker): void => {
+    workers.set(processId, worker);
+  };
+
+  const unregisterWorker = (processId: string): void => {
+    workers.delete(processId);
+    for (const [port, owner] of listeners) if (owner === processId) listeners.delete(port);
+    for (const [key, owner] of pipeListeners) if (owner === processId) pipeListeners.delete(key);
+    for (const [connId, conn] of pipeConns) {
+      if (conn.clientProcessId === processId || conn.serverProcessId === processId) pipeConns.delete(connId);
+    }
+  };
+
+  const listen = (processId: string, port: number): void => {
+    listeners.set(port, processId);
+  };
+
+  const closeServer = (port: number): void => {
+    listeners.delete(port);
+  };
+
+  const pipeListen = (processId: string, key: string): void => {
+    pipeListeners.set(key, processId);
+  };
+
+  const pipeCloseServer = (key: string): void => {
+    pipeListeners.delete(key);
+  };
+
+  const pipeConnect = (clientProcessId: string, key: string): number => {
+    const serverProcessId = pipeListeners.get(key);
+    if (!serverProcessId || !workers.has(serverProcessId)) return 0;
+
+    const connId = nextConnId++;
+    pipeConns.set(connId, { clientProcessId, serverProcessId });
+    send(serverProcessId, { type: "net-pipe-message", payload: { type: "pipe-open", connId, path: key } satisfies PipeRelayMessage });
+    return connId;
+  };
+
+  const relay = (fromProcessId: string, message: PipeRelayMessage): void => {
+    const conn = pipeConns.get(message.connId);
+    if (!conn) return;
+    const toProcessId = conn.clientProcessId === fromProcessId ? conn.serverProcessId : conn.clientProcessId;
+    send(toProcessId, { type: "net-pipe-message", payload: message });
+    if (message.type === "pipe-close") pipeConns.delete(message.connId);
+  };
+
+  return { registerWorker, unregisterWorker, listen, closeServer, pipeListen, pipeCloseServer, pipeConnect, relay };
+};
+
+export { createNetRelay };
+export type { NetRelay };

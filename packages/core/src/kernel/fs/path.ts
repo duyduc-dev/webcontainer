@@ -1,52 +1,30 @@
-import { FSError } from "./FSError";
+/** All paths are treated as absolute against the VFS root, regardless of a leading "/". */
+const normalize = (path: string): string => {
+  const parts = path.split("/").filter((segment) => segment.length > 0 && segment !== ".");
 
-export function isAbsolute(path: string): boolean {
-  return path.startsWith("/");
-}
-
-export function normalize(path: string): string {
-  if (!isAbsolute(path)) {
-    throw new FSError("EINVAL", path, `path must be absolute: ${path}`);
-  }
-
-  const segments = path.split("/");
   const stack: string[] = [];
-
-  for (const segment of segments) {
-    if (segment === "" || segment === ".") {
-      continue;
-    }
-    if (segment === "..") {
-      stack.pop();
-      continue;
-    }
-    stack.push(segment);
+  for (const segment of parts) {
+    if (segment === "..") stack.pop();
+    else stack.push(segment);
   }
 
-  return stack.length === 0 ? "/" : `/${stack.join("/")}`;
-}
+  return `/${stack.join("/")}`;
+};
 
-export function join(...segments: string[]): string {
-  const nonEmpty = segments.filter((segment) => segment !== "");
-  return normalize(nonEmpty.join("/"));
-}
-
-export function dirname(path: string): string {
+const dirname = (path: string): string => {
   const normalized = normalize(path);
-  if (normalized === "/") {
-    return "/";
-  }
+  const index = normalized.lastIndexOf("/");
+  return index <= 0 ? "/" : normalized.slice(0, index);
+};
 
-  const lastSlash = normalized.lastIndexOf("/");
-  const parent = normalized.slice(0, lastSlash);
-  return parent === "" ? "/" : parent;
-}
-
-export function basename(path: string): string {
+const basename = (path: string): string => {
   const normalized = normalize(path);
-  if (normalized === "/") {
-    return "";
-  }
-
   return normalized.slice(normalized.lastIndexOf("/") + 1);
-}
+};
+
+const segments = (path: string): string[] => {
+  const normalized = normalize(path);
+  return normalized === "/" ? [] : normalized.slice(1).split("/");
+};
+
+export { basename, dirname, normalize, segments };

@@ -1,155 +1,296 @@
 import { FSError } from "./FSError";
-import { normalize, dirname, basename } from "./path";
+import { normalize, segments as pathSegments } from "./path";
 
-type DirNode = { type: "dir"; children: Map<string, Node>; mtime: number };
-type FileNode = { type: "file"; content: Uint8Array; mtime: number };
-type Node = DirNode | FileNode;
-
-export type FileStat = { type: "file" | "dir"; size: number; mtime: number };
-
-function segmentsOf(normalizedPath: string): string[] {
-  return normalizedPath === "/" ? [] : normalizedPath.slice(1).split("/");
+interface FileNode {
+  type: "file";
+  contents: Uint8Array;
+  mtimeMs: number;
+  mode: number;
 }
 
-export class VirtualFileSystem {
-  private readonly root: DirNode = {
-    type: "dir",
-    children: new Map(),
-    mtime: Date.now(),
+interface DirNode {
+  type: "dir";
+  children: Map<string, Node>;
+  mtimeMs: number;
+  mode: number;
+}
+
+interface SymlinkNode {
+  type: "symlink";
+  /** Stored exactly as given to symlink() - relative (resolved against the
+   * link's own containing directory) or absolute, matching fs.symlinkSync. */
+  target: string;
+  mtimeMs: number;
+}
+
+type Node = FileNode | DirNode | SymlinkNode;
+
+interface Stat {
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+  size: number;
+  mode: number;
+  mtimeMs: number;
+}
+
+interface MkdirOptions {
+  recursive?: boolean;
+}
+
+interface RmOptions {
+  recursive?: boolean;
+}
+
+interface VirtualFileSystem {
+  mkdir(path: string, options?: MkdirOptions): void;
+  writeFile(path: string, contents: string | Uint8Array): void;
+  readFile(path: string): Uint8Array;
+  readdir(path: string): string[];
+  stat(path: string): Stat;
+  lstat(path: string): Stat;
+  chmod(path: string, mode: number): void;
+  symlink(target: string, path: string): void;
+  readlink(path: string): string;
+  rm(path: string, options?: RmOptions): void;
+  rename(from: string, to: string): void;
+  exists(path: string): boolean;
+}
+
+const encoder = new TextEncoder();
+
+// A cyclic symlink chain must fail (ELOOP) rather than recurse forever; this
+// bound is well past anything a real filesystem tree would legitimately nest.
+const MAX_SYMLINK_DEPTH = 40;
+
+const createVirtualFileSystem = (): VirtualFileSystem => {
+  const root: DirNode = { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 };
+
+  /**
+   * Resolves a path to a fully symlink-free absolute path string, following
+   * every symlink found at a non-final segment (POSIX never treats an
+   * intermediate symlink specially) and the final segment only when
+   * `followFinal` is true. Everything else (resolveNode/resolveParent) walks
+   * the tree directly on the string this returns, so none of the existing
+   * tree-walking logic needs to know about symlinks at all.
+   */
+  const resolveRealPath = (normalized: string, followFinal: boolean, depth = 0): string => {
+    if (depth > MAX_SYMLINK_DEPTH) throw new FSError("ELOOP", normalized);
+
+    const segs = pathSegments(normalized);
+    let dir: DirNode = root;
+    const resolvedSegs: string[] = [];
+
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]!;
+      const isLast = i === segs.length - 1;
+
+      const child = dir.children.get(seg);
+      if (!child) throw new FSError("ENOENT", normalized);
+
+      if (child.type === "symlink" && (!isLast || followFinal)) {
+        const currentDir = resolvedSegs.length === 0 ? "/" : `/${resolvedSegs.join("/")}`;
+        const targetPath = child.target.startsWith("/") ? child.target : normalize(`${currentDir}/${child.target}`);
+        const resolvedTarget = resolveRealPath(targetPath, true, depth + 1);
+        if (isLast) return resolvedTarget;
+        const remaining = segs.slice(i + 1).join("/");
+        return resolveRealPath(normalize(`${resolvedTarget}/${remaining}`), followFinal, depth + 1);
+      }
+
+      resolvedSegs.push(seg);
+      if (!isLast) {
+        if (child.type !== "dir") throw new FSError("ENOTDIR", normalized);
+        dir = child;
+      }
+    }
+
+    return resolvedSegs.length === 0 ? "/" : `/${resolvedSegs.join("/")}`;
   };
 
-  private resolveNode(path: string): Node | undefined {
-    const normalized = normalize(path);
-    let current: Node = this.root;
-    for (const segment of segmentsOf(normalized)) {
-      if (current.type !== "dir") return undefined;
-      const next = current.children.get(segment);
-      if (!next) return undefined;
-      current = next;
+  /**
+   * Unlike resolveNode, the final segment here is NOT required to exist (this
+   * is how a new file/dir/symlink gets created, or an existing one is
+   * inspected before being replaced/removed) - so only the CONTAINING
+   * directory (everything but the last segment) is resolved through
+   * resolveRealPath (which does require every segment along the way to
+   * exist), following any symlinks within it. The final segment is never
+   * looked up or dereferenced here; callers decide what to do with whatever
+   * (if anything) already occupies that name.
+   */
+  const resolveParent = (normalized: string): { parent: DirNode; name: string } => {
+    const segs = pathSegments(normalized);
+    if (segs.length === 0) {
+      throw new FSError("EINVAL", normalized, "Cannot operate on the root directory");
     }
-    return current;
-  }
+    const name = segs[segs.length - 1]!;
+    if (segs.length === 1) return { parent: root, name };
 
-  private getDir(path: string): DirNode {
-    const node = this.resolveNode(path);
-    if (!node) throw new FSError("ENOENT", path);
-    if (node.type !== "dir") throw new FSError("ENOTDIR", path);
+    const dirPath = `/${segs.slice(0, -1).join("/")}`;
+    const realDirPath = resolveRealPath(dirPath, true);
+
+    let dir: Node = root;
+    for (const segment of pathSegments(realDirPath)) {
+      if (dir.type !== "dir") throw new FSError("ENOTDIR", normalized);
+      const child = dir.children.get(segment);
+      if (!child) throw new FSError("ENOENT", normalized);
+      dir = child;
+    }
+    if (dir.type !== "dir") throw new FSError("ENOTDIR", normalized);
+    return { parent: dir, name };
+  };
+
+  const resolveNode = (normalized: string, followSymlinks = true): Node => {
+    const real = resolveRealPath(normalized, followSymlinks);
+    let node: Node = root;
+    for (const segment of pathSegments(real)) {
+      if (node.type !== "dir") throw new FSError("ENOTDIR", normalized);
+      const child = node.children.get(segment);
+      if (!child) throw new FSError("ENOENT", normalized);
+      node = child;
+    }
     return node;
-  }
+  };
 
-  exists(path: string): boolean {
-    return this.resolveNode(path) !== undefined;
-  }
-
-  mkdir(path: string, opts?: { recursive?: boolean }): void {
+  const mkdir = (path: string, options: MkdirOptions = {}): void => {
     const normalized = normalize(path);
-    if (normalized === "/") {
-      if (opts?.recursive) return;
-      throw new FSError("EEXIST", path);
-    }
+    const segs = pathSegments(normalized);
+    if (segs.length === 0) return;
 
-    if (opts?.recursive) {
-      let current = this.root;
-      let builtPath = "";
-      for (const segment of segmentsOf(normalized)) {
-        builtPath += `/${segment}`;
-        let next = current.children.get(segment);
-        if (!next) {
-          next = { type: "dir", children: new Map(), mtime: Date.now() };
-          current.children.set(segment, next);
-        } else if (next.type !== "dir") {
-          throw new FSError("ENOTDIR", builtPath);
-        }
-        current = next;
-      }
+    if (!options.recursive) {
+      const { parent, name } = resolveParent(normalized);
+      if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
+      parent.children.set(name, { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 });
       return;
     }
 
-    const parent = this.getDir(dirname(normalized));
-    const name = basename(normalized);
-    if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
-    parent.children.set(name, {
-      type: "dir",
-      children: new Map(),
-      mtime: Date.now(),
-    });
-  }
+    // Does not resolve an intermediate symlink (an already-existing one
+    // pointing at a real directory would incorrectly ENOTDIR here) - not
+    // exercised by how this runtime's own tooling creates directories, since
+    // symlinks are only ever created as leaf entries (e.g. node_modules/.bin
+    // shims), never as a directory a later mkdir -p walks through.
+    let dir = root;
+    for (const segment of segs) {
+      let child = dir.children.get(segment);
+      if (!child) {
+        child = { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 };
+        dir.children.set(segment, child);
+      } else if (child.type !== "dir") {
+        throw new FSError("ENOTDIR", normalized);
+      }
+      dir = child;
+    }
+  };
 
-  writeFile(path: string, data: Uint8Array): void {
+  const writeFile = (path: string, contents: string | Uint8Array): void => {
     const normalized = normalize(path);
-    if (normalized === "/") throw new FSError("EISDIR", path);
+    const { parent, name } = resolveParent(normalized);
 
-    const parent = this.getDir(dirname(normalized));
-    const name = basename(normalized);
     const existing = parent.children.get(name);
-    if (existing?.type === "dir") throw new FSError("EISDIR", normalized);
+    if (existing && existing.type === "dir") throw new FSError("EISDIR", normalized);
 
-    parent.children.set(name, {
-      type: "file",
-      content: data,
-      mtime: Date.now(),
-    });
-  }
+    // A rewrite of an existing file keeps its mode (matches real
+    // fs.writeFileSync - only a brand new file gets the default), so a
+    // chmod'd .bin shim doesn't silently lose +x if its contents are
+    // rewritten afterward.
+    const mode = existing?.type === "file" ? existing.mode : 0o644;
+    const bytes = typeof contents === "string" ? encoder.encode(contents) : contents;
+    parent.children.set(name, { type: "file", contents: bytes, mtimeMs: Date.now(), mode });
+  };
 
-  readFile(path: string): Uint8Array {
-    const node = this.resolveNode(path);
-    if (!node) throw new FSError("ENOENT", path);
-    if (node.type === "dir") throw new FSError("EISDIR", path);
-    return node.content;
-  }
-
-  readdir(path: string): string[] {
-    const node = this.resolveNode(path);
-    if (!node) throw new FSError("ENOENT", path);
-    if (node.type !== "dir") throw new FSError("ENOTDIR", path);
-    return [...node.children.keys()];
-  }
-
-  stat(path: string): FileStat {
-    const node = this.resolveNode(path);
-    if (!node) throw new FSError("ENOENT", path);
-    return node.type === "dir"
-      ? { type: "dir", size: 0, mtime: node.mtime }
-      : { type: "file", size: node.content.byteLength, mtime: node.mtime };
-  }
-
-  rm(path: string, opts?: { recursive?: boolean }): void {
+  const readFile = (path: string): Uint8Array => {
     const normalized = normalize(path);
-    if (normalized === "/")
-      throw new FSError("EINVAL", path, "cannot remove root");
+    const node = resolveNode(normalized);
+    if (node.type !== "file") throw new FSError("EISDIR", normalized);
+    return node.contents;
+  };
 
-    const node = this.resolveNode(normalized);
-    if (!node) throw new FSError("ENOENT", path);
-    if (node.type === "dir" && node.children.size > 0 && !opts?.recursive) {
-      throw new FSError("ENOTEMPTY", path);
+  const readdir = (path: string): string[] => {
+    const normalized = normalize(path);
+    const node = resolveNode(normalized);
+    if (node.type !== "dir") throw new FSError("ENOTDIR", normalized);
+    return [...node.children.keys()].sort();
+  };
+
+  const statOf = (normalized: string, node: Node): Stat => ({
+    isFile: () => node.type === "file",
+    isDirectory: () => node.type === "dir",
+    isSymbolicLink: () => node.type === "symlink",
+    size: node.type === "file" ? node.contents.byteLength : 0,
+    // A symlink's own permissions aren't meaningfully enforced on any real
+    // filesystem either - lrwxrwxrwx (0o777) is the universal convention.
+    mode: node.type === "symlink" ? 0o777 : node.mode,
+    mtimeMs: node.mtimeMs,
+  });
+
+  const stat = (path: string): Stat => {
+    const normalized = normalize(path);
+    return statOf(normalized, resolveNode(normalized));
+  };
+
+  const lstat = (path: string): Stat => {
+    const normalized = normalize(path);
+    return statOf(normalized, resolveNode(normalized, false));
+  };
+
+  const chmod = (path: string, mode: number): void => {
+    const normalized = normalize(path);
+    // Follows symlinks, matching real fs.chmodSync - resolveNode's default
+    // never actually returns a raw symlink node (see its own doc comment),
+    // so the type check below is unreachable, just satisfying the type.
+    const node = resolveNode(normalized);
+    if (node.type === "symlink") throw new FSError("EINVAL", normalized, "Cannot chmod a symlink");
+    node.mode = mode;
+  };
+
+  const symlink = (target: string, path: string): void => {
+    const normalized = normalize(path);
+    const { parent, name } = resolveParent(normalized);
+    if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
+    parent.children.set(name, { type: "symlink", target, mtimeMs: Date.now() });
+  };
+
+  const readlink = (path: string): string => {
+    const normalized = normalize(path);
+    const node = resolveNode(normalized, false);
+    if (node.type !== "symlink") throw new FSError("EINVAL", normalized, "Not a symbolic link");
+    return node.target;
+  };
+
+  const rm = (path: string, options: RmOptions = {}): void => {
+    const normalized = normalize(path);
+    const { parent, name } = resolveParent(normalized);
+
+    const node = parent.children.get(name);
+    if (!node) throw new FSError("ENOENT", normalized);
+    if (node.type === "dir" && node.children.size > 0 && !options.recursive) {
+      throw new FSError("ENOTEMPTY", normalized);
     }
+    parent.children.delete(name);
+  };
 
-    const parent = this.getDir(dirname(normalized));
-    parent.children.delete(basename(normalized));
-  }
-
-  rename(from: string, to: string): void {
+  const rename = (from: string, to: string): void => {
     const normalizedFrom = normalize(from);
-    const normalizedTo = normalize(to);
-    if (normalizedFrom === "/")
-      throw new FSError("EINVAL", from, "cannot rename root");
+    const { parent: fromParent, name: fromName } = resolveParent(normalizedFrom);
 
-    const node = this.resolveNode(normalizedFrom);
-    if (!node) throw new FSError("ENOENT", from);
+    const node = fromParent.children.get(fromName);
+    if (!node) throw new FSError("ENOENT", normalizedFrom);
 
-    const toParent = this.getDir(dirname(normalizedTo));
-    const toName = basename(normalizedTo);
-    const existing = toParent.children.get(toName);
-    if (existing && existing.type !== node.type) {
-      throw new FSError(
-        "EINVAL",
-        to,
-        "cannot rename across different node types",
-      );
-    }
-
+    const { parent: toParent, name: toName } = resolveParent(normalize(to));
+    fromParent.children.delete(fromName);
     toParent.children.set(toName, node);
-    const fromParent = this.getDir(dirname(normalizedFrom));
-    fromParent.children.delete(basename(normalizedFrom));
-  }
-}
+  };
+
+  const exists = (path: string): boolean => {
+    try {
+      resolveNode(normalize(path));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  return { mkdir, writeFile, readFile, readdir, stat, lstat, chmod, symlink, readlink, rm, rename, exists };
+};
+
+export { createVirtualFileSystem };
+export type { DirNode, FileNode, MkdirOptions, Node, RmOptions, Stat, SymlinkNode, VirtualFileSystem };

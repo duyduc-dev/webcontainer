@@ -1,55 +1,37 @@
-import { KernelBridge } from "./bridges/kernel/KernelBridge";
-import { FileSystem } from "./apis/FileSystem";
-import { ShellSession } from "./apis/Shell";
-import { Preview } from "./apis/Preview";
-import { UnsubscribeFn } from "./models";
-import { KernelWTBEventType, KernelListenMessage } from "./models/kernel/KernelWorkerToBridgeModels";
-import { logger } from "./utilities/logger";
+import { createFileSystemAPI } from "./apis/FileSystem";
+import type { FileSystemAPI } from "./apis/FileSystem";
+import { createProcessAPI } from "./apis/Process";
+import type { ProcessAPI } from "./apis/Process";
+import { createShellAPI } from "./apis/Shell";
+import type { ShellAPI } from "./apis/Shell";
+import { createKernelBridge } from "./bridges";
+import type { KernelBridgeOptions } from "./bridges";
+import type { Diagnostics } from "./protocol/diagnostics";
 
-type AnyListener = (...args: any[]) => void;
+type Unsubscribe = () => void;
+type Handler = (payload?: any) => void;
 
-export class DuckWebContainer {
-  private readonly kernelBridge;
-  private readonly listeners = new Map<string, Set<AnyListener>>();
-  readonly fs: FileSystem;
-  readonly shell: ShellSession;
-  readonly preview: Preview;
+interface BootDWCOptions extends KernelBridgeOptions {}
 
-  constructor(bridge: KernelBridge) {
-    const kernelBridge = bridge;
-    this.kernelBridge = kernelBridge;
-    this.fs = new FileSystem(kernelBridge);
-    this.shell = new ShellSession(kernelBridge, "default");
-    this.preview = new Preview(kernelBridge);
-
-    kernelBridge.on(KernelWTBEventType.PING, () => {
-      logger.info("Connected to Kernel Worker");
-    });
-
-    kernelBridge.on(KernelWTBEventType.LISTEN, (message) => {
-      const { port } = message as KernelListenMessage;
-      this.emitFromBridge("listen", { port });
-    });
-  }
-
-  static initialize() {
-    const bridge = new KernelBridge();
-    return new DuckWebContainer(bridge);
-  }
-
-  on(type: string, handler: AnyListener): UnsubscribeFn {
-    let handlersSet = this.listeners.get(type) ?? new Set();
-    handlersSet.add(handler);
-    this.listeners.set(type, handlersSet);
-    return () => handlersSet.delete(handler);
-  }
-
-  off(event: string, listener: AnyListener): void {
-    this.listeners.get(event)?.delete(listener);
-  }
-
-  private emitFromBridge(event: string, data: any) {
-    const set = this.listeners.get(event);
-    if (set) for (const h of set) h(data);
-  }
+interface BootDWCReturn {
+  diagnostics: Diagnostics;
+  fs: FileSystemAPI;
+  process: ProcessAPI;
+  shell: ShellAPI;
+  addEventListener(type: string, handler: Handler): Unsubscribe;
 }
+
+const bootDWC = async (options: BootDWCOptions = {}): Promise<BootDWCReturn> => {
+  const kernelBridge = await createKernelBridge(options);
+
+  return {
+    diagnostics: kernelBridge.diagnostics,
+    fs: createFileSystemAPI(kernelBridge.request),
+    process: createProcessAPI(kernelBridge.request, kernelBridge.on),
+    shell: createShellAPI(kernelBridge.request),
+    addEventListener: kernelBridge.on,
+  };
+};
+
+export { bootDWC };
+export type { BootDWCOptions, BootDWCReturn };

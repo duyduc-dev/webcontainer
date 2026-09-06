@@ -4,15 +4,19 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "node scripts/copy-preview-sw.mjs && vite",
-    "build": "node scripts/copy-preview-sw.mjs && vite build",
-    "preview": "vite preview"
+    "predev": "node scripts/vendor-npm.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/vendor-npm.mjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "e2e": "playwright test"
   },
   "dependencies": {
     "@dwc/core": "workspace:*",
     "@xterm/xterm": "^6.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "vite": "^7.1.0"
   }
 }
