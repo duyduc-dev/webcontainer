@@ -229,6 +229,49 @@ async function main() {
     pipeToTerminal(childProcessDemo.stderr, terminal);
     const childProcessDemoExit = await childProcessDemo.exit;
     console.log("[dwc] child-process-demo exited with code", childProcessDemoExit);
+
+    // node_modules require() resolution demo: a hand-mounted fake package
+    // (no real npm install yet — that's a later phase) proving require('left-pad')
+    // resolves through package.json's "main" field, and that the package's own
+    // relative requires resolve against ITSELF, not the requiring script.
+    await dwc.fs.mount({
+      node_modules: {
+        directory: {
+          "left-pad": {
+            directory: {
+              "package.json": { file: { contents: JSON.stringify({ name: "left-pad", main: "lib/left-pad.js" }) } },
+              lib: {
+                directory: {
+                  "left-pad.js": {
+                    file: {
+                      contents: [
+                        "const { pad } = require('./pad-char');",
+                        "module.exports = function leftPad(str, len, ch) {",
+                        "  str = String(str);",
+                        "  while (str.length < len) str = pad(ch) + str;",
+                        "  return str;",
+                        "};",
+                        "",
+                      ].join("\n"),
+                    },
+                  },
+                  "pad-char.js": { file: { contents: "exports.pad = (ch) => (ch === undefined ? ' ' : ch);\n" } },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    await dwc.fs.writeFile(
+      "/require-node-modules-demo.js",
+      ["const leftPad = require('left-pad');", "console.log('[require] left-pad(\"5\", 3, \"0\") ->', leftPad('5', 3, '0'));", ""].join("\n"),
+    );
+    const requireDemo = await dwc.process.spawn("/require-node-modules-demo.js");
+    pipeToTerminal(requireDemo.stdout, terminal);
+    pipeToTerminal(requireDemo.stderr, terminal);
+    const requireDemoExit = await requireDemo.exit;
+    console.log("[dwc] require-node-modules-demo exited with code", requireDemoExit);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

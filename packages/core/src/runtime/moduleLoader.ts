@@ -1,8 +1,8 @@
-import { dirname } from "../kernel/fs/path";
+import { dirname, normalize } from "../kernel/fs/path";
 import { createBuiltinModules } from "./builtins";
 import type { ProcessLike } from "./builtins";
 import type { NodeModulesContext } from "./node/loader";
-import { relativeModuleCandidates } from "./resolveSpecifier";
+import { fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, splitBareSpecifier } from "./resolveSpecifier";
 
 interface ModuleLoaderOptions {
   sources: Record<string, string>;
@@ -36,11 +36,49 @@ const resolveRelative = (fromPath: string, specifier: string, sources: Record<st
   throw new Error(`Cannot find module '${specifier}' from '${fromPath}'`);
 };
 
+/** The sync mirror of preload.ts's resolveBareSpecifier(), run against the
+ * now-fully-populated in-memory `sources` map instead of doing I/O - see
+ * moduleLoader.ts's own module doc comment for why the same algorithm has to
+ * exist in both an async (preload-time) and sync (require-time) form. Returns
+ * null (not a throw) on a miss so the caller can report the ORIGINAL
+ * specifier in its error, not an internal resolution detail. */
+const resolveBareSync = (fromPath: string, specifier: string, sources: Record<string, string>): string | null => {
+  const { packageName, subpath } = splitBareSpecifier(specifier);
+
+  for (const nodeModulesDir of nodeModulesDirsFrom(fromPath)) {
+    const pkgDir = `${nodeModulesDir}/${packageName}`;
+
+    if (subpath) {
+      const match = fileCandidates(`${pkgDir}/${subpath}`).find((candidate) => candidate in sources);
+      if (match) return match;
+      continue;
+    }
+
+    let main = "index.js";
+    const pkgJsonPath = `${pkgDir}/package.json`;
+    if (pkgJsonPath in sources) {
+      try {
+        main = (JSON.parse(sources[pkgJsonPath]!) as { main?: string }).main ?? "index.js";
+      } catch {
+        // Malformed package.json - fall through to the plain index.js guess.
+      }
+    }
+
+    const match = fileCandidates(normalize(`${pkgDir}/${main}`)).find((candidate) => candidate in sources);
+    if (match) return match;
+  }
+
+  return null;
+};
+
 /**
  * Minimal CommonJS loader over a fully preloaded source map (Phase 4's "static
- * transport" - no lazy fs access from inside the process worker). Only relative
- * requires and the builtins registry are supported; bare/npm specifiers throw a
- * clear error until package installs land in a later phase.
+ * transport" - no lazy fs access from inside the process worker). Relative
+ * requires, the builtins registry, and bare (node_modules) specifiers are all
+ * supported; package.json "exports"/"imports" conditional resolution is not
+ * (see resolveSpecifier.ts's header) - only the older "main"-field + plain-
+ * subpath algorithm, still correct for any package that doesn't opt into
+ * "exports".
  */
 const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
   const { sources } = options;
@@ -54,13 +92,14 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
     return (specifier: string): unknown => {
       if (specifier in builtins) return builtins[specifier];
 
-      if (!specifier.startsWith(".")) {
-        throw new Error(
-          `Cannot find module '${specifier}': only relative requires and builtins (${Object.keys(builtins).join(", ")}) are supported`,
-        );
+      if (specifier.startsWith(".")) {
+        return loadModule(resolveRelative(fromPath, specifier, sources)).exports;
       }
 
-      return loadModule(resolveRelative(fromPath, specifier, sources)).exports;
+      const resolved = resolveBareSync(fromPath, specifier, sources);
+      if (resolved) return loadModule(resolved).exports;
+
+      throw new Error(`Cannot find module '${specifier}' from '${fromPath}'`);
     };
   };
 

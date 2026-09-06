@@ -70,12 +70,84 @@ describe("moduleLoader", () => {
     expect(loader.run("/index.js")).toBe("injected");
   });
 
-  it("throws a clear error for an unsupported bare (npm) specifier", () => {
+  it("throws a clear error for an unresolvable bare (npm) specifier", () => {
     const loader = createModuleLoader({
       sources: { "/index.js": "require('left-pad');" },
     });
 
     expect(() => loader.run("/index.js")).toThrow(/left-pad/);
+  });
+
+  it("resolves a bare specifier via its package.json \"main\" field", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('left-pad');",
+        "/node_modules/left-pad/package.json": '{"main":"lib/pad.js"}',
+        "/node_modules/left-pad/lib/pad.js": "module.exports = 'padded';",
+      },
+    });
+
+    expect(loader.run("/index.js")).toBe("padded");
+  });
+
+  it("resolves a bare specifier's subpath directly, bypassing \"main\"", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('lodash/map');",
+        "/node_modules/lodash/package.json": '{"main":"lodash.js"}',
+        "/node_modules/lodash/map.js": "module.exports = 'mapped';",
+      },
+    });
+
+    expect(loader.run("/index.js")).toBe("mapped");
+  });
+
+  it("falls back to index.js when a package has no package.json", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('tiny-pkg');",
+        "/node_modules/tiny-pkg/index.js": "module.exports = 'tiny';",
+      },
+    });
+
+    expect(loader.run("/index.js")).toBe("tiny");
+  });
+
+  it("resolves a scoped package", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('@org/pkg');",
+        "/node_modules/@org/pkg/package.json": '{"main":"index.js"}',
+        "/node_modules/@org/pkg/index.js": "module.exports = 'scoped';",
+      },
+    });
+
+    expect(loader.run("/index.js")).toBe("scoped");
+  });
+
+  it("prefers a nested node_modules package over a hoisted one at the same specifier", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/a-dir/index.js": "module.exports = require('dep');",
+        "/node_modules/dep/index.js": "module.exports = 'hoisted';",
+        "/a-dir/node_modules/dep/index.js": "module.exports = 'nested';",
+      },
+    });
+
+    expect(loader.run("/a-dir/index.js")).toBe("nested");
+  });
+
+  it("a package's own require()s resolve relative to itself, not the requiring script", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('pkg');",
+        "/node_modules/pkg/package.json": '{"main":"index.js"}',
+        "/node_modules/pkg/index.js": "module.exports = require('./util');",
+        "/node_modules/pkg/util.js": "module.exports = 'from-pkg-util';",
+      },
+    });
+
+    expect(loader.run("/index.js")).toBe("from-pkg-util");
   });
 
   it("throws a clear error when a relative module cannot be found", () => {

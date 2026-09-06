@@ -152,6 +152,27 @@ test("real vendored child_process: spawn() streams a PATH-resolved coreutil, exe
   expect(pageErrors).toEqual([]);
 });
 
+test("node_modules require() resolution: a bare specifier resolves through package.json's \"main\" field", async ({ page }) => {
+  const consoleMessages: string[] = [];
+  const pageErrors: string[] = [];
+
+  page.on("console", (message) => consoleMessages.push(message.text()));
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto("/");
+
+  await expect
+    .poll(() => consoleMessages.some((text) => text.includes("require-node-modules-demo exited with code 0")), { timeout: 15000 })
+    .toBe(true);
+
+  const terminalText = await page.locator("#terminal").innerText();
+  // Proves both the "main" field lookup AND that the package's own relative
+  // require('./pad-char') resolved against itself, not the requiring script.
+  expect(terminalText).toContain('[require] left-pad("5", 3, "0") -> 005');
+
+  expect(pageErrors).toEqual([]);
+});
+
 test("dwc.fs mounts a declarative tree and reads it back through the FS worker", async ({ page }) => {
   const consoleMessages: string[] = [];
   const pageErrors: string[] = [];
