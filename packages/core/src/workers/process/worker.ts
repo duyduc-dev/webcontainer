@@ -3,6 +3,7 @@ import { createFsBuiltin } from "../../runtime/builtins/fs";
 import type { FsBuiltin, FsBuiltinIO } from "../../runtime/builtins/fs";
 import { createEventLoop } from "../../runtime/eventLoop";
 import { createModuleLoader } from "../../runtime/moduleLoader";
+import { FsOp } from "../../kernel/fs/syncWireFormat";
 import { callSyncFs } from "./syncFsClient";
 import type { SyncFsChannel } from "./syncFsClient";
 import { postEvent } from "./service";
@@ -244,15 +245,32 @@ const createWritableStream = (stream: "stdout" | "stderr") => ({
   isTTY: false,
 });
 
-const createFsBuiltinFromPayload = (syncFs: SyncFsChannelPayload | null): FsBuiltin => {
+const createSyncFsChannel = (syncFs: SyncFsChannelPayload | null): SyncFsChannel | null =>
+  syncFs ? { port: syncFs.port, control: new Int32Array(syncFs.control), data: syncFs.data } : null;
+
+const createFsBuiltinFromChannel = (channel: SyncFsChannel | null): FsBuiltin => {
   const io: FsBuiltinIO = {};
-
-  if (syncFs) {
-    const channel: SyncFsChannel = { port: syncFs.port, control: new Int32Array(syncFs.control), data: syncFs.data };
-    io.callSync = (request) => callSyncFs(channel, request);
-  }
-
+  if (channel) io.callSync = (request) => callSyncFs(channel, request);
   return createFsBuiltin(io);
+};
+
+const decoder = new TextDecoder();
+
+/** Backs moduleLoader.ts's `readFileSync` fallback with the same synchronous
+ * SharedArrayBuffer bridge guest `fs.*Sync` calls use - see that option's doc
+ * comment for why the ahead-of-boot preload can miss a real, on-VFS file.
+ * Any failure (ENOENT, EISDIR against a directory candidate, ...) is "not
+ * this candidate," not a fatal error - the caller tries the next one. */
+const createModuleReadFileSync = (channel: SyncFsChannel | null): ((path: string) => string | null) | undefined => {
+  if (!channel) return undefined;
+  return (path) => {
+    try {
+      const response = callSyncFs(channel, { op: FsOp.READ_FILE, path });
+      return response.op === FsOp.READ_FILE ? decoder.decode(response.contents) : null;
+    } catch {
+      return null;
+    }
+  };
 };
 
 const boot = (payload: BootPayload): void => {
@@ -338,10 +356,12 @@ const boot = (payload: BootPayload): void => {
   // away from the (correct) instance guest code actually calls require('net')
   // on, so every accepted cross-process connection dispatches into a
   // `pipeServers` map nothing ever populated and gets closed immediately.
+  const syncFsChannel = createSyncFsChannel(payload.syncFs);
   const moduleLoader = createModuleLoader({
     sources: payload.sources,
-    builtins: { ...vendoredBuiltins, fs: createFsBuiltinFromPayload(payload.syncFs) },
+    builtins: { ...vendoredBuiltins, fs: createFsBuiltinFromChannel(syncFsChannel) },
     process: processGlobal,
+    readFileSync: createModuleReadFileSync(syncFsChannel),
   });
 
   // Real Node emits 'uncaughtException' on `process` before its own default
@@ -351,12 +371,56 @@ const boot = (payload: BootPayload): void => {
   // fallback below still runs either way, but is itself a no-op once a
   // listener has already called exit() (exitProcess() guards on `exited`), so
   // a listener's own exit code always wins over this default.
+  //
+  // `handlingFatalException` mirrors real Node's own re-entrancy guard around
+  // its fatal-exception path: a guest 'uncaughtException' listener that itself
+  // throws (real npm's own lib/cli/validate-engines.js does exactly this -
+  // its handler re-throws anything that isn't a SyntaxError) must NOT cause a
+  // second emit() - emit() isn't wrapped in its own try/catch, so that second
+  // throw would escape emit(), escape this function, and (since it's now
+  // "uncaught" all over again) come straight back here via the self
+  // 'error' listener below, re-entering reportUncaught and re-emitting
+  // forever. Once we're already handling one fatal exception, any further
+  // error just goes straight to the write+exit fallback with no user
+  // listener involved - same as real Node.
+  let handlingFatalException = false;
   const reportUncaught = (error: unknown): void => {
-    const errorObj = error instanceof Error ? error : new Error(String(error));
-    (processGlobal as unknown as { emit(event: string, ...args: unknown[]): boolean }).emit("uncaughtException", errorObj);
+    let errorObj = error instanceof Error ? error : new Error(String(error));
+    if (!handlingFatalException) {
+      handlingFatalException = true;
+      try {
+        (processGlobal as unknown as { emit(event: string, ...args: unknown[]): boolean }).emit(
+          "uncaughtException",
+          errorObj,
+        );
+      } catch (nestedError) {
+        errorObj = nestedError instanceof Error ? nestedError : new Error(String(nestedError));
+      }
+    }
     write("stderr", `${errorObj.stack ?? errorObj.message}\n`);
     exitProcess(1);
   };
+
+  // Guest code can reach a native, untracked async primitive our own eventLoop
+  // never sees - a bare `Promise` chain with no `.catch`, or a listener that
+  // itself throws while reportUncaught() is already unwinding (see above) -
+  // and end up as a genuine top-level worker error that bubbles past this
+  // worker entirely (surfacing at the kernel bridge's `onerror`, per the
+  // WHATWG nested-worker error-propagation algorithm) - drain()'s catch below
+  // only sees errors from work items the eventLoop itself scheduled and
+  // awaited. Catching both here and preventDefault()-ing keeps every uncaught
+  // error on the same uncaughtException/stderr/exit(1) path regardless of
+  // which primitive guest code used to schedule it, and the reentrancy guard
+  // above keeps that from looping when the error came from inside
+  // reportUncaught's own emit() call.
+  self.addEventListener("error", (event) => {
+    event.preventDefault();
+    reportUncaught(event.error ?? event.message);
+  });
+  self.addEventListener("unhandledrejection", (event) => {
+    event.preventDefault();
+    reportUncaught((event as PromiseRejectionEvent).reason);
+  });
 
   try {
     moduleLoader.run(payload.entryPath);

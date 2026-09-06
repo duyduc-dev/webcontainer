@@ -176,6 +176,59 @@ describe("moduleLoader", () => {
     expect(() => loader.run("/index.js")).toThrow(/missing/);
   });
 
+  it("strips a leading shebang line, like real Node's CommonJS loader (e.g. npm's own bin/npm-cli.js)", () => {
+    const loader = createModuleLoader({
+      sources: { "/bin/npm-cli.js": "#!/usr/bin/env node\nmodule.exports = 'ran';" },
+    });
+
+    expect(loader.run("/bin/npm-cli.js")).toBe("ran");
+  });
+
+  it("names the failing module's path when its source has a syntax error", () => {
+    const loader = createModuleLoader({
+      sources: { "/index.js": "this is not valid javascript(" },
+    });
+
+    expect(() => loader.run("/index.js")).toThrow(/\/index\.js/);
+  });
+
+  it("falls back to readFileSync for an absolute require the ahead-of-boot preload's string-literal scan couldn't see (a runtime-built specifier, like real npm's own bin/cli.js->lib/cli/entry.js hop)", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/bin/npm.js": "module.exports = require('/lib/cli/entry.js');",
+      },
+      readFileSync: (path) => (path === "/lib/cli/entry.js" ? "module.exports = 'from-fallback';" : null),
+    });
+
+    expect(loader.run("/bin/npm.js")).toBe("from-fallback");
+  });
+
+  it("caches a readFileSync fallback hit so a second require of the same path doesn't call it again", () => {
+    let calls = 0;
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('/lib/a.js') + require('/lib/a.js');",
+      },
+      readFileSync: (path) => {
+        if (path !== "/lib/a.js") return null;
+        calls++;
+        return "module.exports = 1;";
+      },
+    });
+
+    expect(loader.run("/index.js")).toBe(2);
+    expect(calls).toBe(1);
+  });
+
+  it("still reports the original specifier when readFileSync also misses", () => {
+    const loader = createModuleLoader({
+      sources: { "/index.js": "require('./missing');" },
+      readFileSync: () => null,
+    });
+
+    expect(() => loader.run("/index.js")).toThrow(/missing/);
+  });
+
   it("supports circular requires by returning the in-progress exports object", () => {
     const loader = createModuleLoader({
       sources: {
