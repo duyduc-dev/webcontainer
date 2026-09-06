@@ -158,40 +158,42 @@ const bootProcess = async (
   return { processId };
 };
 
-/** `node <script> [args...]` run from the shell: the same bootProcess() path
- * `spawn()` uses (so require('https')/etc. work identically), but waited to
- * completion with stdout+stderr collected into one output string, matching
- * shell.exec()'s buffered contract. A script that never exits (e.g. a server)
- * never resolves here — same as any other exec()'d command; use spawn() for
- * anything long-running. */
-const runNodeViaShell = async (
+/** Runs one resolved program (a real script path — `/bin/<name>.js` or a
+ * `node <script>` entry) to completion via the same bootProcess() path
+ * spawn() uses (so require('https')/etc. work identically), collecting
+ * stdout+stderr into one output string and reporting the exit code, matching
+ * shell.exec()'s buffered, `&&`-short-circuiting contract. A script that
+ * never exits (e.g. a server) never resolves here — same as any other
+ * exec()'d command; use spawn() for anything long-running. */
+const runProgramViaShell = async (
+  entryPath: string,
   argv: string[],
   cwd: string,
   fsClient: FsClient,
   processTable: ProcessTable,
   fetcherClient: FetcherClient,
   netRelay: NetRelay,
-): Promise<{ output: string; cwd: string }> => {
-  const [, scriptArg, ...scriptArgs] = argv;
-  if (!scriptArg) throw new Error("node: missing script operand");
-  const entryPath = resolvePath(cwd, scriptArg);
-
+): Promise<{ output: string; exitCode: number }> => {
   let output = "";
+  let exitCode = 0;
   let resolveExit!: () => void;
   const exited = new Promise<void>((resolve) => {
     resolveExit = resolve;
   });
 
-  await bootProcess(fsClient, processTable, fetcherClient, netRelay, { entryPath, argv: scriptArgs, env: {}, cwd }, (type, eventPayload) => {
+  await bootProcess(fsClient, processTable, fetcherClient, netRelay, { entryPath, argv, env: {}, cwd }, (type, eventPayload) => {
     if (type === "stdout" || type === "stderr") {
       output += decoder.decode(eventPayload.chunk);
       return;
     }
-    if (type === "exit") resolveExit();
+    if (type === "exit") {
+      exitCode = eventPayload.code;
+      resolveExit();
+    }
   });
 
   await exited;
-  return { output, cwd };
+  return { output, exitCode };
 };
 
 /** Preloads the require() graph via the FS worker, then spawns a Process Worker to run it. */
@@ -215,51 +217,57 @@ const createProcessClient = (
     });
   };
 
-  const runShellViaProcessWorker = (line: string, cwd: string): Promise<{ output: string; cwd: string }> => {
-    const { id: processId } = processTable.register();
-    const worker = spawnChildWorker(new URL("../process/worker.js", import.meta.url), {
-      name: `Shell:${processId}`,
-    });
-
-    return new Promise((resolve, reject) => {
-      worker.onmessage = (event: MessageEvent<{ type: string; payload?: any }>) => {
-        const { type, payload: eventPayload } = event.data;
-
-        if (type === "shell-result") {
-          processTable.remove(processId);
-          worker.terminate();
-          resolve(eventPayload);
-          return;
-        }
-
-        if (type === "shell-error") {
-          processTable.remove(processId);
-          worker.terminate();
-          reject(new Error(eventPayload.message));
-        }
-      };
-
-      const syncFs = createSyncFsChannelFor(fsClient);
-      const transfer = syncFs ? [syncFs.port] : [];
-      postWithTransfer(worker, { type: "boot-shell", payload: { line, cwd, syncFs } }, transfer);
-    });
-  };
-
-  const runShell = (payload: ShellExecPayload): Promise<{ output: string; cwd: string }> => {
-    const cwd = payload.cwd ?? "/";
+  /** Runs an `&&`-chained shell line: `cd` mutates cwd in place (a subprocess
+   * can't change its parent's cwd, so it can't be a PATH-resolved program
+   * like everything else); `node <script>` reuses today's direct-entryPath
+   * special case (a coreutils program can't easily require() an arbitrary
+   * absolute path the way moduleLoader.run(entryPath) can); every other
+   * command resolves against /bin/<name>.js (see kernel/fs/coreutils.ts,
+   * seeded at FS Worker boot) and runs the same way. Stops the chain (real
+   * `&&` semantics) as soon as a command exits non-zero. */
+  const runShell = async (payload: ShellExecPayload): Promise<{ output: string; cwd: string }> => {
+    let cwd = payload.cwd ?? "/";
     const commands = parseCommands(tokenize(payload.line));
+    let output = "";
 
-    // `node <script>` needs the same async process-spawning path spawn()
-    // uses, which the shell's own execution model (synchronous, sync-fs-
-    // bridge-only, running inside its own "Shell:" process worker) has no
-    // access to - intercept it here, before any process worker is spawned
-    // for the shell line itself. Scope: only as the line's sole command (no
-    // `&&` chaining with it yet, matching this phase's shell integration).
-    if (commands.length === 1 && commands[0]!.argv[0] === "node") {
-      return runNodeViaShell(commands[0]!.argv, cwd, fsClient, processTable, fetcherClient, netRelay);
+    for (const command of commands) {
+      const name = command.argv[0];
+      if (!name) continue;
+
+      if (name === "cd") {
+        const target = command.argv[1] ? resolvePath(cwd, command.argv[1]) : "/";
+        const stat = await fsClient.request<{ isDirectory: boolean }>({ action: "stat", path: target });
+        if (!stat.isDirectory) throw new Error(`cd: not a directory: ${command.argv[1]}`);
+        cwd = target;
+        continue;
+      }
+
+      let entryPath: string;
+      let args: string[];
+      if (name === "node") {
+        const scriptArg = command.argv[1];
+        if (!scriptArg) throw new Error("node: missing script operand");
+        entryPath = resolvePath(cwd, scriptArg);
+        args = command.argv.slice(2);
+      } else {
+        entryPath = `/bin/${name}.js`;
+        const exists = await fsClient.request<boolean>({ action: "exists", path: entryPath });
+        if (!exists) throw new Error(`${name}: command not found`);
+        args = command.argv.slice(1);
+      }
+
+      const { output: cmdOutput, exitCode } = await runProgramViaShell(entryPath, args, cwd, fsClient, processTable, fetcherClient, netRelay);
+
+      if (command.redirectOut) {
+        await fsClient.request({ action: "writeFile", path: resolvePath(cwd, command.redirectOut), contents: cmdOutput });
+      } else {
+        output += cmdOutput;
+      }
+
+      if (exitCode !== 0) break;
     }
 
-    return runShellViaProcessWorker(payload.line, cwd);
+    return { output, cwd };
   };
 
   return { spawn, runShell };

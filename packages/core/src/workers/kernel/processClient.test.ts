@@ -112,10 +112,10 @@ describe("createProcessClient — net-request forwarding", () => {
   });
 });
 
-describe("createProcessClient — runShell 'node <script>' interception", () => {
+describe("createProcessClient — runShell (cd, node, and /bin PATH resolution)", () => {
   const originalWorker = globalThis.Worker;
   const originalSelf = (globalThis as { self?: unknown }).self;
-  let spawned: FakeWorker | undefined;
+  let spawnedWorkers: FakeWorker[] = [];
 
   beforeEach(() => {
     (globalThis as { self?: unknown }).self = { crossOriginIsolated: false, postMessage: vi.fn() };
@@ -124,47 +124,75 @@ describe("createProcessClient — runShell 'node <script>' interception", () => 
   afterEach(() => {
     globalThis.Worker = originalWorker;
     (globalThis as { self?: unknown }).self = originalSelf;
-    spawned = undefined;
+    spawnedWorkers = [];
   });
 
-  const setup = () => {
+  /** Action-aware fake FS: readFile answers preloadModuleGraph, exists defaults
+   * to true (as if every resolved /bin/<name>.js is present), stat defaults to
+   * "is a directory" (for cd's check). Individual tests override via
+   * `fsRequest.mockImplementation(...)` for the cases that care. */
+  const fakeShellFsClient = (): FsClient => {
+    const request = vi.fn(async (payload: { action: string }) => {
+      switch (payload.action) {
+        case "readFile":
+          return new TextEncoder().encode("// entry");
+        case "exists":
+          return true;
+        case "stat":
+          return { isFile: false, isDirectory: true, size: 0, mtimeMs: 0 };
+        case "writeFile":
+          return undefined;
+        default:
+          return { sources: {} };
+      }
+    });
+    return { request, attachSyncChannel: vi.fn() } as unknown as FsClient;
+  };
+
+  const setup = (fsClient: FsClient = fakeShellFsClient()) => {
     class SpawningWorker extends FakeWorker {
       constructor() {
         super();
-        spawned = this;
+        spawnedWorkers.push(this);
       }
     }
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = SpawningWorker;
 
-    const fsClient = fakeFsClient();
-    (fsClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(new TextEncoder().encode("// entry"));
     const fetcherClient: FetcherClient = { request: vi.fn() };
     return {
       client: createProcessClient(fsClient, fakeProcessTable() as never, fetcherClient, createNetRelay()),
       fetcherClient,
+      fsClient,
     };
   };
 
   const encoder = new TextEncoder();
+  const waitForWorker = async (index: number): Promise<FakeWorker> => {
+    await vi.waitFor(() => expect(spawnedWorkers.length).toBeGreaterThan(index));
+    return spawnedWorkers[index]!;
+  };
+  const finishWith = (worker: FakeWorker, code: number): void => {
+    worker.onmessage?.({ data: { type: "exit", payload: { code } } } as MessageEvent);
+  };
 
-  it("routes 'node <script>' through the same boot path spawn() uses, not the shell-as-process worker", async () => {
+  it("routes 'node <script>' through the same boot path spawn() uses", async () => {
     const { client } = setup();
 
     const resultPromise = client.runShell({ line: "node script.js", cwd: "/project" });
     // bootProcess()'s preload step is a chain of several awaits; wait for the
     // worker to actually be constructed rather than counting microtask ticks.
-    await vi.waitFor(() => expect(spawned).toBeDefined());
+    const worker = await waitForWorker(0);
 
-    expect(spawned!.posted).toEqual([
+    expect(worker.posted).toEqual([
       expect.objectContaining({
         type: "boot",
         payload: expect.objectContaining({ entryPath: "/project/script.js", argv: [], cwd: "/project" }),
       }),
     ]);
 
-    spawned!.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("hello\n") } } } as MessageEvent);
-    spawned!.onmessage?.({ data: { type: "exit", payload: { code: 0 } } } as MessageEvent);
+    worker.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("hello\n") } } } as MessageEvent);
+    finishWith(worker, 0);
 
     await expect(resultPromise).resolves.toEqual({ output: "hello\n", cwd: "/project" });
   });
@@ -173,15 +201,15 @@ describe("createProcessClient — runShell 'node <script>' interception", () => 
     const { client } = setup();
 
     const resultPromise = client.runShell({ line: "node ./bin/cli.js --flag", cwd: "/project" });
-    await vi.waitFor(() => expect(spawned).toBeDefined());
+    const worker = await waitForWorker(0);
 
-    expect(spawned!.posted).toEqual([
+    expect(worker.posted).toEqual([
       expect.objectContaining({
         payload: expect.objectContaining({ entryPath: "/project/bin/cli.js", argv: ["--flag"] }),
       }),
     ]);
 
-    spawned!.onmessage?.({ data: { type: "exit", payload: { code: 0 } } } as MessageEvent);
+    finishWith(worker, 0);
     await resultPromise;
   });
 
@@ -189,11 +217,11 @@ describe("createProcessClient — runShell 'node <script>' interception", () => 
     const { client } = setup();
 
     const resultPromise = client.runShell({ line: "node script.js", cwd: "/" });
-    await vi.waitFor(() => expect(spawned).toBeDefined());
+    const worker = await waitForWorker(0);
 
-    spawned!.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("out\n") } } } as MessageEvent);
-    spawned!.onmessage?.({ data: { type: "stderr", payload: { chunk: encoder.encode("err\n") } } } as MessageEvent);
-    spawned!.onmessage?.({ data: { type: "exit", payload: { code: 1 } } } as MessageEvent);
+    worker.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("out\n") } } } as MessageEvent);
+    worker.onmessage?.({ data: { type: "stderr", payload: { chunk: encoder.encode("err\n") } } } as MessageEvent);
+    finishWith(worker, 1);
 
     await expect(resultPromise).resolves.toEqual({ output: "out\nerr\n", cwd: "/" });
   });
@@ -203,14 +231,14 @@ describe("createProcessClient — runShell 'node <script>' interception", () => 
     (fetcherClient.request as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 200 });
 
     const resultPromise = client.runShell({ line: "node script.js", cwd: "/" });
-    await vi.waitFor(() => expect(spawned).toBeDefined());
+    const worker = await waitForWorker(0);
 
-    spawned!.onmessage?.({ data: { type: "net-request", payload: { id: "r1", url: "https://example.com" } } } as MessageEvent);
+    worker.onmessage?.({ data: { type: "net-request", payload: { id: "r1", url: "https://example.com" } } } as MessageEvent);
     await vi.waitFor(() => expect((fetcherClient.request as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0));
 
     expect(fetcherClient.request).toHaveBeenCalledWith({ url: "https://example.com" });
 
-    spawned!.onmessage?.({ data: { type: "exit", payload: { code: 0 } } } as MessageEvent);
+    finishWith(worker, 0);
     await resultPromise;
   });
 
@@ -219,28 +247,89 @@ describe("createProcessClient — runShell 'node <script>' interception", () => 
     await expect(client.runShell({ line: "node", cwd: "/" })).rejects.toThrow(/missing script operand/);
   });
 
-  it("does not intercept 'node' when chained with && (falls through to the shell-as-process path)", async () => {
+  it("cd updates cwd via an async stat check, without spawning a process", async () => {
+    const { client, fsClient } = setup();
+
+    const result = await client.runShell({ line: "cd /project", cwd: "/" });
+
+    expect(result).toEqual({ output: "", cwd: "/project" });
+    expect(fsClient.request).toHaveBeenCalledWith({ action: "stat", path: "/project" });
+    expect(spawnedWorkers).toHaveLength(0);
+  });
+
+  it("cd rejects a target that is not a directory", async () => {
+    const fsClient = fakeShellFsClient();
+    (fsClient.request as ReturnType<typeof vi.fn>).mockResolvedValue({ isFile: true, isDirectory: false, size: 0, mtimeMs: 0 });
+    const { client } = setup(fsClient);
+
+    await expect(client.runShell({ line: "cd /a-file", cwd: "/" })).rejects.toThrow(/not a directory/);
+  });
+
+  it("resolves a non-node command against /bin/<name>.js and boots it the same way as spawn()", async () => {
+    const { client, fsClient } = setup();
+
+    const resultPromise = client.runShell({ line: "echo hi", cwd: "/" });
+    const worker = await waitForWorker(0);
+
+    expect(fsClient.request).toHaveBeenCalledWith({ action: "exists", path: "/bin/echo.js" });
+    expect(worker.posted).toEqual([
+      expect.objectContaining({
+        type: "boot",
+        payload: expect.objectContaining({ entryPath: "/bin/echo.js", argv: ["hi"], cwd: "/" }),
+      }),
+    ]);
+
+    worker.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("hi\n") } } } as MessageEvent);
+    finishWith(worker, 0);
+
+    await expect(resultPromise).resolves.toEqual({ output: "hi\n", cwd: "/" });
+  });
+
+  it("throws a clear error when no /bin/<name>.js exists for the command", async () => {
+    const fsClient = fakeShellFsClient();
+    (fsClient.request as ReturnType<typeof vi.fn>).mockImplementation(async (payload: { action: string }) =>
+      payload.action === "exists" ? false : new TextEncoder().encode("// entry"),
+    );
+    const { client } = setup(fsClient);
+
+    await expect(client.runShell({ line: "nope", cwd: "/" })).rejects.toThrow(/nope: command not found/);
+  });
+
+  it("chains 'node <script>' with a PATH-resolved command via && (no longer restricted to the sole command)", async () => {
     const { client } = setup();
 
     const resultPromise = client.runShell({ line: "node script.js && echo done", cwd: "/" });
-    await Promise.resolve();
+    const nodeWorker = await waitForWorker(0);
+    finishWith(nodeWorker, 0);
 
-    // The shell-as-process path boots via "boot-shell", not "boot".
-    expect(spawned!.posted).toEqual([expect.objectContaining({ type: "boot-shell" })]);
+    const echoWorker = await waitForWorker(1);
+    expect(echoWorker.posted).toEqual([expect.objectContaining({ payload: expect.objectContaining({ entryPath: "/bin/echo.js", argv: ["done"] }) })]);
+    echoWorker.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("done\n") } } } as MessageEvent);
+    finishWith(echoWorker, 0);
 
-    spawned!.onmessage?.({ data: { type: "shell-result", payload: { output: "done\n", cwd: "/" } } } as MessageEvent);
     await expect(resultPromise).resolves.toEqual({ output: "done\n", cwd: "/" });
   });
 
-  it("leaves ordinary (non-node) shell lines on the shell-as-process path", async () => {
+  it("&& short-circuits after a non-zero exit, never spawning the next command", async () => {
     const { client } = setup();
 
-    const resultPromise = client.runShell({ line: "echo hi", cwd: "/" });
-    await Promise.resolve();
+    const resultPromise = client.runShell({ line: "false && echo nope", cwd: "/" });
+    const worker = await waitForWorker(0);
+    finishWith(worker, 1);
 
-    expect(spawned!.posted).toEqual([expect.objectContaining({ type: "boot-shell" })]);
+    await expect(resultPromise).resolves.toEqual({ output: "", cwd: "/" });
+    expect(spawnedWorkers).toHaveLength(1);
+  });
 
-    spawned!.onmessage?.({ data: { type: "shell-result", payload: { output: "hi\n", cwd: "/" } } } as MessageEvent);
-    await expect(resultPromise).resolves.toEqual({ output: "hi\n", cwd: "/" });
+  it("> redirects a command's output to a file instead of the returned output", async () => {
+    const { client, fsClient } = setup();
+
+    const resultPromise = client.runShell({ line: "echo hi > /x/f", cwd: "/" });
+    const worker = await waitForWorker(0);
+    worker.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("hi\n") } } } as MessageEvent);
+    finishWith(worker, 0);
+
+    await expect(resultPromise).resolves.toEqual({ output: "", cwd: "/" });
+    expect(fsClient.request).toHaveBeenCalledWith({ action: "writeFile", path: "/x/f", contents: "hi\n" });
   });
 });

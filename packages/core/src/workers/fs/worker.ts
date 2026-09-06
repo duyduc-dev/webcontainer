@@ -1,3 +1,4 @@
+import { COREUTILS } from "../../kernel/fs/coreutils";
 import { FSError } from "../../kernel/fs/FSError";
 import type { FileSystemTree } from "../../kernel/fs/mount";
 import { mount } from "../../kernel/fs/mount";
@@ -19,6 +20,18 @@ type FsRequestPayload =
   | { action: "mount"; tree: FileSystemTree; basePath?: string };
 
 const vfs = createVirtualFileSystem();
+
+// Every non-cd shell command resolves against /bin (see processClient.ts's
+// runShell()), so the coreutils programs must exist before the first
+// FS_REQUEST is ever handled — no boot round-trip to wait on. mount() never
+// creates its own basePath directory (only nested `directory` entries get
+// mkdir'd), so /bin is nested under root here rather than passed as basePath.
+const coreutilsTree: FileSystemTree = {
+  bin: {
+    directory: Object.fromEntries(Object.entries(COREUTILS).map(([name, source]) => [`${name}.js`, { file: { contents: source } }])),
+  },
+};
+mount(vfs, coreutilsTree, "/");
 
 const handleFsRequest = (payload: FsRequestPayload): unknown => {
   switch (payload.action) {

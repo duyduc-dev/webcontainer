@@ -35,7 +35,7 @@ test("dwc.process.spawn runs a script through the process worker and streams its
   expect(pageErrors).toEqual([]);
 });
 
-test("dwc.shell.exec runs a chained shell line through the sync fs bridge", async ({ page }) => {
+test("dwc.shell.exec runs a chained shell line through /bin coreutils resolved on PATH", async ({ page }) => {
   const consoleMessages: string[] = [];
   const pageErrors: string[] = [];
 
@@ -45,11 +45,18 @@ test("dwc.shell.exec runs a chained shell line through the sync fs bridge", asyn
   await page.goto("/");
 
   await expect
-    .poll(() => consoleMessages.some((text) => text.includes("shell.exec result") && text.includes("hi")))
+    .poll(() => consoleMessages.some((text) => text.includes("shell.exec short-circuit result")))
     .toBe(true);
 
   const terminalText = await page.locator("#terminal").innerText();
+  // mkdir/echo/cat all resolve to real /bin/<name>.js programs run as spawned
+  // processes (kernel/fs/coreutils.ts), not the old hardcoded builtin table.
   expect(terminalText).toContain('mkdir -p /x && echo hi > /x/f && cat /x/f -> "hi\\n"');
+  // `node` is no longer restricted to being the line's sole command — it can
+  // chain with && into a PATH-resolved coreutil like any other command.
+  expect(terminalText).toContain('node /shell-chain.js && echo done -> "from node\\ndone\\n"');
+  // && short-circuits on a non-zero exit: "nope" must never run.
+  expect(terminalText).toContain('false && echo nope -> ""');
 
   expect(pageErrors).toEqual([]);
 });

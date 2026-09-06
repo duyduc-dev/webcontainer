@@ -3,7 +3,6 @@ import { createFsBuiltin } from "../../runtime/builtins/fs";
 import type { FsBuiltin, FsBuiltinIO } from "../../runtime/builtins/fs";
 import { createEventLoop } from "../../runtime/eventLoop";
 import { createModuleLoader } from "../../runtime/moduleLoader";
-import { runShellLine } from "../../shell/Shell";
 import { callSyncFs } from "./syncFsClient";
 import type { SyncFsChannel } from "./syncFsClient";
 import { postEvent } from "./service";
@@ -19,12 +18,6 @@ interface BootPayload {
   sources: Record<string, string>;
   argv: string[];
   env: Record<string, string>;
-  cwd: string;
-  syncFs: SyncFsChannelPayload | null;
-}
-
-interface BootShellPayload {
-  line: string;
   cwd: string;
   syncFs: SyncFsChannelPayload | null;
 }
@@ -145,9 +138,22 @@ const exitProcess = (code: number): void => {
   postEvent("exit", { code });
 };
 
-const write = (stream: "stdout" | "stderr", text: string): void => {
-  postEvent(stream, { chunk: encoder.encode(text) });
+const write = (stream: "stdout" | "stderr", chunk: string | Uint8Array): void => {
+  postEvent(stream, { chunk: typeof chunk === "string" ? encoder.encode(chunk) : chunk });
 };
+
+/** Minimal process.stdout/stderr — just enough for coreutils-style programs'
+ * `process.stdout.write(...)` idiom (real Node's own convention, which every
+ * demo/script so far has avoided in favor of console.log). Reference-equality
+ * checks against these in vendored lib code (net.js, streams/readable.js)
+ * stay correct either way; nothing there calls .write() on them. */
+const createWritableStream = (stream: "stdout" | "stderr") => ({
+  write: (chunk: string | Uint8Array): boolean => {
+    write(stream, chunk);
+    return true;
+  },
+  isTTY: false,
+});
 
 const createFsBuiltinFromPayload = (syncFs: SyncFsChannelPayload | null): FsBuiltin => {
   const io: FsBuiltinIO = {};
@@ -173,6 +179,8 @@ const boot = (payload: BootPayload): void => {
       exitProcess(exitCode);
     },
     nextTick: eventLoop.nextTick,
+    stdout: createWritableStream("stdout"),
+    stderr: createWritableStream("stderr"),
   };
 
   // 'net' needs the loop's close phase + liveness ref/unref (see eventLoop.ts's
@@ -245,16 +253,6 @@ const boot = (payload: BootPayload): void => {
     });
 };
 
-const bootShell = (payload: BootShellPayload): void => {
-  try {
-    const fs = createFsBuiltinFromPayload(payload.syncFs);
-    const result = runShellLine(payload.line, payload.cwd, fs);
-    postEvent("shell-result", result);
-  } catch (error) {
-    postEvent("shell-error", { message: error instanceof Error ? error.message : String(error) });
-  }
-};
-
 const drain = async (eventLoop: ReturnType<typeof createEventLoop>): Promise<void> => {
   while (eventLoop.hasPendingWork()) {
     const didWork = await eventLoop.runOnce();
@@ -264,7 +262,6 @@ const drain = async (eventLoop: ReturnType<typeof createEventLoop>): Promise<voi
 
 self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   if (event.data.type === "boot") boot(event.data.payload as BootPayload);
-  else if (event.data.type === "boot-shell") bootShell(event.data.payload as BootShellPayload);
   else if (event.data.type === "net-response") handleNetResponse(event.data.payload as Parameters<typeof handleNetResponse>[0]);
   else if (event.data.type === "net-pipe-connect-response") handlePipeConnectResponse(event.data.payload as { id: string; connId: number });
   else if (event.data.type === "net-pipe-message") pipeMessageHandler?.(event.data.payload as PipeRelayMessage);

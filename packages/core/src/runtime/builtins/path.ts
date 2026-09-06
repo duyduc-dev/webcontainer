@@ -4,7 +4,16 @@ const sep = "/";
 
 const join = (...parts: string[]): string => normalize(parts.join("/"));
 
-const resolvePath = (...parts: string[]): string => normalize(parts.join("/"));
+const resolvePath = (...parts: string[]): string => {
+  let resolved = "";
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i];
+    if (!part) continue;
+    resolved = resolved ? `${part}/${resolved}` : part;
+    if (part.startsWith("/")) break;
+  }
+  return normalize(resolved.startsWith("/") ? resolved : `/${resolved}`);
+};
 
 const extname = (path: string): string => {
   const base = basename(path);

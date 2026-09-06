@@ -67,6 +67,18 @@ async function main() {
     console.log("[dwc] shell.exec result ->", JSON.stringify(shellResult.output));
     terminal.writeln(`[shell] mkdir -p /x && echo hi > /x/f && cat /x/f -> ${JSON.stringify(shellResult.output)}`);
 
+    // Phase 8c demo: coreutils/PATH layer — `node` chained with && alongside
+    // a PATH-resolved (/bin/echo.js) command, no longer sole-command-only.
+    await dwc.fs.writeFile("/shell-chain.js", "console.log('from node');\n");
+    const chainResult = await dwc.shell.exec("node /shell-chain.js && echo done");
+    console.log("[dwc] shell.exec chain result ->", JSON.stringify(chainResult.output));
+    terminal.writeln(`[shell] node /shell-chain.js && echo done -> ${JSON.stringify(chainResult.output)}`);
+
+    // && short-circuits on a non-zero exit — "nope" must never run.
+    const shortCircuitResult = await dwc.shell.exec("false && echo nope");
+    console.log("[dwc] shell.exec short-circuit result ->", JSON.stringify(shortCircuitResult.output));
+    terminal.writeln(`[shell] false && echo nope -> ${JSON.stringify(shortCircuitResult.output)}`);
+
     // Phase 6/7 demo: real vendored Node events/stream/crypto, and a real
     // network request through the Fetcher Worker via require('https').
     await dwc.fs.writeFile(
