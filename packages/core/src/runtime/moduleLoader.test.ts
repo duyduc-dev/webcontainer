@@ -18,6 +18,55 @@ describe("moduleLoader", () => {
     expect(typeof result.join).toBe("function");
   });
 
+  it("require.resolve() returns the resolved path without loading the module", () => {
+    let loaded = false;
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require.resolve('./dep.js');",
+        "/dep.js": "globalThis.__markLoaded && globalThis.__markLoaded(); module.exports = 1;",
+      },
+    });
+    (globalThis as any).__markLoaded = () => {
+      loaded = true;
+    };
+    try {
+      expect(loader.run("/index.js")).toBe("/dep.js");
+      expect(loaded).toBe(false);
+    } finally {
+      delete (globalThis as any).__markLoaded;
+    }
+  });
+
+  it("require.resolve() resolves a bare specifier via node_modules, same as require()", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require.resolve('left-pad');",
+        "/node_modules/left-pad/package.json": '{"main":"index.js"}',
+        "/node_modules/left-pad/index.js": "module.exports = 'padded';",
+      },
+    });
+
+    expect(loader.run("/index.js")).toBe("/node_modules/left-pad/index.js");
+  });
+
+  it("require.resolve() returns a builtin's own specifier, not a path", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = [require.resolve('path'), require.resolve('node:os')];",
+      },
+    });
+
+    expect(loader.run("/index.js")).toEqual(["path", "node:os"]);
+  });
+
+  it("require.resolve() throws the same \"Cannot find module\" error require() would", () => {
+    const loader = createModuleLoader({
+      sources: { "/index.js": "require.resolve('left-pad');" },
+    });
+
+    expect(() => loader.run("/index.js")).toThrow(/left-pad/);
+  });
+
   it("resolves an absolute-path specifier directly, like a real npm shim requiring its own vendored bin", () => {
     const loader = createModuleLoader({
       sources: {
@@ -294,6 +343,37 @@ describe("moduleLoader", () => {
     expect(() => loader.run("/index.js")).toThrow(/#missing/);
   });
 
+  it("tags a runtime error (not just a syntax error) with the module path that actually threw it", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "require('./deep.js');",
+        "/deep.js": "undefined.boom;",
+      },
+    });
+
+    expect(() => loader.run("/index.js")).toThrow(/\/deep\.js/);
+  });
+
+  it("tags the ORIGINATING module only, not every intermediate require() on the way out", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "require('./middle.js');",
+        "/middle.js": "require('./deep.js');",
+        "/deep.js": "undefined.boom;",
+      },
+    });
+
+    try {
+      loader.run("/index.js");
+      expect.unreachable();
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).toContain("/deep.js");
+      expect(message).not.toContain("/middle.js");
+      expect(message).not.toContain("/index.js");
+    }
+  });
+
   it("supports circular requires by returning the in-progress exports object", () => {
     const loader = createModuleLoader({
       sources: {
@@ -307,5 +387,30 @@ describe("moduleLoader", () => {
     // b required a while a was still mid-execution, so a.fromA was already set
     // (assigned before the require('./b') call) but a.b was not yet.
     expect(result.b.sawFromA).toBe(true);
+  });
+
+  it("a circular require sees a full `module.exports = X` reassignment, not just mutations of the original exports object (real npm's own pacote hits exactly this: fetcher.js reassigns module.exports to its base class, THEN require()s a subclass file that requires fetcher.js back)", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/base.js": [
+          "class Base {}",
+          "module.exports = Base;",
+          // Circular: child.js requires base.js again, mid-execution, AFTER
+          // the reassignment above - it must see the real class, not the
+          // module system's own initial `{}` placeholder.
+          "const Base2 = require('./child.js').Base2;",
+          "module.exports.Base2 = Base2;",
+        ].join("\n"),
+        "/child.js": [
+          "const Base = require('./base.js');",
+          "class Base2 extends Base {}", // throws if Base came back as `{}`
+          "module.exports = { Base2 };",
+        ].join("\n"),
+      },
+    });
+
+    const result = loader.run("/base.js") as { new (): unknown; Base2: new () => unknown };
+    expect(typeof result).toBe("function");
+    expect(new result.Base2()).toBeInstanceOf(result);
   });
 });

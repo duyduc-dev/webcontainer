@@ -61,7 +61,24 @@ const inherits = (ctor: { prototype: object }, superCtor: { prototype: object })
   });
 };
 
-const utilModule = { format, formatWithOptions, inherits };
+// Real Node's util.deprecate(fn, msg) wraps fn so the FIRST call prints a
+// warning (to process.stderr) before running it, then just runs it normally
+// on every later call - traced need: real npm's own `debug` dependency
+// wraps its (rarely-called) `destroy()` no-op with this at module load, so
+// this only needs to exist and return something callable, not perfectly
+// match Node's own warning formatting/dedup-by-code behavior.
+const deprecate = (fn: (...args: unknown[]) => unknown, message: string): ((...args: unknown[]) => unknown) => {
+  let warned = false;
+  return (...args: unknown[]) => {
+    if (!warned) {
+      warned = true;
+      console.error(`DeprecationWarning: ${message}`);
+    }
+    return fn(...args);
+  };
+};
+
+const utilModule = { format, formatWithOptions, inherits, deprecate };
 
 export default utilModule;
-export { format, formatWithOptions, inherits };
+export { deprecate, format, formatWithOptions, inherits };

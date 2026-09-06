@@ -28,6 +28,7 @@ enum FsOp {
   READLINK = 10,
   LSTAT = 11,
   CHMOD = 12,
+  REALPATH = 13,
 }
 
 type FsRequest =
@@ -42,7 +43,8 @@ type FsRequest =
   | { op: FsOp.SYMLINK; target: string; path: string }
   | { op: FsOp.READLINK; path: string }
   | { op: FsOp.LSTAT; path: string }
-  | { op: FsOp.CHMOD; path: string; mode: number };
+  | { op: FsOp.CHMOD; path: string; mode: number }
+  | { op: FsOp.REALPATH; path: string };
 
 type FsResponseOk =
   | { ok: true; op: FsOp.READ_FILE; contents: Uint8Array }
@@ -64,7 +66,8 @@ type FsResponseOk =
   | { ok: true; op: FsOp.EXISTS; exists: boolean }
   | { ok: true; op: FsOp.SYMLINK }
   | { ok: true; op: FsOp.READLINK; target: string }
-  | { ok: true; op: FsOp.CHMOD };
+  | { ok: true; op: FsOp.CHMOD }
+  | { ok: true; op: FsOp.REALPATH; path: string };
 
 type FsResponseError = { ok: false; code: FSErrorCode; path: string; message: string };
 
@@ -163,6 +166,7 @@ const encodeFsRequest = (request: FsRequest, buffer: ArrayBufferLike, byteOffset
     case FsOp.EXISTS:
     case FsOp.READLINK:
     case FsOp.LSTAT:
+    case FsOp.REALPATH:
       writer.writeString(request.path);
       break;
     case FsOp.WRITE_FILE:
@@ -202,6 +206,7 @@ const decodeFsRequest = (buffer: ArrayBufferLike, byteOffset = 0): FsRequest => 
     case FsOp.EXISTS:
     case FsOp.READLINK:
     case FsOp.LSTAT:
+    case FsOp.REALPATH:
       return { op, path: reader.readString() };
     case FsOp.WRITE_FILE:
       return { op, path: reader.readString(), contents: reader.readBytes() };
@@ -254,6 +259,9 @@ const encodeFsResponse = (response: FsResponse, buffer: ArrayBufferLike, byteOff
     case FsOp.READLINK:
       writer.writeString(response.target);
       break;
+    case FsOp.REALPATH:
+      writer.writeString(response.path);
+      break;
     case FsOp.WRITE_FILE:
     case FsOp.MKDIR:
     case FsOp.RM:
@@ -305,6 +313,8 @@ const decodeFsResponse = (buffer: ArrayBufferLike, byteOffset = 0): FsResponse =
       return { ok: true, op, exists: reader.readUint8() === 1 };
     case FsOp.READLINK:
       return { ok: true, op, target: reader.readString() };
+    case FsOp.REALPATH:
+      return { ok: true, op, path: reader.readString() };
     case FsOp.WRITE_FILE:
     case FsOp.MKDIR:
     case FsOp.RM:

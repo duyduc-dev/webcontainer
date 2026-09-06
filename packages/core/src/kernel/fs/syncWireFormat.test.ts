@@ -87,6 +87,10 @@ describe("syncWireFormat requests", () => {
     expect(roundTripRequest({ op: FsOp.READLINK, path: "/link.txt" })).toEqual({ op: FsOp.READLINK, path: "/link.txt" });
   });
 
+  it("round-trips REALPATH", () => {
+    expect(roundTripRequest({ op: FsOp.REALPATH, path: "/link.txt" })).toEqual({ op: FsOp.REALPATH, path: "/link.txt" });
+  });
+
   it("round-trips CHMOD", () => {
     expect(roundTripRequest({ op: FsOp.CHMOD, path: "/a.sh", mode: 0o755 })).toEqual({
       op: FsOp.CHMOD,
@@ -167,6 +171,14 @@ describe("syncWireFormat responses", () => {
 
   it("round-trips a CHMOD success response", () => {
     expect(roundTripResponse({ ok: true, op: FsOp.CHMOD })).toEqual({ ok: true, op: FsOp.CHMOD });
+  });
+
+  it("round-trips a REALPATH success response", () => {
+    expect(roundTripResponse({ ok: true, op: FsOp.REALPATH, path: "/a/b/real.txt" })).toEqual({
+      ok: true,
+      op: FsOp.REALPATH,
+      path: "/a/b/real.txt",
+    });
   });
 
   it("round-trips an EXISTS success response", () => {

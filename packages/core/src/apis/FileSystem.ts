@@ -30,6 +30,7 @@ interface FileSystemAPI {
   chmod(path: string, mode: number): Promise<void>;
   symlink(target: string, path: string): Promise<void>;
   readlink(path: string): Promise<string>;
+  realpath(path: string): Promise<string>;
   rm(path: string, options?: RmOptions): Promise<void>;
   rename(from: string, to: string): Promise<void>;
   exists(path: string): Promise<boolean>;
@@ -87,6 +88,7 @@ const createFileSystemAPI = (request: Requester): FileSystemAPI => {
     chmod: (path, mode) => call("chmod", { path, mode }),
     symlink: (target, path) => call("symlink", { target, path }),
     readlink: (path) => call<string>("readlink", { path }),
+    realpath: (path) => call<string>("realpath", { path }),
     rm: (path, options) => call("rm", { path, recursive: options?.recursive }),
     rename: (from, to) => call("rename", { from, to }),
     exists: (path) => call<boolean>("exists", { path }),

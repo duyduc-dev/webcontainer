@@ -191,6 +191,36 @@ describe("VirtualFileSystem", () => {
     expect(() => vfs.readlink("/real.txt")).toThrow(expect.objectContaining({ code: "EINVAL" }));
   });
 
+  it("realpath resolves a symlink to its target's canonical path, unlike readlink's raw target string", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.mkdir("/a/b", { recursive: true });
+    vfs.writeFile("/a/b/real.txt", "hi");
+    vfs.symlink("./b/real.txt", "/a/link.txt");
+
+    expect(vfs.realpath("/a/link.txt")).toBe("/a/b/real.txt");
+  });
+
+  it("realpath is a no-op for a path with no symlinks in it", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.writeFile("/real.txt", "hi");
+    expect(vfs.realpath("/real.txt")).toBe("/real.txt");
+  });
+
+  it("realpath resolves an intermediate symlink, not just a final-segment one", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.mkdir("/real-dir", { recursive: true });
+    vfs.writeFile("/real-dir/file.txt", "hi");
+    vfs.symlink("/real-dir", "/link-dir");
+
+    expect(vfs.realpath("/link-dir/file.txt")).toBe("/real-dir/file.txt");
+  });
+
+  it("realpath throws ENOENT for a dangling symlink, matching stat's behavior", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.symlink("/does-not-exist", "/link.txt");
+    expect(() => vfs.realpath("/link.txt")).toThrow(expect.objectContaining({ code: "ENOENT" }));
+  });
+
   it("rm removes the symlink itself, not its target", () => {
     const vfs = createVirtualFileSystem();
     vfs.writeFile("/real.txt", "hi");

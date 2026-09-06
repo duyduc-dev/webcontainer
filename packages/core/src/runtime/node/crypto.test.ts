@@ -21,6 +21,7 @@ const requireCrypto = () => {
     randomBytes(size: number, callback?: (err: Error | null, buf: unknown) => void): { length: number } | undefined;
     randomUUID(): string;
     randomInt(min: number, max?: number, callback?: (err: Error | null, n: number) => void): number | undefined;
+    getHashes(): string[];
   };
 };
 
@@ -65,6 +66,16 @@ describe("vendored 'crypto' (pure-JS hash/hmac/random subset)", () => {
   it("throws a clear error for an unsupported digest", () => {
     const crypto = requireCrypto();
     expect(() => crypto.createHash("sha512")).toThrow(/sha512.*not supported/);
+  });
+
+  it("getHashes() reports exactly the digests createHash() actually supports - no more, no less", () => {
+    const crypto = requireCrypto();
+    const hashes = crypto.getHashes();
+
+    expect(hashes.sort()).toEqual(["md5", "sha1", "sha256"]);
+    for (const algorithm of hashes) {
+      expect(() => crypto.createHash(algorithm)).not.toThrow();
+    }
   });
 
   it("matches a known HMAC-SHA256 test vector (RFC 4231 test case 1)", () => {

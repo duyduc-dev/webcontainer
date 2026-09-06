@@ -1,8 +1,12 @@
 import { createNodeModules } from "../node/loader";
 import type { NodeModulesContext } from "../node/loader";
 import { createConstantsModule } from "./constants";
+import { createAssertModule } from "./assert";
+import { createModuleModule } from "./module";
+import { createHttp2Module } from "./http2";
 import { createOsModule } from "./os";
 import { createQuerystringModule } from "./querystring";
+import { createTimersPromisesModule } from "./timersPromises";
 import { createStringDecoderModule } from "./string_decoder";
 import { createTtyModule } from "./tty";
 import { createUrlModule } from "./url";
@@ -30,11 +34,15 @@ const BUILTIN_NAMES = new Set([
   "url",
   "querystring",
   "string_decoder",
+  "timers/promises",
+  "module",
+  "assert",
   "events",
   "stream",
   "buffer",
   "http",
   "https",
+  "http2",
   "crypto",
   "zlib",
   "async_hooks",
@@ -73,6 +81,9 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     url: createUrlModule(),
     querystring: createQuerystringModule(),
     string_decoder: createStringDecoderModule(),
+    "timers/promises": createTimersPromisesModule(),
+    module: createModuleModule(),
+    assert: createAssertModule(),
     // Real Node exposes `process` both as a bare global AND as
     // require('process')/require('node:process'), the same object either
     // way - modern code (e.g. supports-color, vendored inside real npm's
@@ -87,6 +98,7 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     buffer: nodeModules.require("buffer"),
     http: nodeModules.require("http"),
     https: nodeModules.require("https"),
+    http2: createHttp2Module(),
     crypto: nodeModules.require("crypto"),
     zlib: nodeModules.require("zlib"),
     async_hooks: nodeModules.require("async_hooks"),

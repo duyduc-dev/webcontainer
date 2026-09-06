@@ -21,7 +21,8 @@ type FsRequestPayload =
   | { action: "symlink"; target: string; path: string }
   | { action: "readlink"; path: string }
   | { action: "lstat"; path: string }
-  | { action: "chmod"; path: string; mode: number };
+  | { action: "chmod"; path: string; mode: number }
+  | { action: "realpath"; path: string };
 
 const vfs = createVirtualFileSystem();
 
@@ -90,6 +91,8 @@ const handleFsRequest = (payload: FsRequestPayload): unknown => {
     case "chmod":
       vfs.chmod(payload.path, payload.mode);
       return undefined;
+    case "realpath":
+      return vfs.realpath(payload.path);
   }
 };
 

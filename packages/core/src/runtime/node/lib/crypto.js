@@ -266,5 +266,13 @@ export default function (exports, require, module, process, internalBinding, pri
 
   const randomUUID = () => crypto.randomUUID();
 
-  module.exports = { createHash, createHmac, randomBytes, randomInt, randomUUID, Hash, Hmac };
+  // Real Node's getHashes() queries OpenSSL for every digest it supports;
+  // ours just reports the truth for this pure-JS shim (CORES above) -
+  // traced need: ssri (real npm's own subresource-integrity dependency)
+  // calls this at module load to filter its own algorithm-priority list
+  // down to what's actually usable, so an honest, narrow answer is exactly
+  // right here, not a lie to paper over.
+  const getHashes = () => Object.keys(CORES);
+
+  module.exports = { createHash, createHmac, randomBytes, randomInt, randomUUID, getHashes, Hash, Hmac };
 }

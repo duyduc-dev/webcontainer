@@ -53,6 +53,8 @@ const executeFsRequest = (vfs: VirtualFileSystem, request: FsRequest): FsRespons
     case FsOp.CHMOD:
       vfs.chmod(request.path, request.mode);
       return { ok: true, op: FsOp.CHMOD };
+    case FsOp.REALPATH:
+      return { ok: true, op: FsOp.REALPATH, path: vfs.realpath(request.path) };
   }
 };
 

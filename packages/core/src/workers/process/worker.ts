@@ -272,10 +272,10 @@ const createWritableStream = (stream: "stdout" | "stderr") => ({
 const createSyncFsChannel = (syncFs: SyncFsChannelPayload | null): SyncFsChannel | null =>
   syncFs ? { port: syncFs.port, control: new Int32Array(syncFs.control), data: syncFs.data } : null;
 
-const createFsBuiltinFromChannel = (channel: SyncFsChannel | null): FsBuiltin => {
+const createFsBuiltinFromChannel = (channel: SyncFsChannel | null, nextTick: (callback: () => void) => void): FsBuiltin => {
   const io: FsBuiltinIO = {};
   if (channel) io.callSync = (request) => callSyncFs(channel, request);
-  return createFsBuiltin(io);
+  return createFsBuiltin(io, nextTick);
 };
 
 const decoder = new TextDecoder();
@@ -405,7 +405,7 @@ const boot = (payload: BootPayload): void => {
   // on, so every accepted cross-process connection dispatches into a
   // `pipeServers` map nothing ever populated and gets closed immediately.
   const syncFsChannel = createSyncFsChannel(payload.syncFs);
-  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel);
+  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel, eventLoop.nextTick);
   // Real Node's `fs` module also carries a `.promises` namespace, the same
   // object `require('fs/promises')` returns directly - both point at the
   // one fsBuiltin instance so a `fs.promises.readFile()` and a

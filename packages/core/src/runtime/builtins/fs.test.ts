@@ -81,6 +81,160 @@ describe("createFsBuiltin", () => {
     fs.chmodSync("/a.sh", 0o755);
     expect(fs.statSync("/a.sh").mode).toBe(0o755);
   });
+
+  it("constants exposes the same O_* flags require('constants') does (real tar's own get-write-flag.js destructures fs.constants directly)", () => {
+    const fs = createFsBuiltin(makeIO());
+    expect(fs.constants.O_CREAT).toBeTypeOf("number");
+    expect(fs.constants.O_TRUNC).toBeTypeOf("number");
+    expect(fs.constants.O_WRONLY).toBeTypeOf("number");
+  });
+
+  it("realpathSync resolves a symlink to its target's canonical path", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.mkdirSync("/a", { recursive: true });
+    fs.writeFileSync("/real.txt", "hi");
+    fs.symlinkSync("../real.txt", "/a/link.txt");
+
+    expect(fs.realpathSync("/a/link.txt")).toBe("/real.txt");
+  });
+
+  it("realpathSync.native is the same resolver, not a missing/different function (real npm's own path-scurry dependency calls .native directly)", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/real.txt", "hi");
+    fs.symlinkSync("/real.txt", "/link.txt");
+
+    expect(typeof fs.realpathSync.native).toBe("function");
+    expect(fs.realpathSync.native("/link.txt")).toBe("/real.txt");
+  });
+});
+
+// Traced need: fs-minipass (real tar's own dependency, used to physically
+// write/read extracted package files during `npm install`) is built
+// entirely around open/read/write/close by fd, with writev() as its
+// multi-buffer-flush fast path - see fs.ts's own doc comment on
+// createFsBuiltin for how a VFS with no real OS fds backs this.
+describe("createFsBuiltin fd-based I/O", () => {
+  it("openSync('w') + writeSync + closeSync persists the written bytes to the VFS path", () => {
+    const fs = createFsBuiltin(makeIO());
+    const fd = fs.openSync("/out.txt", "w");
+    const bytes = new TextEncoder().encode("hello");
+    fs.writeSync(fd, bytes, 0, bytes.length, null);
+    fs.closeSync(fd);
+
+    expect(new TextDecoder().decode(fs.readFileSync("/out.txt"))).toBe("hello");
+  });
+
+  it("sequential writeSync calls (position: null) append in order, matching a real WriteStream's usage", () => {
+    const fs = createFsBuiltin(makeIO());
+    const fd = fs.openSync("/out.txt", "w");
+    for (const chunk of ["a", "b", "c"]) {
+      const bytes = new TextEncoder().encode(chunk);
+      fs.writeSync(fd, bytes, 0, bytes.length, null);
+    }
+    fs.closeSync(fd);
+
+    expect(new TextDecoder().decode(fs.readFileSync("/out.txt"))).toBe("abc");
+  });
+
+  it("an explicit numeric position writes at that offset without moving the sequential cursor", () => {
+    const fs = createFsBuiltin(makeIO());
+    const fd = fs.openSync("/out.txt", "w");
+    const abc = new TextEncoder().encode("abc");
+    fs.writeSync(fd, abc, 0, abc.length, null); // cursor now at 3
+    const x = new TextEncoder().encode("X");
+    fs.writeSync(fd, x, 0, x.length, 1); // explicit position - overwrite index 1, cursor unmoved
+    const d = new TextEncoder().encode("d");
+    fs.writeSync(fd, d, 0, d.length, null); // resumes from the sequential cursor (3)
+    fs.closeSync(fd);
+
+    expect(new TextDecoder().decode(fs.readFileSync("/out.txt"))).toBe("aXcd");
+  });
+
+  it("writev() writes multiple buffers in order and reports the total bytes written", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const fd = fs.openSync("/out.txt", "w");
+    const result = await new Promise<{ error: unknown; total: number | undefined }>((resolve) => {
+      fs.writev(fd, [new TextEncoder().encode("foo"), new TextEncoder().encode("bar")], null, (error, total) =>
+        resolve({ error, total }),
+      );
+    });
+    fs.closeSync(fd);
+
+    expect(result.error).toBeNull();
+    expect(result.total).toBe(6);
+    expect(new TextDecoder().decode(fs.readFileSync("/out.txt"))).toBe("foobar");
+  });
+
+  it("openSync('r') + readSync reads back what was written, advancing the cursor across calls", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/in.txt", "hello world");
+    const fd = fs.openSync("/in.txt", "r");
+
+    const first = new Uint8Array(5);
+    const firstRead = fs.readSync(fd, first, 0, 5, null);
+    const second = new Uint8Array(6);
+    const secondRead = fs.readSync(fd, second, 0, 6, null);
+    fs.closeSync(fd);
+
+    expect(firstRead).toBe(5);
+    expect(new TextDecoder().decode(first)).toBe("hello");
+    expect(secondRead).toBe(6);
+    expect(new TextDecoder().decode(second)).toBe(" world");
+  });
+
+  it("openSync('r+') on a missing file throws ENOENT (fs-minipass's WriteStream relies on exactly this to retry with 'w')", () => {
+    const fs = createFsBuiltin(makeIO());
+    expect(() => fs.openSync("/missing.txt", "r+")).toThrow(expect.objectContaining({ code: "ENOENT" }));
+  });
+
+  it("openSync('r+') on an existing file preserves its content for in-place overwrites", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/out.txt", "abc");
+    const fd = fs.openSync("/out.txt", "r+");
+    const x = new TextEncoder().encode("X");
+    fs.writeSync(fd, x, 0, x.length, 1);
+    fs.closeSync(fd);
+
+    expect(new TextDecoder().decode(fs.readFileSync("/out.txt"))).toBe("aXc");
+  });
+
+  it("closeSync then any further use of the same fd throws EBADF", () => {
+    const fs = createFsBuiltin(makeIO());
+    const fd = fs.openSync("/out.txt", "w");
+    fs.closeSync(fd);
+
+    expect(() => fs.closeSync(fd)).toThrow(expect.objectContaining({ code: "EBADF" }));
+  });
+
+  it("writeSync on a fd opened for reading throws EBADF", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/in.txt", "hi");
+    const fd = fs.openSync("/in.txt", "r");
+
+    expect(() => fs.writeSync(fd, new Uint8Array(1), 0, 1, null)).toThrow(expect.objectContaining({ code: "EBADF" }));
+  });
+
+  it("the callback-style open/write/read/close variants defer via the provided nextTick, not synchronously", async () => {
+    const calls: string[] = [];
+    let nextTickInvocations = 0;
+    const fs = createFsBuiltin(makeIO(), (cb) => {
+      nextTickInvocations++;
+      queueMicrotask(cb);
+    });
+
+    const fd = await new Promise<number>((resolve) => {
+      fs.open("/out.txt", "w", (_error, openedFd) => resolve(openedFd!));
+      calls.push("open() returned control before its callback ran");
+    });
+    expect(calls).toEqual(["open() returned control before its callback ran"]);
+
+    const bytes = new TextEncoder().encode("hi");
+    await new Promise<void>((resolve) => fs.write(fd, bytes, 0, bytes.length, null, () => resolve()));
+    await new Promise<void>((resolve) => fs.close(fd, () => resolve()));
+
+    expect(nextTickInvocations).toBe(3); // open + write + close
+    expect(new TextDecoder().decode(fs.readFileSync("/out.txt"))).toBe("hi");
+  });
 });
 
 describe("createFsPromisesBuiltin", () => {
@@ -132,5 +286,14 @@ describe("createFsPromisesBuiltin", () => {
     await fsPromises.mkdir("/src", { recursive: true });
     await fsPromises.writeFile("/src/a.js", "a");
     await expect(fsPromises.readdir("/src")).resolves.toEqual(["a.js"]);
+  });
+
+  it("realpath resolves a symlink to its target's canonical path", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const fsPromises = createFsPromisesBuiltin(fs, (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/real.txt", "hi");
+    fs.symlinkSync("/real.txt", "/link.txt");
+
+    await expect(fsPromises.realpath("/link.txt")).resolves.toBe("/real.txt");
   });
 });

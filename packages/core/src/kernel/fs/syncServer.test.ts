@@ -101,4 +101,18 @@ describe("serviceSyncFsRequest", () => {
 
     expect(decodeFsResponse(data)).toEqual({ ok: true, op: FsOp.READLINK, target: "../real.txt" });
   });
+
+  it("services a REALPATH request", () => {
+    const vfs = createVirtualFileSystem();
+    vfs.mkdir("/a");
+    vfs.writeFile("/real.txt", "hi");
+    vfs.symlink("../real.txt", "/a/link.txt");
+    const { control, data } = makeChannel();
+
+    encodeFsRequest({ op: FsOp.REALPATH, path: "/a/link.txt" }, data);
+    Atomics.store(control, FS_SYNC_STATE_INDEX, FS_SYNC_STATE_REQUESTED);
+    serviceSyncFsRequest(vfs, control, data);
+
+    expect(decodeFsResponse(data)).toEqual({ ok: true, op: FsOp.REALPATH, path: "/real.txt" });
+  });
 });
