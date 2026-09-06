@@ -54,6 +54,33 @@ test("dwc.shell.exec runs a chained shell line through the sync fs bridge", asyn
   expect(pageErrors).toEqual([]);
 });
 
+test("real vendored events/stream/crypto run, and https reaches the real npm registry", async ({ page }) => {
+  const consoleMessages: string[] = [];
+  const pageErrors: string[] = [];
+
+  page.on("console", (message) => consoleMessages.push(message.text()));
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto("/");
+
+  await expect
+    .poll(() => consoleMessages.some((text) => text.includes("net-test process exited with code 0")), { timeout: 15000 })
+    .toBe(true);
+
+  // xterm.js visually wraps long lines at the terminal's column width, so
+  // innerText() can insert a newline mid-string (e.g. inside the sha256 hex
+  // digest) - strip newlines before substring checks rather than assert on
+  // the raw wrapped text.
+  const terminalText = (await page.locator("#terminal").innerText()).replace(/\n/g, "");
+  expect(terminalText).toContain("[events] hello, world");
+  expect(terminalText).toContain('[crypto] sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824');
+  expect(terminalText).toMatch(/\[crypto] randomUUID\(\) = [0-9a-f-]{36}/);
+  expect(terminalText).toContain("[stream] piped: abc");
+  expect(terminalText).toContain("[https] fetched from registry.npmjs.org: name= left-pad latest=");
+
+  expect(pageErrors).toEqual([]);
+});
+
 test("dwc.fs mounts a declarative tree and reads it back through the FS worker", async ({ page }) => {
   const consoleMessages: string[] = [];
   const pageErrors: string[] = [];

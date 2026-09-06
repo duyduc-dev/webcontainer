@@ -66,6 +66,48 @@ async function main() {
     const shellResult = await dwc.shell.exec("mkdir -p /x && echo hi > /x/f && cat /x/f");
     console.log("[dwc] shell.exec result ->", JSON.stringify(shellResult.output));
     terminal.writeln(`[shell] mkdir -p /x && echo hi > /x/f && cat /x/f -> ${JSON.stringify(shellResult.output)}`);
+
+    // Phase 6/7 demo: real vendored Node events/stream/crypto, and a real
+    // network request through the Fetcher Worker via require('https').
+    await dwc.fs.writeFile(
+      "/net-test.js",
+      [
+        "const EventEmitter = require('events');",
+        "const { Readable, Writable } = require('stream');",
+        "const crypto = require('crypto');",
+        "const https = require('https');",
+        "",
+        "const emitter = new EventEmitter();",
+        "emitter.on('greet', (name) => console.log('[events] hello,', name));",
+        "emitter.emit('greet', 'world');",
+        "",
+        "const chunks = [];",
+        "const writable = new Writable({",
+        "  write(chunk, enc, cb) { chunks.push(chunk.toString()); cb(); },",
+        "});",
+        "writable.on('finish', () => console.log('[stream] piped:', chunks.join('')));",
+        "Readable.from(['a', 'b', 'c']).pipe(writable);",
+        "",
+        "console.log('[crypto] sha256(\"hello\") =', crypto.createHash('sha256').update('hello').digest('hex'));",
+        "console.log('[crypto] randomUUID() =', crypto.randomUUID());",
+        "",
+        "https.get('https://registry.npmjs.org/left-pad', (res) => {",
+        "  let data = '';",
+        "  res.on('data', (chunk) => { data += chunk; });",
+        "  res.on('end', () => {",
+        "    const pkg = JSON.parse(data);",
+        "    console.log('[https] fetched from registry.npmjs.org: name=', pkg.name, 'latest=', pkg['dist-tags'].latest);",
+        "  });",
+        "}).on('error', (err) => console.error('[https] error:', err.message));",
+        "",
+      ].join("\n"),
+    );
+
+    const netProc = await dwc.process.spawn("/net-test.js");
+    pipeToTerminal(netProc.stdout, terminal);
+    pipeToTerminal(netProc.stderr, terminal);
+    const netExitCode = await netProc.exit;
+    console.log("[dwc] net-test process exited with code", netExitCode);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);
