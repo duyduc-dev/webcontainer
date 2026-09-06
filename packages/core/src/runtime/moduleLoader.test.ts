@@ -229,6 +229,71 @@ describe("moduleLoader", () => {
     expect(() => loader.run("/index.js")).toThrow(/missing/);
   });
 
+  it("resolves a dynamic import() of a plain CJS module, wrapped as a namespace object", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = import('./dep.js');",
+        "/dep.js": "module.exports = { a: 1, b: 2 };",
+      },
+    });
+
+    await expect(loader.run("/index.js")).resolves.toEqual({ a: 1, b: 2, default: { a: 1, b: 2 } });
+  });
+
+  it("resolves a dynamic import() of a genuinely ESM-shaped module (retried through the ESM->CJS transform)", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = import('chalk');",
+        "/node_modules/chalk/package.json": '{"main":"index.js"}',
+        "/node_modules/chalk/index.js": "export class Chalk {}\nconst chalk = new Chalk();\nexport default chalk;",
+      },
+    });
+
+    const ns = (await loader.run("/index.js")) as { Chalk: new () => unknown; default: unknown };
+    expect(typeof ns.Chalk).toBe("function");
+    expect(ns.default).toBeInstanceOf(ns.Chalk);
+  });
+
+  it("doesn't rewrite a .import(...) property access as a dynamic import", () => {
+    const loader = createModuleLoader({
+      sources: { "/index.js": "module.exports = { import: (x) => x * 2 }.import(21);" },
+    });
+
+    expect(loader.run("/index.js")).toBe(42);
+  });
+
+  it("resolves a package's own '#specifier' via its package.json \"imports\" map (real chalk@5's own pattern)", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('pkg');",
+        "/node_modules/pkg/package.json": JSON.stringify({
+          main: "index.js",
+          imports: {
+            "#dep": { node: "./node-dep.js", default: "./browser-dep.js" },
+            "#plain": "./plain-dep.js",
+          },
+        }),
+        "/node_modules/pkg/index.js": "module.exports = require('#dep') + '/' + require('#plain');",
+        "/node_modules/pkg/node-dep.js": "module.exports = 'node-dep';",
+        "/node_modules/pkg/browser-dep.js": "module.exports = 'browser-dep';",
+        "/node_modules/pkg/plain-dep.js": "module.exports = 'plain-dep';",
+      },
+    });
+
+    expect(loader.run("/index.js")).toBe("node-dep/plain-dep");
+  });
+
+  it("throws a clear error for an unresolvable '#specifier'", () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "require('#missing');",
+        "/package.json": '{"imports":{}}',
+      },
+    });
+
+    expect(() => loader.run("/index.js")).toThrow(/#missing/);
+  });
+
   it("supports circular requires by returning the in-progress exports object", () => {
     const loader = createModuleLoader({
       sources: {

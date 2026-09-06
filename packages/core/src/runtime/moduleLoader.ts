@@ -1,6 +1,7 @@
 import { dirname, normalize } from "../kernel/fs/path";
 import { createBuiltinModules } from "./builtins";
 import type { ProcessLike } from "./builtins";
+import { interopDefault, toNamespace, transformEsmToCjs } from "./esmInterop";
 import type { NodeModulesContext } from "./node/loader";
 import { fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, splitBareSpecifier } from "./resolveSpecifier";
 
@@ -50,6 +51,13 @@ interface ModuleLoader {
 // carve-out and treats a bare `#` as a syntax error.
 const stripShebang = (source: string): string =>
   source.startsWith("#!") ? source.slice(source.indexOf("\n") + 1) : source;
+
+// `import(...)` is call-expression syntax, not something `new Function` lets
+// us hand a callback for the way `require` works - rewritten to a call we DO
+// control (bound per-module below, same as `require`) before compiling. The
+// negative lookbehind keeps `foo.import(...)` (a property access, not the
+// dynamic-import keyword) untouched.
+const rewriteDynamicImportCalls = (source: string): string => source.replace(/(?<!\.)\bimport(\s*\()/g, "__dwcImport$1");
 
 type SourceReader = (path: string) => string | undefined;
 
@@ -111,14 +119,76 @@ const resolveBareSync = (fromPath: string, specifier: string, readSource: Source
   return null;
 };
 
+/** Walks up from `dirname(fromPath)` looking for the nearest package.json -
+ * the "owning package" a `#specifier` (see resolvePackageImportsSync) is
+ * private to. Not node_modules-specific: a package's own "imports" map
+ * applies to every file inside it, however deeply nested. */
+const findPackageRoot = (fromPath: string, readSource: SourceReader): string | null => {
+  let dir = dirname(fromPath);
+  for (;;) {
+    if (readSource(`${dir}/package.json`) !== undefined) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+};
+
+/**
+ * Resolves a `#`-prefixed specifier via its owning package's own
+ * package.json `"imports"` map (real Node's "package imports" feature -
+ * distinct from, and unrelated to, the node_modules bare-specifier lookup
+ * `resolveBareSync` does above). Needed by real chalk@5's own source, which
+ * imports `#ansi-styles`/`#supports-color` this way. Only exact-key lookup
+ * and a `node`/`default`-preferring pick from a conditional object value are
+ * supported - no wildcard/pattern keys (chalk's own map doesn't use them,
+ * and this loader has no other caller for `"imports"` yet). Returns null
+ * (not a throw) on any miss, same convention as resolveBareSync.
+ */
+const resolvePackageImportsSync = (fromPath: string, specifier: string, readSource: SourceReader): string | null => {
+  const packageRoot = findPackageRoot(fromPath, readSource);
+  if (!packageRoot) return null;
+
+  const pkgJsonSource = readSource(`${packageRoot}/package.json`);
+  if (pkgJsonSource === undefined) return null;
+
+  let imports: Record<string, unknown>;
+  try {
+    imports = (JSON.parse(pkgJsonSource) as { imports?: Record<string, unknown> }).imports ?? {};
+  } catch {
+    return null;
+  }
+
+  const mapping = imports[specifier];
+  const target =
+    typeof mapping === "string"
+      ? mapping
+      : mapping && typeof mapping === "object"
+        ? ((mapping as Record<string, string>).node ??
+          (mapping as Record<string, string>).default ??
+          Object.values(mapping as Record<string, string>)[0])
+        : undefined;
+  if (typeof target !== "string") return null;
+
+  return fileCandidates(normalize(`${packageRoot}/${target}`)).find((candidate) => readSource(candidate) !== undefined) ?? null;
+};
+
 /**
  * Minimal CommonJS loader over a fully preloaded source map (Phase 4's "static
  * transport" - no lazy fs access from inside the process worker). Relative
  * requires, the builtins registry, and bare (node_modules) specifiers are all
- * supported; package.json "exports"/"imports" conditional resolution is not
- * (see resolveSpecifier.ts's header) - only the older "main"-field + plain-
- * subpath algorithm, still correct for any package that doesn't opt into
- * "exports".
+ * supported; package.json "exports" conditional resolution is not (see
+ * resolveSpecifier.ts's header) - only the older "main"-field + plain-subpath
+ * algorithm, still correct for any package that doesn't opt into "exports".
+ * "imports" (private `#specifier` subpath imports) IS supported, via
+ * resolvePackageImportsSync above - a distinct, much smaller algorithm
+ * (exact-key lookup only, no patterns) added specifically for real chalk@5's
+ * own `#ansi-styles`/`#supports-color` imports.
+ *
+ * A dynamic `import(...)` expression (rewritten to `__dwcImport` before
+ * compiling - see rewriteDynamicImportCalls) and a genuinely ESM source file
+ * that fails to compile as CommonJS (retried once through
+ * esmInterop.ts's transformEsmToCjs) are both supported on a best-effort
+ * basis - see esmInterop.ts's own doc comment for the concrete scope.
  */
 const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
   const { sources } = options;
@@ -154,8 +224,52 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
         throw new Error(`Cannot find module '${specifier}'`);
       }
 
+      // A private package-imports specifier (real Node's "imports" field) -
+      // e.g. chalk@5's own `require('#ansi-styles')`. Checked before the
+      // node_modules walk below since a leading "#" can never be a bare
+      // package name.
+      if (specifier.startsWith("#")) {
+        const resolved = resolvePackageImportsSync(fromPath, specifier, readSource);
+        if (resolved) return loadModule(resolved).exports;
+        throw new Error(`Cannot find package import '${specifier}' from '${fromPath}'`);
+      }
+
       const resolved = resolveBareSync(fromPath, specifier, readSource);
       if (resolved) return loadModule(resolved).exports;
+
+      throw new Error(`Cannot find module '${specifier}' from '${fromPath}'`);
+    };
+  };
+
+  /** Backs a compiled module's rewritten `__dwcImport(...)` call - real
+   * dynamic `import()`, always async, resolved through the same graph
+   * `require` uses (same branch order) and wrapped into a namespace object
+   * (see esmInterop.ts's toNamespace) since that's the shape real `import()`
+   * actually hands back, not a bare CJS `module.exports`. */
+  const createDynamicImport = (fromPath: string) => {
+    return async (rawSpecifier: string): Promise<Record<string, unknown>> => {
+      const specifier = rawSpecifier.startsWith("node:") ? rawSpecifier.slice(5) : rawSpecifier;
+
+      if (specifier in builtins) return toNamespace(builtins[specifier]);
+
+      if (specifier.startsWith(".")) {
+        return toNamespace(loadModule(resolveRelative(fromPath, specifier, readSource)).exports);
+      }
+
+      if (specifier.startsWith("/")) {
+        const resolved = fileCandidates(specifier).find((candidate) => readSource(candidate) !== undefined);
+        if (resolved) return toNamespace(loadModule(resolved).exports);
+        throw new Error(`Cannot find module '${specifier}'`);
+      }
+
+      if (specifier.startsWith("#")) {
+        const resolved = resolvePackageImportsSync(fromPath, specifier, readSource);
+        if (resolved) return toNamespace(loadModule(resolved).exports);
+        throw new Error(`Cannot find package import '${specifier}' from '${fromPath}'`);
+      }
+
+      const resolved = resolveBareSync(fromPath, specifier, readSource);
+      if (resolved) return toNamespace(loadModule(resolved).exports);
 
       throw new Error(`Cannot find module '${specifier}' from '${fromPath}'`);
     };
@@ -176,26 +290,38 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
       return record;
     }
 
-    let wrapper: (module: unknown, exports: unknown, require: unknown, filename: string, dirname: string) => void;
+    type Wrapper = (
+      module: unknown,
+      exports: unknown,
+      require: unknown,
+      filename: string,
+      dirname: string,
+      dwcImport: unknown,
+      dwcInteropDefault: unknown,
+    ) => void;
+    const WRAPPER_PARAMS = ["module", "exports", "require", "__filename", "__dirname", "__dwcImport", "__dwcInteropDefault"];
+    const compiled = rewriteDynamicImportCalls(stripShebang(source));
+
+    let wrapper: Wrapper;
     try {
-      wrapper = new Function(
-        "module",
-        "exports",
-        "require",
-        "__filename",
-        "__dirname",
-        stripShebang(source),
-      ) as typeof wrapper;
-    } catch (error) {
-      // A bare SyntaxError from `new Function` names neither the file nor
-      // even which require() pulled it in - both matter here (this loader
-      // only ever accepts CommonJS; a `.mjs`/ESM file with top-level import/
-      // export would fail exactly like this).
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`${message} while parsing '${path}'`);
+      wrapper = new Function(...WRAPPER_PARAMS, compiled) as Wrapper;
+    } catch (originalError) {
+      // Not valid CommonJS as-is - on the real files this loader actually
+      // hits (chalk@5 and friends: genuinely ESM-only, no CJS build), a
+      // best-effort statement rewrite (see esmInterop.ts) usually fixes
+      // exactly this. Retried once; if it STILL doesn't compile, the
+      // ORIGINAL error is what gets reported (more meaningful than a
+      // failure inside our own best-effort transform, and correct for
+      // plain-broken-syntax input the transform is a no-op on).
+      try {
+        wrapper = new Function(...WRAPPER_PARAMS, transformEsmToCjs(compiled)) as Wrapper;
+      } catch {
+        const message = originalError instanceof Error ? originalError.message : String(originalError);
+        throw new Error(`${message} while parsing '${path}'`);
+      }
     }
     const moduleObj = { exports: record.exports };
-    wrapper(moduleObj, moduleObj.exports, createRequire(path), path, dirname(path));
+    wrapper(moduleObj, moduleObj.exports, createRequire(path), path, dirname(path), createDynamicImport(path), interopDefault);
     record.exports = moduleObj.exports;
 
     return record;

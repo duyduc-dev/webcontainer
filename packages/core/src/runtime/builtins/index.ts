@@ -1,6 +1,11 @@
 import { createNodeModules } from "../node/loader";
 import type { NodeModulesContext } from "../node/loader";
+import { createConstantsModule } from "./constants";
 import { createOsModule } from "./os";
+import { createQuerystringModule } from "./querystring";
+import { createStringDecoderModule } from "./string_decoder";
+import { createTtyModule } from "./tty";
+import { createUrlModule } from "./url";
 import pathModule from "./path";
 import utilModule from "./util";
 
@@ -19,6 +24,12 @@ const BUILTIN_NAMES = new Set([
   "path",
   "util",
   "os",
+  "tty",
+  "process",
+  "constants",
+  "url",
+  "querystring",
+  "string_decoder",
   "events",
   "stream",
   "buffer",
@@ -57,6 +68,20 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     path: pathModule,
     util: utilModule,
     os: createOsModule(process),
+    tty: createTtyModule(),
+    constants: createConstantsModule(),
+    url: createUrlModule(),
+    querystring: createQuerystringModule(),
+    string_decoder: createStringDecoderModule(),
+    // Real Node exposes `process` both as a bare global AND as
+    // require('process')/require('node:process'), the same object either
+    // way - modern code (e.g. supports-color, vendored inside real npm's
+    // own chalk dependency) increasingly does `import process from
+    // 'node:process'` instead of relying on the global. `process` here is
+    // whatever the caller's own global `process` already is (worker.ts
+    // passes the real, EventEmitter-mixed-in processGlobal) - not a second,
+    // divergent instance.
+    process,
     events: nodeModules.require("events"),
     stream: nodeModules.require("stream"),
     buffer: nodeModules.require("buffer"),

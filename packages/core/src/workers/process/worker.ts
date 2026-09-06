@@ -1,5 +1,5 @@
 import { createBuiltinModules } from "../../runtime/builtins";
-import { createFsBuiltin } from "../../runtime/builtins/fs";
+import { createFsBuiltin, createFsPromisesBuiltin } from "../../runtime/builtins/fs";
 import type { FsBuiltin, FsBuiltinIO } from "../../runtime/builtins/fs";
 import { createEventLoop } from "../../runtime/eventLoop";
 import { createModuleLoader } from "../../runtime/moduleLoader";
@@ -228,6 +228,30 @@ const exitProcess = (code: number): void => {
   postEvent("exit", { code });
 };
 
+interface TimerHandle {
+  id: number;
+  ref(): TimerHandle;
+  unref(): TimerHandle;
+}
+
+/** Wraps eventLoop.ts's plain numeric timer id into the Node-shaped handle
+ * guest code's global setTimeout()/setImmediate() must return - see the
+ * Object.assign(self, ...) call site's own comment for why. */
+const wrapTimerHandle = (id: number): TimerHandle => ({
+  id,
+  ref() {
+    return this;
+  },
+  unref() {
+    return this;
+  },
+});
+
+/** clearTimeout()/clearImmediate() accept either the wrapped handle above or
+ * a bare numeric id (real Node's own clearTimeout() is equally permissive). */
+const unwrapTimerHandle = (handle: unknown): number =>
+  typeof handle === "object" && handle !== null ? (handle as TimerHandle).id : (handle as number);
+
 const write = (stream: "stdout" | "stderr", chunk: string | Uint8Array): void => {
   postEvent(stream, { chunk: typeof chunk === "string" ? encoder.encode(chunk) : chunk });
 };
@@ -297,6 +321,12 @@ const boot = (payload: BootPayload): void => {
     versions: { node: "24.18.0" },
     platform: "linux",
     arch: "x64",
+    // Real Node code (traced need: @npmcli/config's own loadGlobalPrefix())
+    // derives the global install prefix from dirname(dirname(execPath)) -
+    // matches NPM_VFS_ROOT (examples/playground/src/vendorNpm.ts) being
+    // mounted at /usr/lib/node_modules/npm, so that derivation lands on the
+    // same /usr a real global npm install would also compute.
+    execPath: "/usr/bin/node",
   };
 
   // 'net' needs the loop's close phase + liveness ref/unref (see eventLoop.ts's
@@ -331,6 +361,11 @@ const boot = (payload: BootPayload): void => {
   // The module wrapper (new Function) closes over the global scope, so console/process/
   // timers must be real globals here rather than parameters threaded through requires.
   Object.assign(self, {
+    // Real Node's `global` is just an alias for `globalThis` - a Worker has
+    // no such identifier at all otherwise, and plenty of real ecosystem code
+    // references it directly (traced need: graceful-fs's own source does
+    // `global.something`, called from real npm's own entry.js).
+    global: self,
     console: {
       log: (...args: unknown[]) => write("stdout", `${args.map(String).join(" ")}\n`),
       info: (...args: unknown[]) => write("stdout", `${args.map(String).join(" ")}\n`),
@@ -338,10 +373,23 @@ const boot = (payload: BootPayload): void => {
       error: (...args: unknown[]) => write("stderr", `${args.map(String).join(" ")}\n`),
     },
     process: processGlobal,
-    setTimeout: eventLoop.setTimeout,
-    clearTimeout: eventLoop.clearTimeout,
-    setImmediate: eventLoop.setImmediate,
-    clearImmediate: eventLoop.clearImmediate,
+    // Real Node's setTimeout()/setImmediate() return a Timeout/Immediate
+    // object with .ref()/.unref() (real code calls this - traced need: real
+    // npm's own lib/utils/display.js does `this.#timeout = setTimeout(...);
+    // this.#timeout.unref()` on its spinner-render timer) - our own
+    // eventLoop.ts keeps returning a plain numeric id internally (unchanged,
+    // so net/child_process's own direct callers are unaffected), wrapped
+    // into a Node-shaped handle only at this guest-facing global boundary.
+    // .unref()/.ref() are no-ops (this eventLoop's hasPendingWork() doesn't
+    // track per-timer ref state) - the practical effect is a process might
+    // wait out an unref'd timer's own delay before concluding it's done,
+    // never an actual hang, since the timer still fires normally.
+    setTimeout: (callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) =>
+      wrapTimerHandle(eventLoop.setTimeout(callback, delay, ...args)),
+    clearTimeout: (handle: unknown) => eventLoop.clearTimeout(unwrapTimerHandle(handle)),
+    setImmediate: (callback: (...args: unknown[]) => void, ...args: unknown[]) =>
+      wrapTimerHandle(eventLoop.setImmediate(callback, ...args)),
+    clearImmediate: (handle: unknown) => eventLoop.clearImmediate(unwrapTimerHandle(handle)),
     __dwcFetchAsync: createNetRequest(eventLoop),
     Buffer: (vendoredBuiltins.buffer as { Buffer: unknown }).Buffer,
   });
@@ -357,9 +405,20 @@ const boot = (payload: BootPayload): void => {
   // on, so every accepted cross-process connection dispatches into a
   // `pipeServers` map nothing ever populated and gets closed immediately.
   const syncFsChannel = createSyncFsChannel(payload.syncFs);
+  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel);
+  // Real Node's `fs` module also carries a `.promises` namespace, the same
+  // object `require('fs/promises')` returns directly - both point at the
+  // one fsBuiltin instance so a `fs.promises.readFile()` and a
+  // `require('fs/promises').readFile()` call are calling through the same
+  // sync bridge, not two independently-constructed fs bindings.
+  const fsPromisesBuiltin = createFsPromisesBuiltin(fsBuiltin, eventLoop.nextTick);
   const moduleLoader = createModuleLoader({
     sources: payload.sources,
-    builtins: { ...vendoredBuiltins, fs: createFsBuiltinFromChannel(syncFsChannel) },
+    builtins: {
+      ...vendoredBuiltins,
+      fs: Object.assign(fsBuiltin, { promises: fsPromisesBuiltin }),
+      "fs/promises": fsPromisesBuiltin,
+    },
     process: processGlobal,
     readFileSync: createModuleReadFileSync(syncFsChannel),
   });
@@ -440,10 +499,31 @@ const boot = (payload: BootPayload): void => {
     });
 };
 
+// How many consecutive real macrotask-boundary yields (each guaranteed to
+// run only after every currently-queued native microtask has fully drained
+// - see eventLoop.ts's yieldToMicrotasks()) drain() gives a guest script's
+// own plain `await somePromise()` chain before concluding the process is
+// actually done. Needed because such a chain (built entirely on native
+// promises - no nextTick/timer/immediate/ref of ours anywhere in it) is
+// invisible to hasPendingWork(): real npm's own `which()` -> `isexe()` ->
+// `fs.promises.stat()` call chain is exactly this shape, and without this
+// grace period the process tore itself down mid-chain, silently dropping
+// every write the chain's remaining `await` continuations would have made.
+// Each yield is a sub-millisecond MessageChannel round trip, so even the
+// full budget adds negligible latency to a process that really is done.
+const DRAIN_GRACE_YIELDS = 20;
+
 const drain = async (eventLoop: ReturnType<typeof createEventLoop>): Promise<void> => {
-  while (eventLoop.hasPendingWork()) {
-    const didWork = await eventLoop.runOnce();
-    if (!didWork) break;
+  let idleStreak = 0;
+  while (idleStreak <= DRAIN_GRACE_YIELDS) {
+    if (eventLoop.hasPendingWork()) {
+      idleStreak = 0;
+      const didWork = await eventLoop.runOnce();
+      if (!didWork) break;
+      continue;
+    }
+    idleStreak++;
+    await eventLoop.yieldToMicrotasks();
   }
 };
 

@@ -8,6 +8,25 @@ const drain = async (loop: ReturnType<typeof createEventLoop>): Promise<void> =>
   }
 };
 
+// Mirrors worker.ts's own drain() - see its comment for why this grace
+// period exists: a guest script's own plain `await somePromise()` chain
+// built entirely on native promises is invisible to hasPendingWork(), so a
+// naive drain() (the plain `drain` above) tears the loop down mid-chain.
+const GRACE_YIELDS = 20;
+const drainWithGrace = async (loop: ReturnType<typeof createEventLoop>): Promise<void> => {
+  let idleStreak = 0;
+  while (idleStreak <= GRACE_YIELDS) {
+    if (loop.hasPendingWork()) {
+      idleStreak = 0;
+      const didWork = await loop.runOnce();
+      if (!didWork) break;
+      continue;
+    }
+    idleStreak++;
+    await loop.yieldToMicrotasks();
+  }
+};
+
 describe("eventLoop", () => {
   it("runs nextTick before timers and immediates", async () => {
     const order: string[] = [];
@@ -161,6 +180,86 @@ describe("eventLoop", () => {
 
     expect(order).toEqual(["reply", "continuation"]);
     expect(loop.hasPendingWork()).toBe(false);
+  });
+
+  it("yieldToMicrotasks() resolves only after every currently-queued microtask has run, including ones enqueued while draining earlier ones", async () => {
+    const loop = createEventLoop();
+    const order: string[] = [];
+
+    // A chain of plain native promises with no nextTick/timer/immediate of
+    // ours anywhere in it - hasPendingWork() can't see any of this.
+    void Promise.resolve()
+      .then(() => {
+        order.push("a");
+        return Promise.resolve();
+      })
+      .then(() => {
+        order.push("b");
+        return Promise.resolve();
+      })
+      .then(() => order.push("c"));
+
+    expect(order).toEqual([]);
+    await loop.yieldToMicrotasks();
+    expect(order).toEqual(["a", "b", "c"]);
+  });
+
+  it("a naive drain() (no grace period) abandons a guest script's plain native-promise chain once nothing is tracked", async () => {
+    // This is the bug the grace period below fixes, reproduced directly:
+    // real npm's own which()->isexe()->fs.promises.stat() shape is exactly
+    // "one tracked hop, then several chained plain `await`s with nothing of
+    // ours in between."
+    const loop = createEventLoop();
+    const order: string[] = [];
+
+    loop.nextTick(() => {
+      order.push("tracked");
+      void Promise.resolve()
+        .then(() => order.push("untracked-1"))
+        .then(() => order.push("untracked-2"))
+        .then(() => order.push("untracked-3"))
+        .then(() => order.push("untracked-4"));
+    });
+
+    await drain(loop);
+
+    expect(order.length).toBeLessThan(5); // some (real npm's own chains ran even more) of the untracked continuations never ran
+  });
+
+  it("drain()'s grace period lets that same chain finish instead of abandoning it", async () => {
+    const loop = createEventLoop();
+    const order: string[] = [];
+
+    loop.nextTick(() => {
+      order.push("tracked");
+      void Promise.resolve()
+        .then(() => order.push("untracked-1"))
+        .then(() => order.push("untracked-2"));
+    });
+
+    await drainWithGrace(loop);
+
+    expect(order).toEqual(["tracked", "untracked-1", "untracked-2"]);
+  });
+
+  it("the grace period resumes normal processing if the untracked chain schedules real tracked work partway through", async () => {
+    const loop = createEventLoop();
+    const order: string[] = [];
+
+    loop.nextTick(() => {
+      order.push("first");
+      // A chain that eventually calls back into one of our own tracked
+      // primitives (e.g. a second require()'d fs.promises call) partway
+      // through - hasPendingWork() should pick it back up.
+      void Promise.resolve().then(() => {
+        order.push("untracked");
+        loop.nextTick(() => order.push("second-tracked"));
+      });
+    });
+
+    await drainWithGrace(loop);
+
+    expect(order).toEqual(["first", "untracked", "second-tracked"]);
   });
 
   it("clearTimeout and clearImmediate cancel pending work", async () => {

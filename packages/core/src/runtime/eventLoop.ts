@@ -33,6 +33,19 @@ interface EventLoop {
   ref(): void;
   unref(): void;
   /**
+   * Yields once to native microtasks via a real macrotask boundary
+   * (MessageChannel) — guaranteed to run only after every currently-queued
+   * microtask (including ones enqueued while draining earlier ones) has
+   * finished. Exposed publicly for boot()'s drain() to fall back on: a
+   * guest script's own plain `await somePromise()` chain built entirely on
+   * native promises (no nextTick/timer/immediate/ref of ours anywhere in
+   * it — e.g. `fs.promises`-based code chained through a few more `await`s)
+   * is invisible to hasPendingWork(), so drain() needs a way to keep giving
+   * it real turns instead of concluding "done" the instant nothing of ours
+   * is tracked.
+   */
+  yieldToMicrotasks(): Promise<void>;
+  /**
    * Schedules `fn` for the loop's close phase — after nextTick/timers/
    * immediates, before the loop would otherwise consider itself done.
    * Node's real loop runs handle-close callbacks in their own phase for
@@ -189,6 +202,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
     ref,
     unref,
     queueClose,
+    yieldToMicrotasks,
   };
 };
 

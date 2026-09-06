@@ -46,13 +46,22 @@ const format = (...args: unknown[]): string => {
   return [formatted, ...leftover].join(" ");
 };
 
+// Real Node's util.formatWithOptions(inspectOptions, ...args) is util.format
+// with an extra leading options bag controlling how objects get inspected
+// (colors, depth, ...) - traced need: real npm's own lib/utils/format.js
+// calls this directly. `options` only affects inspection STYLING, never
+// correctness, so it's accepted (for API compatibility - a caller
+// destructuring it wouldn't get `undefined`) and otherwise ignored, same
+// simplification this file's `format()` already makes for %o/%O.
+const formatWithOptions = (_options: unknown, ...args: unknown[]): string => format(...args);
+
 const inherits = (ctor: { prototype: object }, superCtor: { prototype: object }): void => {
   ctor.prototype = Object.create(superCtor.prototype, {
     constructor: { value: ctor, enumerable: false, writable: true, configurable: true },
   });
 };
 
-const utilModule = { format, inherits };
+const utilModule = { format, formatWithOptions, inherits };
 
 export default utilModule;
-export { format, inherits };
+export { format, formatWithOptions, inherits };
