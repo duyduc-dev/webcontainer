@@ -1,6 +1,7 @@
 import { dirname } from "../kernel/fs/path";
 import { createBuiltinModules } from "./builtins";
 import type { ProcessLike } from "./builtins";
+import type { NodeModulesContext } from "./node/loader";
 import { relativeModuleCandidates } from "./resolveSpecifier";
 
 interface ModuleLoaderOptions {
@@ -10,6 +11,8 @@ interface ModuleLoaderOptions {
   /** Real Node-style process the vendored builtins (events/stream/buffer) run
    * against. Defaults to a microtask-based nextTick when omitted. */
   process?: ProcessLike;
+  /** 'net's liveness/close-phase/cross-process hooks — see createBuiltinModules. */
+  netContext?: NodeModulesContext;
 }
 
 const defaultProcess: ProcessLike = {
@@ -41,7 +44,10 @@ const resolveRelative = (fromPath: string, specifier: string, sources: Record<st
  */
 const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
   const { sources } = options;
-  const builtins = { ...createBuiltinModules(options.process ?? defaultProcess), ...options.builtins };
+  const builtins = {
+    ...createBuiltinModules(options.process ?? defaultProcess, options.netContext),
+    ...options.builtins,
+  };
   const cache = new Map<string, ModuleRecord>();
 
   const createRequire = (fromPath: string) => {

@@ -32,6 +32,18 @@ interface EventLoop {
    * its own until the reply arrives) would look like "no work" and exit early. */
   ref(): void;
   unref(): void;
+  /**
+   * Schedules `fn` for the loop's close phase — after nextTick/timers/
+   * immediates, before the loop would otherwise consider itself done.
+   * Node's real loop runs handle-close callbacks in their own phase for
+   * exactly this reason: `net.Socket._destroy` calls `handle.close(cb2)`
+   * then synchronously `cb(exception)` (which emits `'error'`); if `cb2`
+   * ran on the same nextTick queue, `'close'` would fire before `'error'`,
+   * and `http`'s `socketCloseListener` misreads a close-with-no-error-yet
+   * as a reset, double-emitting errors. A later phase, not just "some
+   * microtask," preserves the ordering real Node guarantees.
+   */
+  queueClose(fn: Task, ...args: unknown[]): void;
 }
 
 interface CreateEventLoopOptions {
@@ -44,6 +56,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
   const nextTickQueue: { fn: Task; args: unknown[] }[] = [];
   const timers = new Map<number, Timer>();
   const immediates = new Map<number, Immediate>();
+  const closeCallbacks: { fn: Task; args: unknown[] }[] = [];
   let nextId = 1;
   let activeHandles = 0;
   let wakeResolvers: (() => void)[] = [];
@@ -87,7 +100,11 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
   };
 
   const hasPendingWork = (): boolean =>
-    nextTickQueue.length > 0 || timers.size > 0 || immediates.size > 0 || activeHandles > 0;
+    nextTickQueue.length > 0 ||
+    timers.size > 0 ||
+    immediates.size > 0 ||
+    closeCallbacks.length > 0 ||
+    activeHandles > 0;
 
   const yieldToMicrotasks = (): Promise<void> =>
     new Promise((resolve) => {
@@ -129,6 +146,12 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
       return true;
     }
 
+    if (closeCallbacks.length > 0) {
+      const due = closeCallbacks.splice(0, closeCallbacks.length);
+      for (const callback of due) callback.fn(...callback.args);
+      return true;
+    }
+
     // Nothing is ready to run right now, but an active handle (e.g. an in-flight
     // network request) means the loop isn't actually done — its reply arrives via
     // a real message from another worker, not anything already queued here, so
@@ -150,6 +173,11 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
     wake();
   };
 
+  const queueClose = (fn: Task, ...args: unknown[]): void => {
+    closeCallbacks.push({ fn, args });
+    wake();
+  };
+
   return {
     nextTick,
     setTimeout: setTimeoutFn,
@@ -160,6 +188,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
     runOnce,
     ref,
     unref,
+    queueClose,
   };
 };
 

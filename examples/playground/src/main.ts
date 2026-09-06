@@ -115,6 +115,34 @@ async function main() {
     const nodeShellResult = await dwc.shell.exec("node /shell-node.js");
     console.log("[dwc] shell.exec('node /shell-node.js') result ->", JSON.stringify(nodeShellResult.output));
     terminal.writeln(`[shell] node /shell-node.js -> ${JSON.stringify(nodeShellResult.output)}`);
+
+    // Phase 8 demo: real vendored `net` — a script that both listens and
+    // connects to its own server over the in-process loopback binding.
+    await dwc.fs.writeFile(
+      "/net-demo.js",
+      [
+        "const net = require('net');",
+        "const server = net.createServer((socket) => {",
+        "  socket.on('data', (chunk) => console.log('[net] server got:', chunk.toString()));",
+        "  socket.write('hello from server');",
+        "});",
+        "server.listen(0, () => {",
+        "  const port = server.address().port;",
+        "  const client = net.connect(port, 'localhost', () => client.write('hello from client'));",
+        "  client.on('data', (chunk) => {",
+        "    console.log('[net] client got:', chunk.toString());",
+        "    client.end();",
+        "  });",
+        "  client.on('close', () => server.close());",
+        "});",
+        "",
+      ].join("\n"),
+    );
+    const netDemoProc = await dwc.process.spawn("/net-demo.js");
+    pipeToTerminal(netDemoProc.stdout, terminal);
+    pipeToTerminal(netDemoProc.stderr, terminal);
+    const netDemoExitCode = await netDemoProc.exit;
+    console.log("[dwc] net-demo process exited with code", netDemoExitCode);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

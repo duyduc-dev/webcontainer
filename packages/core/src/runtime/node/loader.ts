@@ -14,8 +14,9 @@
 // Adding a real Node module later = drop the vendored file in and register it.
 // Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/loader.js.
 
-import { internalBinding } from "./internalBinding";
+import { createInternalBinding } from "./internalBinding";
 import { primordials } from "./primordials";
+import type { NetBridge } from "./bindings/net";
 
 import eventsFactory from "./lib/events";
 import streamFactory from "./lib/stream";
@@ -28,6 +29,12 @@ import httpsFactory from "./lib/https";
 import cryptoFactory from "./lib/crypto";
 import zlibFactory from "./lib/zlib";
 import asyncHooksFactory from "./lib/async_hooks";
+import dnsFactory from "./lib/dns";
+import tlsFactory from "./lib/tls";
+import netFactory from "./lib/net";
+import clusterFactory from "./lib/cluster";
+import diagnosticsChannelFactory from "./lib/diagnostics_channel";
+import timersFactory from "./lib/timers";
 
 import internalBufferFactory from "./internal/buffer";
 import utilFactory from "./internal/util";
@@ -49,6 +56,15 @@ import blobFactory from "./internal/blob";
 import optionsFactory from "./internal/options";
 import startupSnapshotFactory from "./internal/v8/startup_snapshot";
 import fetchTransportFactory from "./internal/fetch-transport";
+import internalTimersFactory from "./internal/timers";
+import internalAsyncHooksFactory from "./internal/async_hooks";
+import blocklistFactory from "./internal/blocklist";
+import internalNetFactory from "./internal/net";
+import perfObserveFactory from "./internal/perf/observe";
+import socketaddressFactory from "./internal/socketaddress";
+import streamBaseCommonsFactory from "./internal/stream_base_commons";
+import internalUrlFactory from "./internal/url";
+import jsTransferableFactory from "./internal/worker/js_transferable";
 
 import streamsAddAbortSignalFactory from "./internal/streams/add-abort-signal";
 import streamsComposeFactory from "./internal/streams/compose";
@@ -91,6 +107,12 @@ const FACTORIES: Record<string, NodeFactory> = {
   crypto: cryptoFactory,
   zlib: zlibFactory,
   async_hooks: asyncHooksFactory,
+  dns: dnsFactory,
+  tls: tlsFactory,
+  net: netFactory,
+  cluster: clusterFactory,
+  diagnostics_channel: diagnosticsChannelFactory,
+  timers: timersFactory,
 
   "internal/buffer": internalBufferFactory,
   "internal/util": utilFactory,
@@ -113,6 +135,15 @@ const FACTORIES: Record<string, NodeFactory> = {
   "internal/options": optionsFactory,
   "internal/v8/startup_snapshot": startupSnapshotFactory,
   "internal/fetch-transport": fetchTransportFactory,
+  "internal/timers": internalTimersFactory,
+  "internal/async_hooks": internalAsyncHooksFactory,
+  "internal/blocklist": blocklistFactory,
+  "internal/net": internalNetFactory,
+  "internal/perf/observe": perfObserveFactory,
+  "internal/socketaddress": socketaddressFactory,
+  "internal/stream_base_commons": streamBaseCommonsFactory,
+  "internal/url": internalUrlFactory,
+  "internal/worker/js_transferable": jsTransferableFactory,
 
   "internal/streams/add-abort-signal": streamsAddAbortSignalFactory,
   "internal/streams/compose": streamsComposeFactory,
@@ -141,8 +172,32 @@ interface NodeModules {
   has(name: string): boolean;
 }
 
+interface ProcessLikeForModules {
+  nextTick(fn: (...args: unknown[]) => void, ...args: unknown[]): void;
+}
+
+/** Per-process context 'net' needs beyond `process` itself: the event loop's
+ * close phase and liveness ref/unref, and (optionally) the kernel's
+ * cross-process relay. Every field defaults to a same-process-only,
+ * nextTick-based fallback when omitted, so existing callers (tests,
+ * anything not touching net) are unaffected. */
+interface NodeModulesContext {
+  queueClose?: (fn: (...args: unknown[]) => void, ...args: unknown[]) => void;
+  ref?: () => void;
+  unref?: () => void;
+  netBridge?: NetBridge;
+}
+
 /** Creates one isolated module cache + require() over the vendored Node builtins. */
-const createNodeModules = (process: unknown): NodeModules => {
+const createNodeModules = (process: ProcessLikeForModules, context: NodeModulesContext = {}): NodeModules => {
+  const internalBinding = createInternalBinding({
+    process,
+    queueClose: context.queueClose ?? ((fn, ...args) => process.nextTick(fn, ...args)),
+    ref: context.ref ?? (() => {}),
+    unref: context.unref ?? (() => {}),
+    netBridge: context.netBridge,
+  });
+
   const modules = new Map<string, { exports: unknown }>(); // id -> module (kept for cycle resolution)
 
   const nodeRequire = (name: string): unknown => {
@@ -175,4 +230,4 @@ const createNodeModules = (process: unknown): NodeModules => {
 };
 
 export { createNodeModules };
-export type { NodeModules };
+export type { NodeModules, NodeModulesContext };

@@ -82,6 +82,46 @@ describe("eventLoop", () => {
     expect(loop.hasPendingWork()).toBe(true);
   });
 
+  it("runs close callbacks after immediates but before the loop considers itself done", async () => {
+    const order: string[] = [];
+    const loop = createEventLoop();
+
+    loop.setImmediate(() => order.push("immediate"));
+    loop.queueClose(() => order.push("close"));
+    loop.nextTick(() => order.push("nextTick"));
+
+    await drain(loop);
+
+    expect(order).toEqual(["nextTick", "immediate", "close"]);
+  });
+
+  it("orders a handle's close after its own error, matching net.Socket._destroy's close(cb2)-then-cb(err) sequence", async () => {
+    // Regression guard for the exact bug queueClose exists for: if a close
+    // callback ran on the plain nextTick queue instead of its own later
+    // phase, it would fire before an 'error' emitted synchronously right
+    // after handle.close(cb2) was called - the reverse of real Node.
+    const order: string[] = [];
+    const loop = createEventLoop();
+
+    loop.queueClose(() => order.push("close"));
+    order.push("error"); // emitted synchronously, before any tick runs
+
+    await drain(loop);
+
+    expect(order).toEqual(["error", "close"]);
+  });
+
+  it("queueClose() keeps hasPendingWork() true until it runs", async () => {
+    const loop = createEventLoop();
+    expect(loop.hasPendingWork()).toBe(false);
+
+    loop.queueClose(() => {});
+    expect(loop.hasPendingWork()).toBe(true);
+
+    await loop.runOnce();
+    expect(loop.hasPendingWork()).toBe(false);
+  });
+
   it("ref() keeps hasPendingWork() true with nothing else queued", () => {
     const loop = createEventLoop();
     expect(loop.hasPendingWork()).toBe(false);

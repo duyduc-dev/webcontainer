@@ -3,14 +3,15 @@
 // In real Node, `internalBinding('fs')` returns the native (C++) module. Here,
 // this is where we substitute our own implementations: JS shims or Wasm/Web
 // codecs. The JS layer above the binding line (Node's real lib/) stays
-// unmodified. Bindings are added as each real lib/ module comes online — this
-// phase only needs enough for `events`/`stream`/`buffer`: 'buffer' (the real
-// codec, see bindings/buffer.ts), plus small 'util'/'config'/'symbols'/
-// 'trace_events' stand-ins. 'fs'/'net'/'zlib'/'crypto'/etc. follow in later
-// phases as their real lib/ modules get vendored.
+// unmodified. Bindings are added as each real lib/ module comes online.
+// A factory (not a static object) because 'net' needs per-process context
+// (the event loop's close phase / liveness ref-unref, and later the kernel's
+// cross-process relay) that a module-load-time singleton can't carry.
 // Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/internal-binding.js.
 
 import { createBufferBinding } from "./bindings/buffer";
+import { createNetBindings } from "./bindings/net";
+import type { NetBindingContext } from "./bindings/net";
 
 // Node's v8::PropertyFilter values used by getOwnNonIndexProperties.
 const ALL_PROPERTIES = 0;
@@ -31,40 +32,61 @@ function getOwnNonIndexProperties(obj: object, filter: number): (string | symbol
   return out;
 }
 
-// Minted once per realm: internal/blocklist.js and others reach for these
-// through this binding so a handle's owner can be found by identity.
-const REALM_SYMBOLS = {
-  owner_symbol: Symbol("owner_symbol"),
-  async_id_symbol: Symbol("async_id_symbol"),
-  trigger_async_id_symbol: Symbol("trigger_async_id_symbol"),
-};
+interface InternalBindingContext extends NetBindingContext {}
 
-const bindings: Record<string, unknown> = {
-  buffer: createBufferBinding(),
-  util: {
-    constants: { ALL_PROPERTIES, ONLY_ENUMERABLE },
-    getOwnNonIndexProperties,
-    isInsideNodeModules: () => false,
-    // internal/buffer.js destructures this at module load time to brand
-    // Buffers created for transfer as non-transferable; we don't implement
-    // structured-clone transfer semantics, so the symbol only needs to exist.
-    privateSymbols: {
-      untransferable_object_private_symbol: Symbol("untransferable_object"),
+const createInternalBinding = (context: InternalBindingContext): ((name: string) => unknown) => {
+  // Minted once per realm: internal/blocklist.js and others reach for these
+  // through this binding so a handle's owner can be found by identity.
+  const REALM_SYMBOLS = {
+    owner_symbol: Symbol("owner_symbol"),
+    async_id_symbol: Symbol("async_id_symbol"),
+    trigger_async_id_symbol: Symbol("trigger_async_id_symbol"),
+  };
+
+  const net = createNetBindings(context);
+
+  const bindings: Record<string, unknown> = {
+    buffer: createBufferBinding(),
+    tcp_wrap: net.tcp_wrap,
+    stream_wrap: net.stream_wrap,
+    uv: net.uv,
+    pipe_wrap: net.pipe_wrap,
+    cares_wrap: net.cares_wrap,
+    util: {
+      constants: { ALL_PROPERTIES, ONLY_ENUMERABLE },
+      getOwnNonIndexProperties,
+      isInsideNodeModules: () => false,
+      // internal/buffer.js destructures this at module load time to brand
+      // Buffers created for transfer as non-transferable; we don't implement
+      // structured-clone transfer semantics, so the symbol only needs to exist.
+      privateSymbols: {
+        untransferable_object_private_symbol: Symbol("untransferable_object"),
+      },
     },
-  },
-  // hasIntl=false keeps Buffer.transcode / ICU paths dormant (no icu binding).
-  config: { hasIntl: false },
-  symbols: REALM_SYMBOLS,
-  // inert — internal/http records HTTP trace spans through it, when http lands.
-  trace_events: {
-    getCategoryEnabledBuffer: () => new Uint8Array(1),
-    trace: () => {},
-  },
+    // hasIntl=false keeps Buffer.transcode / ICU paths dormant (no icu binding).
+    config: { hasIntl: false },
+    symbols: REALM_SYMBOLS,
+    // inert — internal/http records HTTP trace spans through it.
+    trace_events: {
+      getCategoryEnabledBuffer: () => new Uint8Array(1),
+      trace: () => {},
+    },
+    // internal/net.js destructures writeBuffer at module load time (for
+    // makeSyncWrite(fd), used when a net.Socket wraps a raw fd directly rather
+    // than a TCP/Pipe handle) — not exercised by our TCP/Pipe loopback paths,
+    // so it only needs to exist; throws loudly if a caller actually reaches it.
+    fs: {
+      writeBuffer: () => {
+        throw new Error("internalBinding('fs').writeBuffer is not implemented yet (raw fd writes)");
+      },
+    },
+  };
+
+  return (name: string): unknown => {
+    if (Object.prototype.hasOwnProperty.call(bindings, name)) return bindings[name];
+    throw new Error(`internalBinding('${name}') is not implemented yet`);
+  };
 };
 
-const internalBinding = (name: string): unknown => {
-  if (Object.prototype.hasOwnProperty.call(bindings, name)) return bindings[name];
-  throw new Error(`internalBinding('${name}') is not implemented yet`);
-};
-
-export { internalBinding };
+export { createInternalBinding };
+export type { InternalBindingContext };

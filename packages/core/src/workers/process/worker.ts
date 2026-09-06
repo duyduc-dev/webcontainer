@@ -1,3 +1,4 @@
+import { createBuiltinModules } from "../../runtime/builtins";
 import { createFsBuiltin } from "../../runtime/builtins/fs";
 import type { FsBuiltin, FsBuiltinIO } from "../../runtime/builtins/fs";
 import { createEventLoop } from "../../runtime/eventLoop";
@@ -124,6 +125,17 @@ const boot = (payload: BootPayload): void => {
     nextTick: eventLoop.nextTick,
   };
 
+  // 'net' needs the loop's close phase + liveness ref/unref (see eventLoop.ts's
+  // queueClose doc comment and bindings/net.ts's recount()), so the vendored
+  // builtins are built ONCE here — not left to moduleLoader's own default
+  // construction — and threaded through as options.builtins below. That also
+  // means the SAME Buffer class installed as a global (net's `buf()` helper
+  // reads it from there) is the one guest code's `require('buffer')` gets too;
+  // building two separate instances would make `instanceof Buffer` disagree
+  // between them.
+  const netContext = { queueClose: eventLoop.queueClose, ref: eventLoop.ref, unref: eventLoop.unref };
+  const vendoredBuiltins = createBuiltinModules(processGlobal, netContext);
+
   // The module wrapper (new Function) closes over the global scope, so console/process/
   // timers must be real globals here rather than parameters threaded through requires.
   Object.assign(self, {
@@ -139,12 +151,14 @@ const boot = (payload: BootPayload): void => {
     setImmediate: eventLoop.setImmediate,
     clearImmediate: eventLoop.clearImmediate,
     __dwcFetchAsync: createNetRequest(eventLoop),
+    Buffer: (vendoredBuiltins.buffer as { Buffer: unknown }).Buffer,
   });
 
   const moduleLoader = createModuleLoader({
     sources: payload.sources,
-    builtins: { fs: createFsBuiltinFromPayload(payload.syncFs) },
+    builtins: { ...vendoredBuiltins, fs: createFsBuiltinFromPayload(payload.syncFs) },
     process: processGlobal,
+    netContext,
   });
 
   try {

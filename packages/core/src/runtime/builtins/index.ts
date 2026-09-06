@@ -1,4 +1,5 @@
 import { createNodeModules } from "../node/loader";
+import type { NodeModulesContext } from "../node/loader";
 import pathModule from "./path";
 import utilModule from "./util";
 
@@ -24,19 +25,28 @@ const BUILTIN_NAMES = new Set([
   "crypto",
   "zlib",
   "async_hooks",
+  "net",
+  "dns",
+  "tls",
 ]);
 
 const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(specifier);
 
 /**
  * Builds the require()-able builtins record for one process. `events`,
- * `stream`, `buffer`, `http`, `https`, `crypto`, `zlib`, and `async_hooks`
- * resolve through real vendored Node source (runtime/node/loader.ts) rather
- * than hand-written approximations; `path` and `util` stay hand-written until
- * their own real lib/ modules are vendored.
+ * `stream`, `buffer`, `http`, `https`, `crypto`, `zlib`, `async_hooks`,
+ * `net`, `dns`, and `tls` resolve through real vendored Node source
+ * (runtime/node/loader.ts) rather than hand-written approximations; `path`
+ * and `util` stay hand-written until their own real lib/ modules are vendored.
+ *
+ * `net`'s liveness/close-phase/cross-process hooks come from `netContext`
+ * (the calling process worker's own event loop + kernel bridge) — omitted,
+ * `net` still works for same-process listen()/connect() via loader.ts's
+ * nextTick-based fallbacks, just without real close-phase ordering or
+ * cross-process reachability.
  */
-const createBuiltinModules = (process: ProcessLike): Record<string, unknown> => {
-  const nodeModules = createNodeModules(process);
+const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesContext): Record<string, unknown> => {
+  const nodeModules = createNodeModules(process, netContext);
   return {
     path: pathModule,
     util: utilModule,
@@ -48,6 +58,9 @@ const createBuiltinModules = (process: ProcessLike): Record<string, unknown> => 
     crypto: nodeModules.require("crypto"),
     zlib: nodeModules.require("zlib"),
     async_hooks: nodeModules.require("async_hooks"),
+    net: nodeModules.require("net"),
+    dns: nodeModules.require("dns"),
+    tls: nodeModules.require("tls"),
   };
 };
 
