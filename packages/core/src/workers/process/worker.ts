@@ -272,10 +272,14 @@ const createWritableStream = (stream: "stdout" | "stderr") => ({
 const createSyncFsChannel = (syncFs: SyncFsChannelPayload | null): SyncFsChannel | null =>
   syncFs ? { port: syncFs.port, control: new Int32Array(syncFs.control), data: syncFs.data } : null;
 
-const createFsBuiltinFromChannel = (channel: SyncFsChannel | null, nextTick: (callback: () => void) => void): FsBuiltin => {
+const createFsBuiltinFromChannel = (
+  channel: SyncFsChannel | null,
+  nextTick: (callback: () => void) => void,
+  wrapBuffer: (bytes: Uint8Array) => Uint8Array,
+): FsBuiltin => {
   const io: FsBuiltinIO = {};
   if (channel) io.callSync = (request) => callSyncFs(channel, request);
-  return createFsBuiltin(io, nextTick);
+  return createFsBuiltin(io, nextTick, wrapBuffer);
 };
 
 const decoder = new TextDecoder();
@@ -299,6 +303,14 @@ const createModuleReadFileSync = (channel: SyncFsChannel | null): ((path: string
 
 const boot = (payload: BootPayload): void => {
   const eventLoop = createEventLoop();
+
+  // Real Node's process.umask() getter/setter affects default file-creation
+  // permissions - there's no real host umask to report on, so this is a
+  // plausible, fixed stand-in (0o022, the most common Linux default),
+  // mutable via the real setter form since that's a cheap, correct addition
+  // once the getter exists. Traced need: real npm's own bin-links dependency
+  // computes an executable's mode as `0o777 & ~process.umask()`.
+  let currentUmask = 0o022;
 
   const processGlobal: { nextTick: typeof eventLoop.nextTick; env: Record<string, string>; [key: string]: unknown } = {
     argv: ["node", payload.entryPath, ...payload.argv],
@@ -327,6 +339,28 @@ const boot = (payload: BootPayload): void => {
     // mounted at /usr/lib/node_modules/npm, so that derivation lands on the
     // same /usr a real global npm install would also compute.
     execPath: "/usr/bin/node",
+    umask(mask?: number): number {
+      const previous = currentUmask;
+      if (mask !== undefined) currentUmask = mask;
+      return previous;
+    },
+    // Real Node's process.report is a whole diagnostic-report subsystem
+    // (getReport()/writeReport(), signal-triggered reports, .directory,
+    // .filename, ...) - not implemented here beyond the two members real
+    // npm's own npm-install-checks actually touches while probing libc
+    // family: it toggles `excludeNetwork` around a `getReport()` call, then
+    // reads `report.header.glibcVersionRuntime` and `report.sharedObjects`.
+    // There's no real glibc/musl to detect from inside a browser sandbox,
+    // so an empty header/sharedObjects shape is the honest answer - it
+    // makes that probe correctly conclude "family unknown" (null), the same
+    // outcome real Node reaches on a platform report can't identify either,
+    // rather than fabricating a specific libc.
+    report: {
+      excludeNetwork: false,
+      getReport(): { header: Record<string, never>; sharedObjects: string[] } {
+        return { header: {}, sharedObjects: [] };
+      },
+    },
   };
 
   // 'net' needs the loop's close phase + liveness ref/unref (see eventLoop.ts's
@@ -405,7 +439,8 @@ const boot = (payload: BootPayload): void => {
   // on, so every accepted cross-process connection dispatches into a
   // `pipeServers` map nothing ever populated and gets closed immediately.
   const syncFsChannel = createSyncFsChannel(payload.syncFs);
-  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel, eventLoop.nextTick);
+  const BufferCtor = (vendoredBuiltins.buffer as { Buffer: { from(bytes: Uint8Array): Uint8Array } }).Buffer;
+  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel, eventLoop.nextTick, (bytes) => BufferCtor.from(bytes));
   // Real Node's `fs` module also carries a `.promises` namespace, the same
   // object `require('fs/promises')` returns directly - both point at the
   // one fsBuiltin instance so a `fs.promises.readFile()` and a

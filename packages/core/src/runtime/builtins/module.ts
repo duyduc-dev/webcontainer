@@ -40,6 +40,7 @@ const BUILTIN_MODULE_NAMES = [
   "tty",
   "url",
   "util",
+  "v8",
   "zlib",
 ];
 

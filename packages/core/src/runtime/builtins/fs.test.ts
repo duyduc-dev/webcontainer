@@ -16,6 +16,15 @@ describe("createFsBuiltin", () => {
     expect(new TextDecoder().decode(fs.readFileSync("/a.txt"))).toBe("hi");
   });
 
+  it("appendFileSync creates the file if missing, and appends on subsequent calls (real npm's own cacache appends each new index entry as a line via fs/promises.appendFile)", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.appendFileSync("/index.txt", "first\n");
+    expect(new TextDecoder().decode(fs.readFileSync("/index.txt"))).toBe("first\n");
+
+    fs.appendFileSync("/index.txt", "second\n");
+    expect(new TextDecoder().decode(fs.readFileSync("/index.txt"))).toBe("first\nsecond\n");
+  });
+
   it("mkdirSync + readdirSync", () => {
     const fs = createFsBuiltin(makeIO());
     fs.mkdirSync("/src", { recursive: true });
@@ -42,6 +51,45 @@ describe("createFsBuiltin", () => {
 
     fs.rmSync("/b.txt");
     expect(fs.existsSync("/b.txt")).toBe(false);
+  });
+
+  it("rmSync on a missing path throws ENOENT by default, but is a no-op with { force: true }", () => {
+    const fs = createFsBuiltin(makeIO());
+    expect(() => fs.rmSync("/missing")).toThrow(expect.objectContaining({ code: "ENOENT" }));
+    expect(() => fs.rmSync("/missing", { force: true })).not.toThrow();
+  });
+
+  it("rmSync({ force: true }) still throws a non-ENOENT error (real npm's own cacache relies on force only swallowing 'already gone', not masking a real failure)", () => {
+    const fs = createFsBuiltin({});
+    expect(() => fs.rmSync("/a.txt", { force: true })).toThrow(expect.objectContaining({ code: "ERR_NOT_ISOLATED" }));
+  });
+
+  it("readFileSync with an 'utf8' encoding argument returns a decoded string, not bytes (real npm's own lib/utils/error-message.js does `readFileSync(path, 'utf8').replace(...)`)", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/a.txt", "hi\r\nthere");
+    const text = fs.readFileSync("/a.txt", "utf8");
+    expect(text.replace(/\r\n/g, "\n")).toBe("hi\nthere");
+  });
+
+  it("readFileSync also accepts the encoding as an { encoding } options object", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/a.txt", "hi");
+    expect(fs.readFileSync("/a.txt", { encoding: "utf8" })).toBe("hi");
+  });
+
+  it("readFileSync with NO encoding still wraps through the provided wrapBuffer (real npm's own cacache reads cached content this way, then calls .toString() on it expecting UTF-8 decoding - a bare Uint8Array's toString() would print comma-separated byte values instead)", () => {
+    class FakeBuffer extends Uint8Array {
+      toString() {
+        return `wrapped:${new TextDecoder().decode(this)}`;
+      }
+    }
+    const fs = createFsBuiltin(
+      makeIO(),
+      (cb) => cb(),
+      (bytes) => new FakeBuffer(bytes),
+    );
+    fs.writeFileSync("/a.txt", "hi");
+    expect(fs.readFileSync("/a.txt").toString()).toBe("wrapped:hi");
   });
 
   it("surfaces an FSError with the original code for a missing file", () => {
@@ -117,6 +165,16 @@ describe("createFsBuiltin fd-based I/O", () => {
   it("openSync('w') + writeSync + closeSync persists the written bytes to the VFS path", () => {
     const fs = createFsBuiltin(makeIO());
     const fd = fs.openSync("/out.txt", "w");
+    const bytes = new TextEncoder().encode("hello");
+    fs.writeSync(fd, bytes, 0, bytes.length, null);
+    fs.closeSync(fd);
+
+    expect(new TextDecoder().decode(fs.readFileSync("/out.txt"))).toBe("hello");
+  });
+
+  it("openSync('wx') creates/truncates just like 'w' (real npm's own cacache opens its tmp files with exactly this flag)", () => {
+    const fs = createFsBuiltin(makeIO());
+    const fd = fs.openSync("/out.txt", "wx");
     const bytes = new TextEncoder().encode("hello");
     fs.writeSync(fd, bytes, 0, bytes.length, null);
     fs.closeSync(fd);
@@ -237,7 +295,159 @@ describe("createFsBuiltin fd-based I/O", () => {
   });
 });
 
+describe("createFsBuiltin readFile (callback form)", () => {
+  it("defers via the provided nextTick and hands the callback bytes, not a promise", async () => {
+    let nextTickInvocations = 0;
+    const fs = createFsBuiltin(makeIO(), (cb) => {
+      nextTickInvocations++;
+      queueMicrotask(cb);
+    });
+    fs.writeFileSync("/a.txt", "hi");
+
+    const bytes = await new Promise<Uint8Array>((resolve, reject) => {
+      fs.readFile("/a.txt", (error, result) => (error ? reject(error) : resolve(result!)));
+    });
+    expect(nextTickInvocations).toBe(1);
+    expect(new TextDecoder().decode(bytes)).toBe("hi");
+  });
+
+  it("wraps the result through the provided wrapBuffer (real npm's own read-cmd-shim calls .toString() on this, which only UTF-8-decodes on a real Buffer, not a bare Uint8Array)", async () => {
+    class FakeBuffer extends Uint8Array {
+      toString() {
+        return `wrapped:${new TextDecoder().decode(this)}`;
+      }
+    }
+    const fs = createFsBuiltin(
+      makeIO(),
+      (cb) => cb(),
+      (bytes) => new FakeBuffer(bytes),
+    );
+    fs.writeFileSync("/a.txt", "hi");
+
+    const result = await new Promise<Uint8Array>((resolve, reject) => {
+      fs.readFile("/a.txt", (error, data) => (error ? reject(error) : resolve(data!)));
+    });
+    expect(result.toString()).toBe("wrapped:hi");
+  });
+
+  it("rejects (via the callback's error) for a missing file", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const error = await new Promise((resolve) => {
+      fs.readFile("/missing", (err) => resolve(err));
+    });
+    expect(error).toEqual(expect.objectContaining({ code: "ENOENT" }));
+  });
+});
+
+describe("createFsBuiltin stat (callback form)", () => {
+  it("defers via the provided nextTick and hands the callback a StatResult (real npm's own mkdirp checks a directory this way before creating it)", async () => {
+    let nextTickInvocations = 0;
+    const fs = createFsBuiltin(makeIO(), (cb) => {
+      nextTickInvocations++;
+      queueMicrotask(cb);
+    });
+    fs.mkdirSync("/dir");
+
+    const stat = await new Promise<{ isDirectory(): boolean }>((resolve, reject) => {
+      fs.stat("/dir", (error, result) => (error ? reject(error) : resolve(result!)));
+    });
+    expect(nextTickInvocations).toBe(1);
+    expect(stat.isDirectory()).toBe(true);
+  });
+
+  it("rejects (via the callback's error) for a missing path", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const error = await new Promise((resolve) => {
+      fs.stat("/missing", (err) => resolve(err));
+    });
+    expect(error).toEqual(expect.objectContaining({ code: "ENOENT" }));
+  });
+});
+
+// Real tar's own lib/mkdir.js and lib/unpack.js call every one of these
+// while physically recreating a package's directory tree during
+// extraction - traced need: `npm install left-pad` reaching real tar's
+// directory-creation retry logic (onmkdir's error handler calls fs.lstat
+// to distinguish "already exists as a directory, fine" from a real
+// conflict), which crashed outright when these callback-form methods
+// didn't exist yet.
+describe("createFsBuiltin extraction-support callback methods (lstat/mkdir/chmod/unlink/rmdir/rename/chown/utimes)", () => {
+  const callback = <T>(fn: (cb: (error: unknown, result?: T) => void) => void): Promise<T> =>
+    new Promise((resolve, reject) => fn((error, result) => (error ? reject(error) : resolve(result as T))));
+
+  it("lstat resolves a StatResult and rejects ENOENT for a missing path", async () => {
+    const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/a.txt", "hi");
+    const stat = await callback<{ isFile(): boolean }>((cb) => fs.lstat("/a.txt", cb));
+    expect(stat.isFile()).toBe(true);
+    await expect(callback((cb) => fs.lstat("/missing", cb))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("mkdir (both the 2-arg and 3-arg forms) creates a directory, and throws EEXIST on a second call - the exact signal real tar's onmkdir error handler branches on", async () => {
+    const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
+    await callback((cb) => fs.mkdir("/dir", cb));
+    expect(fs.existsSync("/dir")).toBe(true);
+    await expect(callback((cb) => fs.mkdir("/dir", 0o755, cb))).rejects.toMatchObject({ code: "EEXIST" });
+  });
+
+  it("chmod changes the mode real npm's own get-write-flag.js later reads back via statSync", async () => {
+    const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/a.sh", "#!/bin/sh\n");
+    await callback((cb) => fs.chmod("/a.sh", 0o755, cb));
+    expect(fs.statSync("/a.sh").mode.toString(8)).toBe("755");
+  });
+
+  it("unlink removes a file", async () => {
+    const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/a.txt", "hi");
+    await callback((cb) => fs.unlink("/a.txt", cb));
+    expect(fs.existsSync("/a.txt")).toBe(false);
+  });
+
+  it("rmdir removes a directory", async () => {
+    const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
+    fs.mkdirSync("/dir");
+    await callback((cb) => fs.rmdir("/dir", cb));
+    expect(fs.existsSync("/dir")).toBe(false);
+  });
+
+  it("rename moves a file", async () => {
+    const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/a.txt", "hi");
+    await callback((cb) => fs.rename("/a.txt", "/b.txt", cb));
+    expect(fs.existsSync("/a.txt")).toBe(false);
+    expect(new TextDecoder().decode(fs.readFileSync("/b.txt"))).toBe("hi");
+  });
+
+  it("chown/fchown/utimes/futimes exist and succeed as no-ops (no real multi-user ownership or mtime-preservation model in this VFS - real tar's Unpack calls these unconditionally while restoring an extracted entry's metadata)", async () => {
+    const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/a.txt", "hi");
+    await expect(callback((cb) => fs.chown("/a.txt", 501, 20, cb))).resolves.toBeUndefined();
+    await expect(callback((cb) => fs.fchown(3, 501, 20, cb))).resolves.toBeUndefined();
+    await expect(callback((cb) => fs.utimes("/a.txt", 0, 0, cb))).resolves.toBeUndefined();
+    await expect(callback((cb) => fs.futimes(3, 0, 0, cb))).resolves.toBeUndefined();
+  });
+});
+
 describe("createFsPromisesBuiltin", () => {
+  it("readFile with no options still wraps through the provided wrapBuffer (real npm's own cacache does `(await fs.promises.readFile(path)).toString()` on cached content)", async () => {
+    class FakeBuffer extends Uint8Array {
+      toString() {
+        return `wrapped:${new TextDecoder().decode(this)}`;
+      }
+    }
+    const fs = createFsBuiltin(
+      makeIO(),
+      (cb) => queueMicrotask(cb),
+      (bytes) => new FakeBuffer(bytes),
+    );
+    const fsPromises = createFsPromisesBuiltin(fs, (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/a.txt", "hi");
+
+    const result = await fsPromises.readFile("/a.txt");
+    expect(result.toString()).toBe("wrapped:hi");
+  });
+
   it("resolves every call through the provided nextTick, not a bare native microtask", async () => {
     // Regression test: a plain `async (path) => fs.readFileSync(path)` looks
     // identical from the caller's side but resolves via an untracked native
@@ -277,6 +487,15 @@ describe("createFsPromisesBuiltin", () => {
 
     await expect(fsPromises.access("/a.txt")).resolves.toBeUndefined();
     await expect(fsPromises.access("/missing")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("appendFile creates then appends, resolving through the provided nextTick (real npm's own cacache does this to grow its index bucket files)", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const fsPromises = createFsPromisesBuiltin(fs, (cb) => queueMicrotask(cb));
+
+    await fsPromises.appendFile("/index.txt", "first\n");
+    await fsPromises.appendFile("/index.txt", "second\n");
+    await expect(fsPromises.readFile("/index.txt")).resolves.toEqual(new TextEncoder().encode("first\nsecond\n"));
   });
 
   it("mkdir + readdir round-trip", async () => {

@@ -111,6 +111,15 @@ describe("vendored 'https'/'http' (fetch-backed client)", () => {
     });
   });
 
+  it("exposes STATUS_CODES on 'http' (real npm's own minipass-fetch reads it even for an https:// request)", () => {
+    const { require } = createNodeModules(fakeProcess());
+    const http = require("http") as { STATUS_CODES: Record<number, string> };
+
+    expect(http.STATUS_CODES[200]).toBe("OK");
+    expect(http.STATUS_CODES[404]).toBe("Not Found");
+    expect(http.STATUS_CODES[500]).toBe("Internal Server Error");
+  });
+
   it("fails loudly on a protocol upgrade instead of hanging", async () => {
     (globalThis as any).__dwcFetchAsync = vi.fn();
     const { require } = createNodeModules(fakeProcess());

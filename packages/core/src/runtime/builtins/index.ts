@@ -5,6 +5,7 @@ import { createAssertModule } from "./assert";
 import { createModuleModule } from "./module";
 import { createHttp2Module } from "./http2";
 import { createOsModule } from "./os";
+import { createV8Module } from "./v8";
 import { createQuerystringModule } from "./querystring";
 import { createTimersPromisesModule } from "./timersPromises";
 import { createStringDecoderModule } from "./string_decoder";
@@ -43,6 +44,7 @@ const BUILTIN_NAMES = new Set([
   "http",
   "https",
   "http2",
+  "v8",
   "crypto",
   "zlib",
   "async_hooks",
@@ -99,6 +101,7 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     http: nodeModules.require("http"),
     https: nodeModules.require("https"),
     http2: createHttp2Module(),
+    v8: createV8Module(),
     crypto: nodeModules.require("crypto"),
     zlib: nodeModules.require("zlib"),
     async_hooks: nodeModules.require("async_hooks"),

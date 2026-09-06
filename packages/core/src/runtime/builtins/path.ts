@@ -16,10 +16,48 @@ const resolvePath = (...parts: string[]): string => {
   return normalize(resolved.startsWith("/") ? resolved : `/${resolved}`);
 };
 
+// Real Node's path.relative(from, to) - traced need: real npm's own
+// @npmcli/arborist Node class computes each node's `location` off of
+// `relative(root.realpath, this.realpath)`. Both inputs are resolved
+// against root ("/", the only "cwd" this VFS has - see resolvePath's own
+// no-real-cwd design) before comparing path segments, matching real Node's
+// POSIX algorithm (find the longest common prefix, ".." out of `from` for
+// what's left, then descend into `to`'s remaining segments).
+const relative = (from: string, to: string): string => {
+  const fromParts = resolvePath(from).slice(1).split("/").filter(Boolean);
+  const toParts = resolvePath(to).slice(1).split("/").filter(Boolean);
+  const maxCommon = Math.min(fromParts.length, toParts.length);
+  let commonLength = 0;
+  while (commonLength < maxCommon && fromParts[commonLength] === toParts[commonLength]) commonLength++;
+  const upSegments = fromParts.slice(commonLength).map(() => "..");
+  return [...upSegments, ...toParts.slice(commonLength)].join("/");
+};
+
 const extname = (path: string): string => {
   const base = basename(path);
   const index = base.lastIndexOf(".");
   return index <= 0 ? "" : base.slice(index);
+};
+
+// Real Node's POSIX path.isAbsolute(path) - traced need: real tar's own
+// lib/unpack.js checks `path.isAbsolute(entry.path)` (the bare, non-win32
+// import) while sanitizing a tar-slip-style absolute entry path during
+// extraction.
+const isAbsolute = (path: string): boolean => path.startsWith("/");
+
+// Real Node's POSIX path.parse(path) - traced need: real npm's own
+// @npmcli/arborist ships a vendored common-ancestor-path.js that calls
+// `require('path').parse(...)` directly (not path.posix.parse, though this
+// runtime's posix is a self-alias of the default export anyway).
+const parse = (path: string): Win32Parsed => {
+  const root = path.startsWith("/") ? "/" : "";
+  const rest = path.slice(root.length);
+  const base = rest.split("/").pop() ?? "";
+  const dir = root + rest.slice(0, rest.length - base.length).replace(/\/+$/, "");
+  const extIndex = base.lastIndexOf(".");
+  const ext = extIndex > 0 ? base.slice(extIndex) : "";
+  const name = extIndex > 0 ? base.slice(0, extIndex) : base;
+  return { root, dir, base, ext, name };
 };
 
 interface Win32Parsed {
@@ -44,6 +82,9 @@ interface PathModule {
   basename(path: string): string;
   normalize(path: string): string;
   extname(path: string): string;
+  isAbsolute(path: string): boolean;
+  relative(from: string, to: string): string;
+  parse(path: string): Win32Parsed;
   posix: PathModule;
   win32: Win32Module;
 }
@@ -88,6 +129,9 @@ const pathModule = {
   basename,
   normalize,
   extname,
+  isAbsolute,
+  relative,
+  parse,
 } as PathModule;
 
 // Real Node always exposes both `path.posix` and `path.win32` regardless of
@@ -99,4 +143,4 @@ pathModule.posix = pathModule;
 pathModule.win32 = { isAbsolute: win32IsAbsolute, parse: win32Parse };
 
 export default pathModule;
-export { basename, delimiter, dirname, extname, join, normalize, resolvePath as resolve, sep };
+export { basename, delimiter, dirname, extname, isAbsolute, join, normalize, parse, relative, resolvePath as resolve, sep };
