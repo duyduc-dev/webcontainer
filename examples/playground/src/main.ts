@@ -1,7 +1,11 @@
 import { bootDWC, DWCError } from "@dwc/core";
 import { Terminal } from "@xterm/xterm";
+import { loadVendoredNpm } from "./vendorNpm";
 
-function pipeToTerminal(stream: ReadableStream<Uint8Array>, terminal: Terminal): void {
+function pipeToTerminal(
+  stream: ReadableStream<Uint8Array>,
+  terminal: Terminal,
+): void {
   const decoder = new TextDecoder();
   const reader = stream.getReader();
 
@@ -44,7 +48,10 @@ async function main() {
     });
 
     const contents = await dwc.fs.readFile("/hello.txt");
-    console.log("[dwc] readFile /hello.txt ->", new TextDecoder().decode(contents));
+    console.log(
+      "[dwc] readFile /hello.txt ->",
+      new TextDecoder().decode(contents),
+    );
 
     const entries = await dwc.fs.readdir("/src");
     console.log("[dwc] readdir /src ->", entries);
@@ -68,21 +75,40 @@ async function main() {
     console.log("[dwc] process exited with code", exitCode);
     terminal.writeln(`\r\n[process exited with code ${exitCode}]`);
 
-    const shellResult = await dwc.shell.exec("mkdir -p /x && echo hi > /x/f && cat /x/f");
-    console.log("[dwc] shell.exec result ->", JSON.stringify(shellResult.output));
-    terminal.writeln(`[shell] mkdir -p /x && echo hi > /x/f && cat /x/f -> ${JSON.stringify(shellResult.output)}`);
+    const shellResult = await dwc.shell.exec(
+      "mkdir -p /x && echo hi > /x/f && cat /x/f",
+    );
+    console.log(
+      "[dwc] shell.exec result ->",
+      JSON.stringify(shellResult.output),
+    );
+    terminal.writeln(
+      `[shell] mkdir -p /x && echo hi > /x/f && cat /x/f -> ${JSON.stringify(shellResult.output)}`,
+    );
 
     // Phase 8c demo: coreutils/PATH layer — `node` chained with && alongside
     // a PATH-resolved (/bin/echo.js) command, no longer sole-command-only.
     await dwc.fs.writeFile("/shell-chain.js", "console.log('from node');\n");
-    const chainResult = await dwc.shell.exec("node /shell-chain.js && echo done");
-    console.log("[dwc] shell.exec chain result ->", JSON.stringify(chainResult.output));
-    terminal.writeln(`[shell] node /shell-chain.js && echo done -> ${JSON.stringify(chainResult.output)}`);
+    const chainResult = await dwc.shell.exec(
+      "node /shell-chain.js && echo done",
+    );
+    console.log(
+      "[dwc] shell.exec chain result ->",
+      JSON.stringify(chainResult.output),
+    );
+    terminal.writeln(
+      `[shell] node /shell-chain.js && echo done -> ${JSON.stringify(chainResult.output)}`,
+    );
 
     // && short-circuits on a non-zero exit — "nope" must never run.
     const shortCircuitResult = await dwc.shell.exec("false && echo nope");
-    console.log("[dwc] shell.exec short-circuit result ->", JSON.stringify(shortCircuitResult.output));
-    terminal.writeln(`[shell] false && echo nope -> ${JSON.stringify(shortCircuitResult.output)}`);
+    console.log(
+      "[dwc] shell.exec short-circuit result ->",
+      JSON.stringify(shortCircuitResult.output),
+    );
+    terminal.writeln(
+      `[shell] false && echo nope -> ${JSON.stringify(shortCircuitResult.output)}`,
+    );
 
     // Phase 6/7 demo: real vendored Node events/stream/crypto, and a real
     // network request through the Fetcher Worker via require('https').
@@ -128,10 +154,18 @@ async function main() {
 
     // `node <script>` reachable from the shell (dwc.shell.exec), not just
     // dwc.process.spawn() directly.
-    await dwc.fs.writeFile("/shell-node.js", "console.log('[shell-node] ran via dwc.shell.exec');\n");
+    await dwc.fs.writeFile(
+      "/shell-node.js",
+      "console.log('[shell-node] ran via dwc.shell.exec');\n",
+    );
     const nodeShellResult = await dwc.shell.exec("node /shell-node.js");
-    console.log("[dwc] shell.exec('node /shell-node.js') result ->", JSON.stringify(nodeShellResult.output));
-    terminal.writeln(`[shell] node /shell-node.js -> ${JSON.stringify(nodeShellResult.output)}`);
+    console.log(
+      "[dwc] shell.exec('node /shell-node.js') result ->",
+      JSON.stringify(nodeShellResult.output),
+    );
+    terminal.writeln(
+      `[shell] node /shell-node.js -> ${JSON.stringify(nodeShellResult.output)}`,
+    );
 
     // Phase 8 demo: real vendored `net` — a script that both listens and
     // connects to its own server over the in-process loopback binding.
@@ -233,7 +267,10 @@ async function main() {
     pipeToTerminal(childProcessDemo.stdout, terminal);
     pipeToTerminal(childProcessDemo.stderr, terminal);
     const childProcessDemoExit = await childProcessDemo.exit;
-    console.log("[dwc] child-process-demo exited with code", childProcessDemoExit);
+    console.log(
+      "[dwc] child-process-demo exited with code",
+      childProcessDemoExit,
+    );
 
     // node_modules require() resolution demo: a hand-mounted fake package
     // (no real npm install yet — that's a later phase) proving require('left-pad')
@@ -244,7 +281,14 @@ async function main() {
         directory: {
           "left-pad": {
             directory: {
-              "package.json": { file: { contents: JSON.stringify({ name: "left-pad", main: "lib/left-pad.js" }) } },
+              "package.json": {
+                file: {
+                  contents: JSON.stringify({
+                    name: "left-pad",
+                    main: "lib/left-pad.js",
+                  }),
+                },
+              },
               lib: {
                 directory: {
                   "left-pad.js": {
@@ -260,7 +304,12 @@ async function main() {
                       ].join("\n"),
                     },
                   },
-                  "pad-char.js": { file: { contents: "exports.pad = (ch) => (ch === undefined ? ' ' : ch);\n" } },
+                  "pad-char.js": {
+                    file: {
+                      contents:
+                        "exports.pad = (ch) => (ch === undefined ? ' ' : ch);\n",
+                    },
+                  },
                 },
               },
             },
@@ -270,13 +319,22 @@ async function main() {
     });
     await dwc.fs.writeFile(
       "/require-node-modules-demo.js",
-      ["const leftPad = require('left-pad');", "console.log('[require] left-pad(\"5\", 3, \"0\") ->', leftPad('5', 3, '0'));", ""].join("\n"),
+      [
+        "const leftPad = require('left-pad');",
+        "console.log('[require] left-pad(\"5\", 3, \"0\") ->', leftPad('5', 3, '0'));",
+        "",
+      ].join("\n"),
     );
-    const requireDemo = await dwc.process.spawn("/require-node-modules-demo.js");
+    const requireDemo = await dwc.process.spawn(
+      "/require-node-modules-demo.js",
+    );
     pipeToTerminal(requireDemo.stdout, terminal);
     pipeToTerminal(requireDemo.stderr, terminal);
     const requireDemoExit = await requireDemo.exit;
-    console.log("[dwc] require-node-modules-demo exited with code", requireDemoExit);
+    console.log(
+      "[dwc] require-node-modules-demo exited with code",
+      requireDemoExit,
+    );
 
     // VFS symlink support demo (real-npm prerequisite: node_modules/.bin
     // shims are symlinks) — dwc.fs.symlink() at the host level, then a
@@ -306,7 +364,13 @@ async function main() {
     // (an 'uncaughtException' listener that calls process.exit() itself,
     // whose exit code must win over the runtime's own default fallback).
     await dwc.fs.mount({
-      vendor: { directory: { "absolute-required.js": { file: { contents: "module.exports = 'absolute-ok';\n" } } } },
+      vendor: {
+        directory: {
+          "absolute-required.js": {
+            file: { contents: "module.exports = 'absolute-ok';\n" },
+          },
+        },
+      },
     });
     await dwc.fs.writeFile(
       "/gaps-demo.js",
@@ -338,6 +402,44 @@ async function main() {
     pipeToTerminal(gapsDemo.stderr, terminal);
     const gapsDemoExit = await gapsDemo.exit;
     console.log("[dwc] gaps-demo exited with code", gapsDemoExit);
+
+    // Real npm, vendored (see scripts/vendor-npm.mjs + src/vendorNpm.ts) and
+    // booted through the real bin/npm-cli.js, exactly like a real Node
+    // install would run it - `npm --version` is the first gate: it only
+    // exercises engine validation + top-level Npm construction, nothing
+    // touching the registry or installers yet.
+    const { version: vendoredVersion, fileCount } = await loadVendoredNpm(dwc);
+    console.log("[dwc] loaded vendored npm", vendoredVersion, `(${fileCount} files)`);
+
+    const npmVersionProc = await dwc.process.spawn("/bin/npm.js", { argv: ["--version"] });
+    // Buffered + truncated rather than piped straight into xterm like every
+    // other demo (pipeToTerminal): a require-chain failure deep in a real,
+    // separately-vendored program can print an arbitrarily long stack trace,
+    // and streaming that raw into xterm has been observed to hang the tab's
+    // main thread - a real npm command is exactly the kind of guest code
+    // this cap protects against, so it stays even now that --version itself
+    // prints only a couple of bytes.
+    const readAllTruncated = async (stream: ReadableStream<Uint8Array>, limit = 4000): Promise<string> => {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      let text = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return text;
+        text += decoder.decode(value);
+        if (text.length > limit) return `${text.slice(0, limit)}\n...[truncated]`;
+      }
+    };
+    const [npmStdout, npmStderr] = await Promise.all([
+      readAllTruncated(npmVersionProc.stdout),
+      readAllTruncated(npmVersionProc.stderr),
+    ]);
+    const npmVersionExit = await npmVersionProc.exit;
+    console.log("[dwc] npm --version exited with code", npmVersionExit);
+    console.log("[dwc] npm --version stdout:", npmStdout);
+    console.log("[dwc] npm --version stderr:", npmStderr);
+    terminal.writeln(`[npm --version] exit=${npmVersionExit} stdout=${JSON.stringify(npmStdout)}`);
+    terminal.writeln(`[npm --version] stderr=${JSON.stringify(npmStderr)}`);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

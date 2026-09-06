@@ -223,6 +223,26 @@ test("real-npm-boot gaps: os module, \"node:\"/absolute-path require(), fs.chmod
   expect(pageErrors).toEqual([]);
 });
 
+test("real vendored npm@10.9.2 boots through its own bin/npm-cli.js and `npm --version` prints the real version", async ({ page }) => {
+  const consoleMessages: string[] = [];
+  const pageErrors: string[] = [];
+
+  page.on("console", (message) => consoleMessages.push(message.text()));
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto("/");
+
+  await expect
+    .poll(() => consoleMessages.some((text) => text.includes("npm --version exited with code")), { timeout: 15000 })
+    .toBe(true);
+
+  const terminalText = await page.locator("#terminal").innerText();
+  expect(terminalText).toContain('[npm --version] exit=0 stdout="10.9.2\\n"');
+  expect(terminalText).toContain('[npm --version] stderr=""');
+
+  expect(pageErrors).toEqual([]);
+});
+
 test("dwc.fs mounts a declarative tree and reads it back through the FS worker", async ({ page }) => {
   const consoleMessages: string[] = [];
   const pageErrors: string[] = [];
