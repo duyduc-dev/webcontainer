@@ -7,6 +7,7 @@ import { resolvePath } from "../../shell/resolvePath";
 import { parseCommands, tokenize } from "../../shell/tokenize";
 import type { FetcherClient, NetRequestPayload } from "./fetcherClient";
 import type { FsClient } from "./fsClient";
+import type { NetRelay } from "./netRelay";
 import { postEvent } from "./service";
 import { spawnChildWorker } from "./spawn";
 
@@ -90,6 +91,7 @@ const bootProcess = async (
   fsClient: FsClient,
   processTable: ProcessTable,
   fetcherClient: FetcherClient,
+  netRelay: NetRelay,
   payload: BootProcessPayload,
   onEvent: ProcessEventHandler,
 ): Promise<{ processId: string }> => {
@@ -100,6 +102,7 @@ const bootProcess = async (
   const worker = spawnChildWorker(new URL("../process/worker.js", import.meta.url), {
     name: `Process:${processId}`,
   });
+  netRelay.registerWorker(processId, worker);
 
   worker.onmessage = (event: MessageEvent<{ type: string; payload?: any }>) => {
     const { type, payload: eventPayload } = event.data;
@@ -109,8 +112,39 @@ const bootProcess = async (
       return;
     }
 
+    // Cross-process net: this process either registered a port/path (fire-
+    // and-forget) or is dialing one (net-pipe-connect gets a synchronous
+    // local-registry answer back as net-pipe-connect-response), or is
+    // relaying bytes/EOF/close over an already-established connection.
+    if (type === "net-listen") {
+      netRelay.listen(processId, eventPayload.port);
+      return;
+    }
+    if (type === "net-close-server") {
+      netRelay.closeServer(eventPayload.port);
+      return;
+    }
+    if (type === "net-pipe-listen") {
+      netRelay.pipeListen(processId, eventPayload.key);
+      return;
+    }
+    if (type === "net-pipe-close-server") {
+      netRelay.pipeCloseServer(eventPayload.key);
+      return;
+    }
+    if (type === "net-pipe-connect") {
+      const connId = netRelay.pipeConnect(processId, eventPayload.key);
+      worker.postMessage({ type: "net-pipe-connect-response", payload: { id: eventPayload.id, connId } });
+      return;
+    }
+    if (type === "net-pipe-relay") {
+      netRelay.relay(processId, eventPayload);
+      return;
+    }
+
     if (type === "exit") {
       processTable.remove(processId);
+      netRelay.unregisterWorker(processId);
       worker.terminate();
     }
 
@@ -136,6 +170,7 @@ const runNodeViaShell = async (
   fsClient: FsClient,
   processTable: ProcessTable,
   fetcherClient: FetcherClient,
+  netRelay: NetRelay,
 ): Promise<{ output: string; cwd: string }> => {
   const [, scriptArg, ...scriptArgs] = argv;
   if (!scriptArg) throw new Error("node: missing script operand");
@@ -147,7 +182,7 @@ const runNodeViaShell = async (
     resolveExit = resolve;
   });
 
-  await bootProcess(fsClient, processTable, fetcherClient, { entryPath, argv: scriptArgs, env: {}, cwd }, (type, eventPayload) => {
+  await bootProcess(fsClient, processTable, fetcherClient, netRelay, { entryPath, argv: scriptArgs, env: {}, cwd }, (type, eventPayload) => {
     if (type === "stdout" || type === "stderr") {
       output += decoder.decode(eventPayload.chunk);
       return;
@@ -160,11 +195,16 @@ const runNodeViaShell = async (
 };
 
 /** Preloads the require() graph via the FS worker, then spawns a Process Worker to run it. */
-const createProcessClient = (fsClient: FsClient, processTable: ProcessTable, fetcherClient: FetcherClient): ProcessClient => {
+const createProcessClient = (
+  fsClient: FsClient,
+  processTable: ProcessTable,
+  fetcherClient: FetcherClient,
+  netRelay: NetRelay,
+): ProcessClient => {
   const spawn = async (payload: SpawnPayload): Promise<{ processId: string }> => {
     const { entryPath, argv = [], env = {}, cwd = "/" } = payload;
 
-    return bootProcess(fsClient, processTable, fetcherClient, { entryPath, argv, env, cwd }, (type, eventPayload, processId) => {
+    return bootProcess(fsClient, processTable, fetcherClient, netRelay, { entryPath, argv, env, cwd }, (type, eventPayload, processId) => {
       if (type === "stdout" || type === "stderr") {
         postEvent(`process:${type}`, { processId, chunk: eventPayload.chunk });
         return;
@@ -216,7 +256,7 @@ const createProcessClient = (fsClient: FsClient, processTable: ProcessTable, fet
     // for the shell line itself. Scope: only as the line's sole command (no
     // `&&` chaining with it yet, matching this phase's shell integration).
     if (commands.length === 1 && commands[0]!.argv[0] === "node") {
-      return runNodeViaShell(commands[0]!.argv, cwd, fsClient, processTable, fetcherClient);
+      return runNodeViaShell(commands[0]!.argv, cwd, fsClient, processTable, fetcherClient, netRelay);
     }
 
     return runShellViaProcessWorker(payload.line, cwd);

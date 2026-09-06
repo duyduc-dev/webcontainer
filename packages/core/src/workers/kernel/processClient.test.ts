@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createProcessClient } from "./processClient";
 import type { FetcherClient } from "./fetcherClient";
 import type { FsClient } from "./fsClient";
+import { createNetRelay } from "./netRelay";
 import { DWCError } from "../../protocol/errors";
 
 class FakeWorker {
@@ -64,7 +65,7 @@ describe("createProcessClient — net-request forwarding", () => {
     const fsClient = fakeFsClient();
     // preloadModuleGraph reads the entry file via fsClient.request({action:"readFile",...})
     (fsClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(new TextEncoder().encode("// entry"));
-    return createProcessClient(fsClient, fakeProcessTable() as never, fetcherClient);
+    return createProcessClient(fsClient, fakeProcessTable() as never, fetcherClient, createNetRelay());
   };
 
   it("forwards a spawned process's net-request to the fetcher client and replies with net-response", async () => {
@@ -139,7 +140,10 @@ describe("createProcessClient — runShell 'node <script>' interception", () => 
     const fsClient = fakeFsClient();
     (fsClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(new TextEncoder().encode("// entry"));
     const fetcherClient: FetcherClient = { request: vi.fn() };
-    return { client: createProcessClient(fsClient, fakeProcessTable() as never, fetcherClient), fetcherClient };
+    return {
+      client: createProcessClient(fsClient, fakeProcessTable() as never, fetcherClient, createNetRelay()),
+      fetcherClient,
+    };
   };
 
   const encoder = new TextEncoder();

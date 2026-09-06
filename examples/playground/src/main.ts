@@ -143,6 +143,52 @@ async function main() {
     pipeToTerminal(netDemoProc.stderr, terminal);
     const netDemoExitCode = await netDemoProc.exit;
     console.log("[dwc] net-demo process exited with code", netDemoExitCode);
+
+    // Phase 8 demo: cross-process net — a server in ONE process worker, a
+    // client in a SEPARATE one, reaching it through the kernel's relay
+    // (workers/kernel/netRelay.ts) rather than the same-process loopback.
+    await dwc.fs.writeFile(
+      "/net-xproc-server.js",
+      [
+        "const net = require('net');",
+        "const server = net.createServer((socket) => {",
+        "  socket.on('data', (chunk) => console.log('[net-xproc] server got:', chunk.toString()));",
+        "  socket.write('hello from cross-process server');",
+        "  socket.on('close', () => server.close());",
+        "});",
+        "server.listen(4000, () => console.log('[net-xproc] server listening on 4000'));",
+        "setTimeout(() => server.close(), 5000);", // safety fallback if the client never connects
+        "",
+      ].join("\n"),
+    );
+    await dwc.fs.writeFile(
+      "/net-xproc-client.js",
+      [
+        "const net = require('net');",
+        "const client = net.connect(4000, 'localhost', () => client.write('hello from cross-process client'));",
+        "client.on('data', (chunk) => {",
+        "  console.log('[net-xproc] client got:', chunk.toString());",
+        "  client.end();",
+        "});",
+        "client.on('error', (err) => console.error('[net-xproc] client error:', err.message));",
+        "",
+      ].join("\n"),
+    );
+
+    const xprocServer = await dwc.process.spawn("/net-xproc-server.js");
+    pipeToTerminal(xprocServer.stdout, terminal);
+    pipeToTerminal(xprocServer.stderr, terminal);
+    // Give the server's fire-and-forget kernel registration (see
+    // netRelay.ts's file header) a moment to land before the client dials it.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const xprocClient = await dwc.process.spawn("/net-xproc-client.js");
+    pipeToTerminal(xprocClient.stdout, terminal);
+    pipeToTerminal(xprocClient.stderr, terminal);
+    const xprocClientExit = await xprocClient.exit;
+    console.log("[dwc] net-xproc-client exited with code", xprocClientExit);
+    const xprocServerExit = await xprocServer.exit;
+    console.log("[dwc] net-xproc-server exited with code", xprocServerExit);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

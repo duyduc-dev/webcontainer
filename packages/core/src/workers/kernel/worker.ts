@@ -5,6 +5,7 @@ import { createRouter } from "../../kernel/router";
 import { createFetcherClient } from "./fetcherClient";
 import type { NetRequestPayload } from "./fetcherClient";
 import { createFsClient } from "./fsClient";
+import { createNetRelay } from "./netRelay";
 import { createProcessClient } from "./processClient";
 import type { ShellExecPayload, SpawnPayload } from "./processClient";
 import { postErrorReply, postReply } from "./service";
@@ -13,7 +14,8 @@ const processTable = createProcessTable();
 const router = createRouter();
 const fsClient = createFsClient();
 const fetcherClient = createFetcherClient();
-const processClient = createProcessClient(fsClient, processTable, fetcherClient);
+const netRelay = createNetRelay();
+const processClient = createProcessClient(fsClient, processTable, fetcherClient, netRelay);
 
 router.handle("PING", () => "PONG");
 router.handle("INITIALIZE", () => {

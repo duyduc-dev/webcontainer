@@ -103,6 +103,26 @@ test("real vendored net: a script talks to its own server over the loopback bind
   expect(pageErrors).toEqual([]);
 });
 
+test("real vendored net: two separate process workers talk over the kernel's cross-process relay", async ({ page }) => {
+  const consoleMessages: string[] = [];
+  const pageErrors: string[] = [];
+
+  page.on("console", (message) => consoleMessages.push(message.text()));
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto("/");
+
+  await expect
+    .poll(() => consoleMessages.some((text) => text.includes("net-xproc-server exited with code 0")), { timeout: 15000 })
+    .toBe(true);
+
+  const terminalText = await page.locator("#terminal").innerText();
+  expect(terminalText).toContain("[net-xproc] server got: hello from cross-process client");
+  expect(terminalText).toContain("[net-xproc] client got: hello from cross-process server");
+
+  expect(pageErrors).toEqual([]);
+});
+
 test("dwc.fs mounts a declarative tree and reads it back through the FS worker", async ({ page }) => {
   const consoleMessages: string[] = [];
   const pageErrors: string[] = [];

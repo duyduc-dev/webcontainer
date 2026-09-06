@@ -43,11 +43,20 @@ interface NetRequestInit {
   body?: Uint8Array;
 }
 
+interface PipeRelayMessage {
+  type: "pipe-open" | "pipe-data" | "pipe-shutdown" | "pipe-close";
+  connId: number;
+  path?: string;
+  chunk?: Uint8Array;
+}
+
 const encoder = new TextEncoder();
 
 let exitCode = 0;
 let exited = false;
 const pendingNetRequests = new Map<string, { resolve: (reply: NetReply) => void; reject: (error: unknown) => void }>();
+const pendingPipeConnects = new Map<string, { resolve: (v: { connId: number }) => void; reject: (error: unknown) => void }>();
+let pipeMessageHandler: ((msg: PipeRelayMessage) => void) | null = null;
 
 /** Bridges the guest realm's globalThis.__dwcFetchAsync (see internal/fetch-transport.js)
  * up through the kernel to the Fetcher Worker — the only place with real network access.
@@ -87,6 +96,47 @@ const handleNetResponse = (payload: { id: string; ok: boolean; result?: NetReply
 
   if (payload.ok) waiting.resolve(payload.result!);
   else waiting.reject(Object.assign(new Error(payload.error!.message), { code: payload.error!.code }));
+};
+
+/** The process-worker half of 'net's cross-process relay (see
+ * workers/kernel/netRelay.ts) — a plain postMessage bridge up to the kernel,
+ * mirroring createNetRequest's shape. listen()/pipeListen() are fire-and-
+ * forget; pipeConnect() refs the loop for the round trip, same reasoning as
+ * createNetRequest (the reply arrives via a message from another worker, not
+ * anything the loop already tracks). */
+const createNetBridge = (eventLoop: ReturnType<typeof createEventLoop>) => ({
+  listen: (port: number): void => self.postMessage({ type: "net-listen", payload: { port } }),
+  closeServer: (port: number): void => self.postMessage({ type: "net-close-server", payload: { port } }),
+  pipeListen: (key: string): void => self.postMessage({ type: "net-pipe-listen", payload: { key } }),
+  pipeCloseServer: (key: string): void => self.postMessage({ type: "net-pipe-close-server", payload: { key } }),
+  pipeConnect: (key: string): Promise<{ connId: number }> => {
+    const id = crypto.randomUUID();
+    eventLoop.ref();
+    return new Promise((resolve, reject) => {
+      pendingPipeConnects.set(id, {
+        resolve: (v) => {
+          eventLoop.unref();
+          resolve(v);
+        },
+        reject: (error) => {
+          eventLoop.unref();
+          reject(error);
+        },
+      });
+      self.postMessage({ type: "net-pipe-connect", payload: { id, key } });
+    });
+  },
+  postRaw: (msg: PipeRelayMessage): void => self.postMessage({ type: "net-pipe-relay", payload: msg }),
+  onMessage: (handler: (msg: PipeRelayMessage) => void): void => {
+    pipeMessageHandler = handler;
+  },
+});
+
+const handlePipeConnectResponse = (payload: { id: string; connId: number }): void => {
+  const waiting = pendingPipeConnects.get(payload.id);
+  if (!waiting) return;
+  pendingPipeConnects.delete(payload.id);
+  waiting.resolve({ connId: payload.connId });
 };
 
 const exitProcess = (code: number): void => {
@@ -133,7 +183,12 @@ const boot = (payload: BootPayload): void => {
   // reads it from there) is the one guest code's `require('buffer')` gets too;
   // building two separate instances would make `instanceof Buffer` disagree
   // between them.
-  const netContext = { queueClose: eventLoop.queueClose, ref: eventLoop.ref, unref: eventLoop.unref };
+  const netContext = {
+    queueClose: eventLoop.queueClose,
+    ref: eventLoop.ref,
+    unref: eventLoop.unref,
+    netBridge: createNetBridge(eventLoop),
+  };
   const vendoredBuiltins = createBuiltinModules(processGlobal, netContext);
 
   // The module wrapper (new Function) closes over the global scope, so console/process/
@@ -154,11 +209,20 @@ const boot = (payload: BootPayload): void => {
     Buffer: (vendoredBuiltins.buffer as { Buffer: unknown }).Buffer,
   });
 
+  // netContext is NOT threaded through here: `builtins` below already carries
+  // net/dns/tls from the ONE `vendoredBuiltins` built above, and moduleLoader's
+  // own default construction (createBuiltinModules(options.process,
+  // options.netContext)) would otherwise build a SECOND, independent net
+  // binding closure purely to have its output thrown away by the `builtins`
+  // override spread — except that closure's `netBridge.onMessage()` call has
+  // a live side effect: it steals the kernel's cross-process relay dispatch
+  // away from the (correct) instance guest code actually calls require('net')
+  // on, so every accepted cross-process connection dispatches into a
+  // `pipeServers` map nothing ever populated and gets closed immediately.
   const moduleLoader = createModuleLoader({
     sources: payload.sources,
     builtins: { ...vendoredBuiltins, fs: createFsBuiltinFromPayload(payload.syncFs) },
     process: processGlobal,
-    netContext,
   });
 
   try {
@@ -169,7 +233,16 @@ const boot = (payload: BootPayload): void => {
     return;
   }
 
-  void drain(eventLoop).then(() => exitProcess(exitCode));
+  drain(eventLoop)
+    .then(() => exitProcess(exitCode))
+    .catch((error: unknown) => {
+      // A callback the loop drained (a timer, a nextTick — e.g. the async
+      // dns.lookup()->connect() chain) can throw same as top-level code can;
+      // uncaught, it would otherwise just reject this promise silently, with
+      // nothing to report it and the process never exiting.
+      write("stderr", `${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+      exitProcess(1);
+    });
 };
 
 const bootShell = (payload: BootShellPayload): void => {
@@ -193,4 +266,6 @@ self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   if (event.data.type === "boot") boot(event.data.payload as BootPayload);
   else if (event.data.type === "boot-shell") bootShell(event.data.payload as BootShellPayload);
   else if (event.data.type === "net-response") handleNetResponse(event.data.payload as Parameters<typeof handleNetResponse>[0]);
+  else if (event.data.type === "net-pipe-connect-response") handlePipeConnectResponse(event.data.payload as { id: string; connId: number });
+  else if (event.data.type === "net-pipe-message") pipeMessageHandler?.(event.data.payload as PipeRelayMessage);
 };
