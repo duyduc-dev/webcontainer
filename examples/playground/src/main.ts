@@ -201,6 +201,34 @@ async function main() {
     console.log("[dwc] net-xproc-client exited with code", xprocClientExit);
     const xprocServerExit = await xprocServer.exit;
     console.log("[dwc] net-xproc-server exited with code", xprocServerExit);
+
+    // Phase 8d demo: real vendored `child_process` — spawn() streaming a
+    // PATH-resolved coreutil, exec() delegating to the kernel's own shell
+    // (real &&/>/PATH support for free), and spawn() reporting a clean
+    // 'error' for an unresolvable command rather than hanging.
+    await dwc.fs.writeFile(
+      "/child-process-demo.js",
+      [
+        "const { spawn, exec } = require('child_process');",
+        "",
+        "const child = spawn('echo', ['hi-from-spawn']);",
+        "child.stdout.on('data', (chunk) => console.log('[child_process] spawn stdout:', chunk.toString().trim()));",
+        "child.on('exit', (code) => console.log('[child_process] spawn exited with code', code));",
+        "",
+        "exec('mkdir -p /y && echo z > /y/f && cat /y/f', (err, stdout) => {",
+        "  console.log('[child_process] exec output:', JSON.stringify(stdout));",
+        "});",
+        "",
+        "const bad = spawn('nope-cmd', []);",
+        "bad.on('error', (err) => console.log('[child_process] spawn error:', err.message));",
+        "",
+      ].join("\n"),
+    );
+    const childProcessDemo = await dwc.process.spawn("/child-process-demo.js");
+    pipeToTerminal(childProcessDemo.stdout, terminal);
+    pipeToTerminal(childProcessDemo.stderr, terminal);
+    const childProcessDemoExit = await childProcessDemo.exit;
+    console.log("[dwc] child-process-demo exited with code", childProcessDemoExit);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

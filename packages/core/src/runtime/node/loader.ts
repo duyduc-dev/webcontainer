@@ -16,6 +16,7 @@
 
 import { createInternalBinding } from "./internalBinding";
 import { primordials } from "./primordials";
+import type { ChildProcessBridge } from "./bindings/childProcess";
 import type { NetBridge } from "./bindings/net";
 
 import eventsFactory from "./lib/events";
@@ -35,6 +36,7 @@ import netFactory from "./lib/net";
 import clusterFactory from "./lib/cluster";
 import diagnosticsChannelFactory from "./lib/diagnostics_channel";
 import timersFactory from "./lib/timers";
+import childProcessFactory from "./lib/child_process";
 
 import internalBufferFactory from "./internal/buffer";
 import utilFactory from "./internal/util";
@@ -113,6 +115,7 @@ const FACTORIES: Record<string, NodeFactory> = {
   cluster: clusterFactory,
   diagnostics_channel: diagnosticsChannelFactory,
   timers: timersFactory,
+  child_process: childProcessFactory,
 
   "internal/buffer": internalBufferFactory,
   "internal/util": utilFactory,
@@ -186,6 +189,7 @@ interface NodeModulesContext {
   ref?: () => void;
   unref?: () => void;
   netBridge?: NetBridge;
+  childProcessBridge?: ChildProcessBridge;
 }
 
 /** Creates one isolated module cache + require() over the vendored Node builtins. */
@@ -196,6 +200,7 @@ const createNodeModules = (process: ProcessLikeForModules, context: NodeModulesC
     ref: context.ref ?? (() => {}),
     unref: context.unref ?? (() => {}),
     netBridge: context.netBridge,
+    childProcessBridge: context.childProcessBridge,
   });
 
   const modules = new Map<string, { exports: unknown }>(); // id -> module (kept for cycle resolution)

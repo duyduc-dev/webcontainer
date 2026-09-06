@@ -333,3 +333,153 @@ describe("createProcessClient — runShell (cd, node, and /bin PATH resolution)"
     expect(fsClient.request).toHaveBeenCalledWith({ action: "writeFile", path: "/x/f", contents: "hi\n" });
   });
 });
+
+describe("createProcessClient — child_process guest-to-kernel relay (cp-spawn/cp-exec/cp-kill)", () => {
+  const originalWorker = globalThis.Worker;
+  const originalSelf = (globalThis as { self?: unknown }).self;
+  let spawnedWorkers: FakeWorker[] = [];
+
+  beforeEach(() => {
+    (globalThis as { self?: unknown }).self = { crossOriginIsolated: false, postMessage: vi.fn() };
+  });
+
+  afterEach(() => {
+    globalThis.Worker = originalWorker;
+    (globalThis as { self?: unknown }).self = originalSelf;
+    spawnedWorkers = [];
+  });
+
+  const fakeShellFsClient = (): FsClient => {
+    const request = vi.fn(async (payload: { action: string }) => {
+      switch (payload.action) {
+        case "readFile":
+          return new TextEncoder().encode("// entry");
+        case "exists":
+          return true;
+        case "stat":
+          return { isFile: false, isDirectory: true, size: 0, mtimeMs: 0 };
+        case "writeFile":
+          return undefined;
+        default:
+          return { sources: {} };
+      }
+    });
+    return { request, attachSyncChannel: vi.fn() } as unknown as FsClient;
+  };
+
+  const setup = (fsClient: FsClient = fakeShellFsClient()) => {
+    class SpawningWorker extends FakeWorker {
+      constructor() {
+        super();
+        spawnedWorkers.push(this);
+      }
+    }
+    // @ts-expect-error test stub, not a full Worker implementation
+    globalThis.Worker = SpawningWorker;
+
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    return { client: createProcessClient(fsClient, fakeProcessTable() as never, fetcherClient, createNetRelay()), fsClient };
+  };
+
+  const encoder = new TextEncoder();
+  const waitForWorker = async (index: number): Promise<FakeWorker> => {
+    await vi.waitFor(() => expect(spawnedWorkers.length).toBeGreaterThan(index));
+    return spawnedWorkers[index]!;
+  };
+  const finishWith = (worker: FakeWorker, code: number): void => {
+    worker.onmessage?.({ data: { type: "exit", payload: { code } } } as MessageEvent);
+  };
+
+  it("cp-spawn resolves the command against /bin and relays the child's stdout/exit back as cp-event", async () => {
+    const { client } = setup();
+
+    await client.spawn({ entryPath: "/parent.js" });
+    const parent = await waitForWorker(0);
+
+    parent.onmessage?.({ data: { type: "cp-spawn", payload: { id: "req-1", command: "echo", args: ["hi"], cwd: "/", env: {} } } } as MessageEvent);
+    const child = await waitForWorker(1);
+
+    expect(child.posted).toEqual([
+      expect.objectContaining({ type: "boot", payload: expect.objectContaining({ entryPath: "/bin/echo.js", argv: ["hi"] }) }),
+    ]);
+
+    child.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("hi\n") } } } as MessageEvent);
+    finishWith(child, 0);
+
+    expect(parent.posted).toContainEqual({ type: "cp-event", payload: { id: "req-1", kind: "stdout", chunk: encoder.encode("hi\n") } });
+    expect(parent.posted).toContainEqual({ type: "cp-event", payload: { id: "req-1", kind: "exit", code: 0 } });
+  });
+
+  it("cp-spawn replies with a cp-event error when the command can't be resolved", async () => {
+    const fsClient = fakeShellFsClient();
+    (fsClient.request as ReturnType<typeof vi.fn>).mockImplementation(async (payload: { action: string }) =>
+      payload.action === "exists" ? false : new TextEncoder().encode("// entry"),
+    );
+    const { client } = setup(fsClient);
+
+    await client.spawn({ entryPath: "/parent.js" });
+    const parent = await waitForWorker(0);
+
+    parent.onmessage?.({ data: { type: "cp-spawn", payload: { id: "req-2", command: "nope", args: [], cwd: "/", env: {} } } } as MessageEvent);
+
+    await vi.waitFor(() =>
+      expect(parent.posted).toContainEqual({ type: "cp-event", payload: { id: "req-2", kind: "error", message: "nope: command not found" } }),
+    );
+    expect(spawnedWorkers).toHaveLength(1);
+  });
+
+  it("cp-kill terminates the child worker and relays a synthetic exit back to the parent", async () => {
+    const { client } = setup();
+
+    await client.spawn({ entryPath: "/parent.js" });
+    const parent = await waitForWorker(0);
+
+    parent.onmessage?.({ data: { type: "cp-spawn", payload: { id: "req-3", command: "sleep", args: ["5"], cwd: "/", env: {} } } } as MessageEvent);
+    const child = await waitForWorker(1);
+    const terminateSpy = vi.spyOn(child, "terminate");
+
+    parent.onmessage?.({ data: { type: "cp-kill", payload: { id: "req-3" } } } as MessageEvent);
+
+    expect(terminateSpy).toHaveBeenCalledTimes(1);
+    expect(parent.posted).toContainEqual({ type: "cp-event", payload: { id: "req-3", kind: "exit", code: 143 } });
+  });
+
+  it("cp-exec runs the line through the same shell runShell() uses and replies once with the buffered result", async () => {
+    const { client } = setup();
+
+    await client.spawn({ entryPath: "/parent.js" });
+    const parent = await waitForWorker(0);
+
+    parent.onmessage?.({ data: { type: "cp-exec", payload: { id: "req-4", line: "echo hi", cwd: "/" } } } as MessageEvent);
+    const shellWorker = await waitForWorker(1);
+    shellWorker.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("hi\n") } } } as MessageEvent);
+    finishWith(shellWorker, 0);
+
+    await vi.waitFor(() =>
+      expect(parent.posted).toContainEqual({
+        type: "cp-exec-response",
+        payload: { id: "req-4", ok: true, result: { output: "hi\n", cwd: "/", exitCode: 0 } },
+      }),
+    );
+  });
+
+  it("cp-exec replies with ok:false when the shell line throws", async () => {
+    const fsClient = fakeShellFsClient();
+    (fsClient.request as ReturnType<typeof vi.fn>).mockImplementation(async (payload: { action: string }) =>
+      payload.action === "exists" ? false : new TextEncoder().encode("// entry"),
+    );
+    const { client } = setup(fsClient);
+
+    await client.spawn({ entryPath: "/parent.js" });
+    const parent = await waitForWorker(0);
+
+    parent.onmessage?.({ data: { type: "cp-exec", payload: { id: "req-5", line: "nope", cwd: "/" } } } as MessageEvent);
+
+    await vi.waitFor(() =>
+      expect(parent.posted).toContainEqual({
+        type: "cp-exec-response",
+        payload: { id: "req-5", ok: false, error: { message: "nope: command not found" } },
+      }),
+    );
+  });
+});

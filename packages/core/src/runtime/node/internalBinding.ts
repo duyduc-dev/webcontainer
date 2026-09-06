@@ -10,6 +10,8 @@
 // Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/internal-binding.js.
 
 import { createBufferBinding } from "./bindings/buffer";
+import { createChildProcessBindings } from "./bindings/childProcess";
+import type { ChildProcessBindingContext } from "./bindings/childProcess";
 import { createNetBindings } from "./bindings/net";
 import type { NetBindingContext } from "./bindings/net";
 
@@ -32,7 +34,7 @@ function getOwnNonIndexProperties(obj: object, filter: number): (string | symbol
   return out;
 }
 
-interface InternalBindingContext extends NetBindingContext {}
+interface InternalBindingContext extends NetBindingContext, ChildProcessBindingContext {}
 
 const createInternalBinding = (context: InternalBindingContext): ((name: string) => unknown) => {
   // Minted once per realm: internal/blocklist.js and others reach for these
@@ -52,6 +54,7 @@ const createInternalBinding = (context: InternalBindingContext): ((name: string)
     uv: net.uv,
     pipe_wrap: net.pipe_wrap,
     cares_wrap: net.cares_wrap,
+    child_process: createChildProcessBindings(context),
     util: {
       constants: { ALL_PROPERTIES, ONLY_ENUMERABLE },
       getOwnNonIndexProperties,

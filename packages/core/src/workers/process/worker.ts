@@ -43,6 +43,12 @@ interface PipeRelayMessage {
   chunk?: Uint8Array;
 }
 
+interface ChildProcessSpawnHandlers {
+  onStdout(chunk: Uint8Array): void;
+  onStderr(chunk: Uint8Array): void;
+  onExit(code: number | null, errorMessage?: string): void;
+}
+
 const encoder = new TextEncoder();
 
 let exitCode = 0;
@@ -50,6 +56,11 @@ let exited = false;
 const pendingNetRequests = new Map<string, { resolve: (reply: NetReply) => void; reject: (error: unknown) => void }>();
 const pendingPipeConnects = new Map<string, { resolve: (v: { connId: number }) => void; reject: (error: unknown) => void }>();
 let pipeMessageHandler: ((msg: PipeRelayMessage) => void) | null = null;
+const childSpawnHandlers = new Map<string, ChildProcessSpawnHandlers>();
+const pendingChildExecs = new Map<
+  string,
+  { resolve: (v: { output: string; cwd: string; exitCode: number }) => void; reject: (error: unknown) => void }
+>();
 
 /** Bridges the guest realm's globalThis.__dwcFetchAsync (see internal/fetch-transport.js)
  * up through the kernel to the Fetcher Worker — the only place with real network access.
@@ -132,6 +143,84 @@ const handlePipeConnectResponse = (payload: { id: string; connId: number }): voi
   waiting.resolve({ connId: payload.connId });
 };
 
+/** The process-worker half of child_process's guest-to-kernel relay (see
+ * workers/kernel/processClient.ts's "cp-spawn"/"cp-exec" handling inside
+ * bootProcess()). spawn() is an ongoing relay (stdout/stderr/exit events
+ * tagged by request id, like net's pipe relay), refed for the child's whole
+ * lifetime; exec() is one-shot request/response, same shape as
+ * createNetRequest. */
+const createChildProcessBridge = (eventLoop: ReturnType<typeof createEventLoop>) => ({
+  spawn: (command: string, args: string[], cwd: string, env: Record<string, string>, handlers: ChildProcessSpawnHandlers): { kill(): void } => {
+    const id = crypto.randomUUID();
+    eventLoop.ref();
+    childSpawnHandlers.set(id, {
+      onStdout: handlers.onStdout,
+      onStderr: handlers.onStderr,
+      onExit: (code, errorMessage) => {
+        eventLoop.unref();
+        handlers.onExit(code, errorMessage);
+      },
+    });
+    self.postMessage({ type: "cp-spawn", payload: { id, command, args, cwd, env } });
+    return {
+      kill: () => self.postMessage({ type: "cp-kill", payload: { id } }),
+    };
+  },
+  exec: (line: string, cwd: string): Promise<{ output: string; cwd: string; exitCode: number }> => {
+    const id = crypto.randomUUID();
+    eventLoop.ref();
+    return new Promise((resolve, reject) => {
+      pendingChildExecs.set(id, {
+        resolve: (v) => {
+          eventLoop.unref();
+          resolve(v);
+        },
+        reject: (error) => {
+          eventLoop.unref();
+          reject(error);
+        },
+      });
+      self.postMessage({ type: "cp-exec", payload: { id, line, cwd } });
+    });
+  },
+});
+
+const handleChildProcessEvent = (payload: {
+  id: string;
+  kind: "stdout" | "stderr" | "exit" | "error";
+  chunk?: Uint8Array;
+  code?: number;
+  message?: string;
+}): void => {
+  const handlers = childSpawnHandlers.get(payload.id);
+  if (!handlers) return;
+
+  if (payload.kind === "stdout") {
+    handlers.onStdout(payload.chunk!);
+    return;
+  }
+  if (payload.kind === "stderr") {
+    handlers.onStderr(payload.chunk!);
+    return;
+  }
+  childSpawnHandlers.delete(payload.id);
+  handlers.onExit(payload.kind === "error" ? null : payload.code!, payload.kind === "error" ? payload.message : undefined);
+};
+
+const handleChildExecResponse = (payload: {
+  id: string;
+  ok: boolean;
+  result?: { output: string; cwd: string; exitCode: number };
+  error?: { message: string };
+}): void => {
+  const waiting = pendingChildExecs.get(payload.id);
+  if (!waiting) return;
+  pendingChildExecs.delete(payload.id);
+
+  if (payload.ok) waiting.resolve(payload.result!);
+  else waiting.reject(new Error(payload.error!.message));
+};
+
 const exitProcess = (code: number): void => {
   if (exited) return;
   exited = true;
@@ -196,6 +285,7 @@ const boot = (payload: BootPayload): void => {
     ref: eventLoop.ref,
     unref: eventLoop.unref,
     netBridge: createNetBridge(eventLoop),
+    childProcessBridge: createChildProcessBridge(eventLoop),
   };
   const vendoredBuiltins = createBuiltinModules(processGlobal, netContext);
 
@@ -265,4 +355,6 @@ self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   else if (event.data.type === "net-response") handleNetResponse(event.data.payload as Parameters<typeof handleNetResponse>[0]);
   else if (event.data.type === "net-pipe-connect-response") handlePipeConnectResponse(event.data.payload as { id: string; connId: number });
   else if (event.data.type === "net-pipe-message") pipeMessageHandler?.(event.data.payload as PipeRelayMessage);
+  else if (event.data.type === "cp-event") handleChildProcessEvent(event.data.payload as Parameters<typeof handleChildProcessEvent>[0]);
+  else if (event.data.type === "cp-exec-response") handleChildExecResponse(event.data.payload as Parameters<typeof handleChildExecResponse>[0]);
 };

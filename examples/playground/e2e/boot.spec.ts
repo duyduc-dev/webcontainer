@@ -130,6 +130,28 @@ test("real vendored net: two separate process workers talk over the kernel's cro
   expect(pageErrors).toEqual([]);
 });
 
+test("real vendored child_process: spawn() streams a PATH-resolved coreutil, exec() delegates to the shell, and an unresolvable command reports a clean error", async ({ page }) => {
+  const consoleMessages: string[] = [];
+  const pageErrors: string[] = [];
+
+  page.on("console", (message) => consoleMessages.push(message.text()));
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+
+  await page.goto("/");
+
+  await expect
+    .poll(() => consoleMessages.some((text) => text.includes("child-process-demo exited with code 0")), { timeout: 15000 })
+    .toBe(true);
+
+  const terminalText = await page.locator("#terminal").innerText();
+  expect(terminalText).toContain("[child_process] spawn stdout: hi-from-spawn");
+  expect(terminalText).toContain("[child_process] spawn exited with code 0");
+  expect(terminalText).toContain("[child_process] spawn error: nope-cmd: command not found");
+  expect(terminalText).toContain('[child_process] exec output: "z\\n"');
+
+  expect(pageErrors).toEqual([]);
+});
+
 test("dwc.fs mounts a declarative tree and reads it back through the FS worker", async ({ page }) => {
   const consoleMessages: string[] = [];
   const pageErrors: string[] = [];

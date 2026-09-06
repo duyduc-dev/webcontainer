@@ -37,6 +37,31 @@ interface BootProcessPayload {
 
 type ProcessEventHandler = (type: string, eventPayload: any, processId: string) => void;
 
+/** child_process.spawn('node', [...]) is an extremely common real-world
+ * pattern (build tools re-invoking themselves), so it gets the exact same
+ * resolution `node <script>` already gets in a shell line: a direct entryPath
+ * rather than a /bin/node.js lookup (no vendored Node script can require() an
+ * arbitrary absolute path the way moduleLoader.run(entryPath) can). Every
+ * other command resolves against /bin/<name>.js (kernel/fs/coreutils.ts,
+ * seeded at FS Worker boot). Returns null - not a thrown error - so callers
+ * (the shell's "command not found" vs. child_process's ENOENT-shaped error)
+ * can each report it their own way. */
+const resolveEntryPoint = async (
+  fsClient: FsClient,
+  command: string,
+  args: string[],
+  cwd: string,
+): Promise<{ entryPath: string; args: string[] } | null> => {
+  if (command === "node") {
+    const scriptArg = args[0];
+    if (!scriptArg) return null;
+    return { entryPath: resolvePath(cwd, scriptArg), args: args.slice(1) };
+  }
+  const entryPath = `/bin/${command}.js`;
+  const exists = await fsClient.request<boolean>({ action: "exists", path: entryPath });
+  return exists ? { entryPath, args } : null;
+};
+
 const decoder = new TextDecoder();
 
 const readFileAsText = (fsClient: FsClient) => async (path: string): Promise<string> => {
@@ -94,6 +119,7 @@ const bootProcess = async (
   netRelay: NetRelay,
   payload: BootProcessPayload,
   onEvent: ProcessEventHandler,
+  onWorkerCreated?: (worker: Worker) => void,
 ): Promise<{ processId: string }> => {
   const { entryPath, argv, env, cwd } = payload;
   const { sources } = await preloadModuleGraph(entryPath, readFileAsText(fsClient));
@@ -103,6 +129,12 @@ const bootProcess = async (
     name: `Process:${processId}`,
   });
   netRelay.registerWorker(processId, worker);
+  onWorkerCreated?.(worker);
+
+  // child_process.spawn()'d children of THIS process: tracked by the spawn
+  // request id (not processId) so a later "cp-kill" can find the right
+  // worker without this process needing to know its child's processId.
+  const childWorkersByRequestId = new Map<string, Worker>();
 
   worker.onmessage = (event: MessageEvent<{ type: string; payload?: any }>) => {
     const { type, payload: eventPayload } = event.data;
@@ -139,6 +171,71 @@ const bootProcess = async (
     }
     if (type === "net-pipe-relay") {
       netRelay.relay(processId, eventPayload);
+      return;
+    }
+
+    // child_process: this process is asking to spawn a child (an ongoing
+    // relay of stdout/stderr/exit events tagged by request id, not a single
+    // reply — see workers/process/worker.ts's createChildProcessBridge) or
+    // run a shell line (a one-shot buffered result, like net-request/
+    // net-response above), or to kill a child it previously spawned.
+    if (type === "cp-spawn") {
+      const { id, command, args: childArgs, cwd: childCwd, env: childEnv } = eventPayload;
+      (async () => {
+        try {
+          const resolved = await resolveEntryPoint(fsClient, command, childArgs, childCwd);
+          if (!resolved) {
+            worker.postMessage({ type: "cp-event", payload: { id, kind: "error", message: `${command}: command not found` } });
+            return;
+          }
+          await bootProcess(
+            fsClient,
+            processTable,
+            fetcherClient,
+            netRelay,
+            { entryPath: resolved.entryPath, argv: resolved.args, env: childEnv ?? {}, cwd: childCwd },
+            (childType, childPayload) => {
+              if (childType === "stdout" || childType === "stderr") {
+                worker.postMessage({ type: "cp-event", payload: { id, kind: childType, chunk: childPayload.chunk } });
+                return;
+              }
+              if (childType === "exit") {
+                childWorkersByRequestId.delete(id);
+                worker.postMessage({ type: "cp-event", payload: { id, kind: "exit", code: childPayload.code } });
+              }
+            },
+            (childWorker) => childWorkersByRequestId.set(id, childWorker),
+          );
+        } catch (error) {
+          worker.postMessage({
+            type: "cp-event",
+            payload: { id, kind: "error", message: error instanceof Error ? error.message : String(error) },
+          });
+        }
+      })();
+      return;
+    }
+    if (type === "cp-kill") {
+      const childWorker = childWorkersByRequestId.get(eventPayload.id);
+      if (!childWorker) return;
+      childWorkersByRequestId.delete(eventPayload.id);
+      childWorker.terminate();
+      // 143 = 128 + SIGTERM(15), the conventional shell exit code for a
+      // terminated process — there's no real signal here, just a worker torn
+      // down from outside, but ChildProcess's 'exit' handlers still need a code.
+      worker.postMessage({ type: "cp-event", payload: { id: eventPayload.id, kind: "exit", code: 143 } });
+      return;
+    }
+    if (type === "cp-exec") {
+      const { id, line, cwd: execCwd } = eventPayload;
+      runShellInternal(fsClient, processTable, fetcherClient, netRelay, { line, cwd: execCwd }).then(
+        (result) => worker.postMessage({ type: "cp-exec-response", payload: { id, ok: true, result } }),
+        (error: unknown) =>
+          worker.postMessage({
+            type: "cp-exec-response",
+            payload: { id, ok: false, error: { message: error instanceof Error ? error.message : String(error) } },
+          }),
+      );
       return;
     }
 
@@ -196,6 +293,60 @@ const runProgramViaShell = async (
   return { output, exitCode };
 };
 
+/** Runs an `&&`-chained shell line: `cd` mutates cwd in place (a subprocess
+ * can't change its parent's cwd, so it can't be a PATH-resolved program like
+ * everything else); every other command (including `node`) resolves via
+ * resolveEntryPoint() and runs the same way. Stops the chain (real `&&`
+ * semantics) as soon as a command exits non-zero. Module-level (not a
+ * createProcessClient() closure) so bootProcess()'s "cp-exec" handling -
+ * child_process.exec() from guest code - can call it directly; the returned
+ * exitCode is internal-only (createProcessClient()'s public runShell() below
+ * strips it to keep dwc.shell.exec()'s existing {output, cwd} contract). */
+const runShellInternal = async (
+  fsClient: FsClient,
+  processTable: ProcessTable,
+  fetcherClient: FetcherClient,
+  netRelay: NetRelay,
+  payload: ShellExecPayload,
+): Promise<{ output: string; cwd: string; exitCode: number }> => {
+  let cwd = payload.cwd ?? "/";
+  const commands = parseCommands(tokenize(payload.line));
+  let output = "";
+  let exitCode = 0;
+
+  for (const command of commands) {
+    const name = command.argv[0];
+    if (!name) continue;
+
+    if (name === "cd") {
+      const target = command.argv[1] ? resolvePath(cwd, command.argv[1]) : "/";
+      const stat = await fsClient.request<{ isDirectory: boolean }>({ action: "stat", path: target });
+      if (!stat.isDirectory) throw new Error(`cd: not a directory: ${command.argv[1]}`);
+      cwd = target;
+      exitCode = 0;
+      continue;
+    }
+
+    if (name === "node" && !command.argv[1]) throw new Error("node: missing script operand");
+
+    const resolved = await resolveEntryPoint(fsClient, name, command.argv.slice(1), cwd);
+    if (!resolved) throw new Error(`${name}: command not found`);
+
+    const result = await runProgramViaShell(resolved.entryPath, resolved.args, cwd, fsClient, processTable, fetcherClient, netRelay);
+    exitCode = result.exitCode;
+
+    if (command.redirectOut) {
+      await fsClient.request({ action: "writeFile", path: resolvePath(cwd, command.redirectOut), contents: result.output });
+    } else {
+      output += result.output;
+    }
+
+    if (exitCode !== 0) break;
+  }
+
+  return { output, cwd, exitCode };
+};
+
 /** Preloads the require() graph via the FS worker, then spawns a Process Worker to run it. */
 const createProcessClient = (
   fsClient: FsClient,
@@ -217,56 +368,8 @@ const createProcessClient = (
     });
   };
 
-  /** Runs an `&&`-chained shell line: `cd` mutates cwd in place (a subprocess
-   * can't change its parent's cwd, so it can't be a PATH-resolved program
-   * like everything else); `node <script>` reuses today's direct-entryPath
-   * special case (a coreutils program can't easily require() an arbitrary
-   * absolute path the way moduleLoader.run(entryPath) can); every other
-   * command resolves against /bin/<name>.js (see kernel/fs/coreutils.ts,
-   * seeded at FS Worker boot) and runs the same way. Stops the chain (real
-   * `&&` semantics) as soon as a command exits non-zero. */
   const runShell = async (payload: ShellExecPayload): Promise<{ output: string; cwd: string }> => {
-    let cwd = payload.cwd ?? "/";
-    const commands = parseCommands(tokenize(payload.line));
-    let output = "";
-
-    for (const command of commands) {
-      const name = command.argv[0];
-      if (!name) continue;
-
-      if (name === "cd") {
-        const target = command.argv[1] ? resolvePath(cwd, command.argv[1]) : "/";
-        const stat = await fsClient.request<{ isDirectory: boolean }>({ action: "stat", path: target });
-        if (!stat.isDirectory) throw new Error(`cd: not a directory: ${command.argv[1]}`);
-        cwd = target;
-        continue;
-      }
-
-      let entryPath: string;
-      let args: string[];
-      if (name === "node") {
-        const scriptArg = command.argv[1];
-        if (!scriptArg) throw new Error("node: missing script operand");
-        entryPath = resolvePath(cwd, scriptArg);
-        args = command.argv.slice(2);
-      } else {
-        entryPath = `/bin/${name}.js`;
-        const exists = await fsClient.request<boolean>({ action: "exists", path: entryPath });
-        if (!exists) throw new Error(`${name}: command not found`);
-        args = command.argv.slice(1);
-      }
-
-      const { output: cmdOutput, exitCode } = await runProgramViaShell(entryPath, args, cwd, fsClient, processTable, fetcherClient, netRelay);
-
-      if (command.redirectOut) {
-        await fsClient.request({ action: "writeFile", path: resolvePath(cwd, command.redirectOut), contents: cmdOutput });
-      } else {
-        output += cmdOutput;
-      }
-
-      if (exitCode !== 0) break;
-    }
-
+    const { output, cwd } = await runShellInternal(fsClient, processTable, fetcherClient, netRelay, payload);
     return { output, cwd };
   };
 

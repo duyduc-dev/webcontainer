@@ -28,6 +28,7 @@ const BUILTIN_NAMES = new Set([
   "net",
   "dns",
   "tls",
+  "child_process",
 ]);
 
 const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(specifier);
@@ -35,15 +36,18 @@ const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(spe
 /**
  * Builds the require()-able builtins record for one process. `events`,
  * `stream`, `buffer`, `http`, `https`, `crypto`, `zlib`, `async_hooks`,
- * `net`, `dns`, and `tls` resolve through real vendored Node source
+ * `net`, `dns`, `tls`, and `child_process` resolve through real vendored (or,
+ * for `child_process` — like `net`'s bindings — hand-written) Node source
  * (runtime/node/loader.ts) rather than hand-written approximations; `path`
  * and `util` stay hand-written until their own real lib/ modules are vendored.
  *
- * `net`'s liveness/close-phase/cross-process hooks come from `netContext`
- * (the calling process worker's own event loop + kernel bridge) — omitted,
- * `net` still works for same-process listen()/connect() via loader.ts's
- * nextTick-based fallbacks, just without real close-phase ordering or
- * cross-process reachability.
+ * `net`'s liveness/close-phase/cross-process hooks and `child_process`'s
+ * spawn/exec relay both come from `netContext` (the calling process worker's
+ * own event loop + kernel bridge) — omitted, `net` still works for
+ * same-process listen()/connect() via loader.ts's nextTick-based fallbacks
+ * (just without real close-phase ordering or cross-process reachability),
+ * and `child_process.spawn()`/`exec()` throw clearly instead of silently
+ * doing nothing.
  */
 const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesContext): Record<string, unknown> => {
   const nodeModules = createNodeModules(process, netContext);
@@ -61,6 +65,7 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     net: nodeModules.require("net"),
     dns: nodeModules.require("dns"),
     tls: nodeModules.require("tls"),
+    child_process: nodeModules.require("child_process"),
   };
 };
 
