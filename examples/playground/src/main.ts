@@ -108,6 +108,13 @@ async function main() {
     pipeToTerminal(netProc.stderr, terminal);
     const netExitCode = await netProc.exit;
     console.log("[dwc] net-test process exited with code", netExitCode);
+
+    // `node <script>` reachable from the shell (dwc.shell.exec), not just
+    // dwc.process.spawn() directly.
+    await dwc.fs.writeFile("/shell-node.js", "console.log('[shell-node] ran via dwc.shell.exec');\n");
+    const nodeShellResult = await dwc.shell.exec("node /shell-node.js");
+    console.log("[dwc] shell.exec('node /shell-node.js') result ->", JSON.stringify(nodeShellResult.output));
+    terminal.writeln(`[shell] node /shell-node.js -> ${JSON.stringify(nodeShellResult.output)}`);
   } catch (error) {
     if (error instanceof DWCError) {
       console.error(`[dwc] boot failed: ${error.code} - ${error.message}`);

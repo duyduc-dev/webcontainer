@@ -64,7 +64,7 @@ test("real vendored events/stream/crypto run, and https reaches the real npm reg
   await page.goto("/");
 
   await expect
-    .poll(() => consoleMessages.some((text) => text.includes("net-test process exited with code 0")), { timeout: 15000 })
+    .poll(() => consoleMessages.some((text) => text.includes("shell.exec('node /shell-node.js')")), { timeout: 15000 })
     .toBe(true);
 
   // xterm.js visually wraps long lines at the terminal's column width, so
@@ -76,6 +76,8 @@ test("real vendored events/stream/crypto run, and https reaches the real npm reg
   expect(terminalText).toContain('[crypto] sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824');
   expect(terminalText).toMatch(/\[crypto] randomUUID\(\) = [0-9a-f-]{36}/);
   expect(terminalText).toContain("[stream] piped: abc");
+  // node <script> reachable from dwc.shell.exec(), not just dwc.process.spawn().
+  expect(terminalText).toContain('[shell] node /shell-node.js -> "[shell-node] ran via dwc.shell.exec\\n"');
   expect(terminalText).toContain("[https] fetched from registry.npmjs.org: name= left-pad latest=");
 
   expect(pageErrors).toEqual([]);

@@ -110,3 +110,133 @@ describe("createProcessClient — net-request forwarding", () => {
     expect(fetcherClient.request).not.toHaveBeenCalled();
   });
 });
+
+describe("createProcessClient — runShell 'node <script>' interception", () => {
+  const originalWorker = globalThis.Worker;
+  const originalSelf = (globalThis as { self?: unknown }).self;
+  let spawned: FakeWorker | undefined;
+
+  beforeEach(() => {
+    (globalThis as { self?: unknown }).self = { crossOriginIsolated: false, postMessage: vi.fn() };
+  });
+
+  afterEach(() => {
+    globalThis.Worker = originalWorker;
+    (globalThis as { self?: unknown }).self = originalSelf;
+    spawned = undefined;
+  });
+
+  const setup = () => {
+    class SpawningWorker extends FakeWorker {
+      constructor() {
+        super();
+        spawned = this;
+      }
+    }
+    // @ts-expect-error test stub, not a full Worker implementation
+    globalThis.Worker = SpawningWorker;
+
+    const fsClient = fakeFsClient();
+    (fsClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(new TextEncoder().encode("// entry"));
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    return { client: createProcessClient(fsClient, fakeProcessTable() as never, fetcherClient), fetcherClient };
+  };
+
+  const encoder = new TextEncoder();
+
+  it("routes 'node <script>' through the same boot path spawn() uses, not the shell-as-process worker", async () => {
+    const { client } = setup();
+
+    const resultPromise = client.runShell({ line: "node script.js", cwd: "/project" });
+    // bootProcess()'s preload step is a chain of several awaits; wait for the
+    // worker to actually be constructed rather than counting microtask ticks.
+    await vi.waitFor(() => expect(spawned).toBeDefined());
+
+    expect(spawned!.posted).toEqual([
+      expect.objectContaining({
+        type: "boot",
+        payload: expect.objectContaining({ entryPath: "/project/script.js", argv: [], cwd: "/project" }),
+      }),
+    ]);
+
+    spawned!.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("hello\n") } } } as MessageEvent);
+    spawned!.onmessage?.({ data: { type: "exit", payload: { code: 0 } } } as MessageEvent);
+
+    await expect(resultPromise).resolves.toEqual({ output: "hello\n", cwd: "/project" });
+  });
+
+  it("resolves a script path relative to cwd and forwards extra argv to the script", async () => {
+    const { client } = setup();
+
+    const resultPromise = client.runShell({ line: "node ./bin/cli.js --flag", cwd: "/project" });
+    await vi.waitFor(() => expect(spawned).toBeDefined());
+
+    expect(spawned!.posted).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({ entryPath: "/project/bin/cli.js", argv: ["--flag"] }),
+      }),
+    ]);
+
+    spawned!.onmessage?.({ data: { type: "exit", payload: { code: 0 } } } as MessageEvent);
+    await resultPromise;
+  });
+
+  it("collects both stdout and stderr into the final output", async () => {
+    const { client } = setup();
+
+    const resultPromise = client.runShell({ line: "node script.js", cwd: "/" });
+    await vi.waitFor(() => expect(spawned).toBeDefined());
+
+    spawned!.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("out\n") } } } as MessageEvent);
+    spawned!.onmessage?.({ data: { type: "stderr", payload: { chunk: encoder.encode("err\n") } } } as MessageEvent);
+    spawned!.onmessage?.({ data: { type: "exit", payload: { code: 1 } } } as MessageEvent);
+
+    await expect(resultPromise).resolves.toEqual({ output: "out\nerr\n", cwd: "/" });
+  });
+
+  it("forwards net-request from a node-via-shell script to the fetcher client", async () => {
+    const { client, fetcherClient } = setup();
+    (fetcherClient.request as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 200 });
+
+    const resultPromise = client.runShell({ line: "node script.js", cwd: "/" });
+    await vi.waitFor(() => expect(spawned).toBeDefined());
+
+    spawned!.onmessage?.({ data: { type: "net-request", payload: { id: "r1", url: "https://example.com" } } } as MessageEvent);
+    await vi.waitFor(() => expect((fetcherClient.request as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0));
+
+    expect(fetcherClient.request).toHaveBeenCalledWith({ url: "https://example.com" });
+
+    spawned!.onmessage?.({ data: { type: "exit", payload: { code: 0 } } } as MessageEvent);
+    await resultPromise;
+  });
+
+  it("rejects with a clear error when 'node' is given no script", async () => {
+    const { client } = setup();
+    await expect(client.runShell({ line: "node", cwd: "/" })).rejects.toThrow(/missing script operand/);
+  });
+
+  it("does not intercept 'node' when chained with && (falls through to the shell-as-process path)", async () => {
+    const { client } = setup();
+
+    const resultPromise = client.runShell({ line: "node script.js && echo done", cwd: "/" });
+    await Promise.resolve();
+
+    // The shell-as-process path boots via "boot-shell", not "boot".
+    expect(spawned!.posted).toEqual([expect.objectContaining({ type: "boot-shell" })]);
+
+    spawned!.onmessage?.({ data: { type: "shell-result", payload: { output: "done\n", cwd: "/" } } } as MessageEvent);
+    await expect(resultPromise).resolves.toEqual({ output: "done\n", cwd: "/" });
+  });
+
+  it("leaves ordinary (non-node) shell lines on the shell-as-process path", async () => {
+    const { client } = setup();
+
+    const resultPromise = client.runShell({ line: "echo hi", cwd: "/" });
+    await Promise.resolve();
+
+    expect(spawned!.posted).toEqual([expect.objectContaining({ type: "boot-shell" })]);
+
+    spawned!.onmessage?.({ data: { type: "shell-result", payload: { output: "hi\n", cwd: "/" } } } as MessageEvent);
+    await expect(resultPromise).resolves.toEqual({ output: "hi\n", cwd: "/" });
+  });
+});
