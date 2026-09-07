@@ -19,6 +19,15 @@ import type { NetRelay } from "./netRelay";
 import { postEvent } from "./service";
 import { spawnChildWorker } from "./spawn";
 
+// Mirrors bindings/net.ts's own private tcpXKey()/portFromTcpXKey() exactly -
+// duplicated rather than imported since net.ts doesn't export them (an
+// internal encoding detail of that file), but the format is a stable,
+// load-bearing wire contract between the two sides either way (see
+// previewRelay.ts's own copy of the same encoding).
+const TCP_XKEY_PREFIX = "\u0000dwc-tcp:";
+const portFromTcpXKey = (key: string): number | null =>
+  key.startsWith(TCP_XKEY_PREFIX) ? Number(key.slice(TCP_XKEY_PREFIX.length)) : null;
+
 interface SpawnPayload {
   entryPath: string;
   argv?: string[];
@@ -232,11 +241,6 @@ const bootProcess = async (
     // relaying bytes/EOF/close over an already-established connection.
     if (type === "net-listen") {
       netRelay.listen(processId, eventPayload.port);
-      // Also surfaced as a top-level "listen" event (dwc.addEventListener) -
-      // traced need: the host page has no other way to learn a guest
-      // process just started listening on a port, which dwc.preview's own
-      // iframe-preview flow depends on.
-      onEvent("listen", { port: eventPayload.port }, processId);
       return;
     }
     if (type === "net-close-server") {
@@ -245,6 +249,18 @@ const bootProcess = async (
     }
     if (type === "net-pipe-listen") {
       netRelay.pipeListen(processId, eventPayload.key);
+      // The top-level "listen" event (dwc.addEventListener) fires from HERE,
+      // not from net-listen above, even though both arrive from the same
+      // net.Server.listen() call (bindings/net.ts posts net-listen then
+      // net-pipe-listen, synchronously, in that order) - traced need:
+      // dwc.preview's iframe-preview flow calls netRelay.pipeConnect(),
+      // which only succeeds once THIS registration (not net-listen's) has
+      // landed. Firing from net-listen raced the host page's resulting
+      // iframe navigation against this message actually being processed -
+      // intermittently producing "nothing is listening on port N" on a
+      // fresh page's very first preview. Confirmed live.
+      const port = portFromTcpXKey(eventPayload.key);
+      if (port !== null) onEvent("listen", { port }, processId);
       return;
     }
     if (type === "net-pipe-close-server") {

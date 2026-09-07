@@ -113,7 +113,28 @@ describe("createProcessClient — net-request forwarding", () => {
   // dwc.addEventListener("listen", ({ port }) => ...) actually firing -
   // previously net-listen only updated netRelay's internal port->processId
   // map and never reached the host page at all.
-  it("posts a top-level 'listen' event to the host page when a guest process reports net-listen", async () => {
+  it("posts a top-level 'listen' event once the guest's net-pipe-listen registers the port for preview dialing", async () => {
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    const client = setup(fetcherClient);
+
+    await client.spawn({ entryPath: "/index.js" });
+    // bindings/net.ts always posts these two messages together, in this
+    // order, for one net.Server.listen(port) call.
+    spawned!.onmessage?.({ data: { type: "net-listen", payload: { port: 4321 } } } as MessageEvent);
+    spawned!.onmessage?.({ data: { type: "net-pipe-listen", payload: { key: "\u0000dwc-tcp:4321" } } } as MessageEvent);
+
+    const postMessage = (globalThis as unknown as { self: { postMessage: ReturnType<typeof vi.fn> } }).self
+      .postMessage;
+    expect(postMessage).toHaveBeenCalledWith({ type: "listen", payload: { port: 4321 } });
+  });
+
+  // Traced need (root cause of an intermittent "nothing is listening on
+  // port N" on a fresh page's very first preview): firing "listen" from
+  // net-listen raced the host page's resulting iframe navigation against
+  // net-pipe-listen - the message dwc.preview.fetch()'s netRelay.pipeConnect()
+  // actually depends on - landing first. This pins the fix to the message
+  // that matters, not just the one that arrives first.
+  it("does not post a top-level 'listen' event from net-listen alone, before net-pipe-listen arrives", async () => {
     const fetcherClient: FetcherClient = { request: vi.fn() };
     const client = setup(fetcherClient);
 
@@ -122,7 +143,19 @@ describe("createProcessClient — net-request forwarding", () => {
 
     const postMessage = (globalThis as unknown as { self: { postMessage: ReturnType<typeof vi.fn> } }).self
       .postMessage;
-    expect(postMessage).toHaveBeenCalledWith({ type: "listen", payload: { port: 4321 } });
+    expect(postMessage).not.toHaveBeenCalledWith({ type: "listen", payload: { port: 4321 } });
+  });
+
+  it("does not post a top-level 'listen' event for a net-pipe-listen that isn't a TCP port (a real named pipe)", async () => {
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    const client = setup(fetcherClient);
+
+    await client.spawn({ entryPath: "/index.js" });
+    spawned!.onmessage?.({ data: { type: "net-pipe-listen", payload: { key: "/tmp/my.sock" } } } as MessageEvent);
+
+    const postMessage = (globalThis as unknown as { self: { postMessage: ReturnType<typeof vi.fn> } }).self
+      .postMessage;
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "listen" }));
   });
 
   it("does not touch the fetcher client for stdout/stderr/exit messages", async () => {
