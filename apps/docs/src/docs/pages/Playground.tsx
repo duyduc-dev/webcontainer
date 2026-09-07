@@ -6,6 +6,26 @@ import { useEffect, useRef, useState } from 'react';
 import DocPage from '../components/DocPage';
 
 const RESTART_DEBOUNCE_MS = 600;
+const STORAGE_KEY = 'dwc-playground-code';
+
+/** Best-effort - localStorage can throw (private browsing, disabled site
+ * data) or simply not persist across a reload; either way the demo still
+ * works, it just falls back to the example each time. */
+const loadStoredCode = (): string | null => {
+  try {
+    return window.localStorage.getItem(STORAGE_KEY);
+  } catch {
+    return null;
+  }
+};
+
+const storeCode = (value: string): void => {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, value);
+  } catch {
+    // ignore - see loadStoredCode
+  }
+};
 
 const DEFAULT_CODE = `const http = require("http");
 let hits = 0;
@@ -43,12 +63,16 @@ function Playground() {
   const dwcRef = useRef<ReturnType<typeof bootDWC> | null>(null);
   const bootedRef = useRef(false);
   const runIdRef = useRef(0);
-  const codeRef = useRef(DEFAULT_CODE);
+  const codeRef = useRef<string>(DEFAULT_CODE);
   const procRef = useRef<ProcessHandle | null>(null);
   const restartTimerRef = useRef<number | undefined>(undefined);
   const theme = useSystemTheme();
 
-  const [code, setCode] = useState(DEFAULT_CODE);
+  const [code, setCode] = useState(() => {
+    const initial = loadStoredCode() ?? DEFAULT_CODE;
+    codeRef.current = initial;
+    return initial;
+  });
   const [output, setOutput] = useState('');
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const [status, setStatus] = useState<'booting' | 'idle' | 'running' | 'error'>('booting');
@@ -151,11 +175,19 @@ function Playground() {
   const handleChange = (value: string) => {
     setCode(value);
     codeRef.current = value;
+    storeCode(value);
     if (restartTimerRef.current !== undefined) window.clearTimeout(restartTimerRef.current);
     restartTimerRef.current = window.setTimeout(() => {
       restartTimerRef.current = undefined;
       run();
     }, RESTART_DEBOUNCE_MS);
+  };
+
+  const resetToExample = () => {
+    storeCode(DEFAULT_CODE);
+    setCode(DEFAULT_CODE);
+    codeRef.current = DEFAULT_CODE;
+    run();
   };
 
   return (
@@ -170,14 +202,24 @@ function Playground() {
             <span className="font-mono text-[11.5px] tracking-[0.02em] text-[var(--color-text-faint)]">
               /project/server.js
             </span>
-            <button
-              className="border border-[var(--color-accent)] bg-[var(--color-accent)] px-3 py-1 font-mono text-[12px] font-semibold text-[var(--color-accent-ink)] disabled:opacity-50"
-              disabled={status === 'booting'}
-              onClick={run}
-              type="button"
-            >
-              {status === 'booting' ? 'booting…' : status === 'running' ? 'running' : 'Run now'}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                className="border border-[var(--color-border)] bg-transparent px-3 py-1 font-mono text-[12px] text-[var(--color-text-faint)] hover:text-[var(--color-text)] disabled:opacity-50"
+                disabled={status === 'booting'}
+                onClick={resetToExample}
+                type="button"
+              >
+                Reset
+              </button>
+              <button
+                className="border border-[var(--color-accent)] bg-[var(--color-accent)] px-3 py-1 font-mono text-[12px] font-semibold text-[var(--color-accent-ink)] disabled:opacity-50"
+                disabled={status === 'booting'}
+                onClick={run}
+                type="button"
+              >
+                {status === 'booting' ? 'booting…' : status === 'running' ? 'running' : 'Run now'}
+              </button>
+            </div>
           </div>
           <CodeMirror
             basicSetup={{ foldGutter: false }}
@@ -222,7 +264,8 @@ function Playground() {
       <p className="text-[13px] text-[var(--color-text-faint)]">
         Runs entirely in your browser — no request leaves this tab except the initial page load. Cross-origin
         isolation isn't enabled on this page, so <code>fs.*Sync</code>/<code>execFileSync</code> aren't available
-        here; everything used in the default example doesn't need them.
+        here; everything used in the default example doesn't need them. Your edits are saved to this browser
+        only (<code>localStorage</code>) — <strong>Reset</strong> brings back the original example.
       </p>
     </DocPage>
   );
