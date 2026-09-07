@@ -111,6 +111,7 @@ function Playground() {
 
     const dwc = bootDWC();
     dwcRef.current = dwc;
+    (window as any).__dwc = dwc;
 
     dwc.addEventListener('listen', (payload) => {
       // Bump unconditionally (not reset to a fixed value) - a respawn can
