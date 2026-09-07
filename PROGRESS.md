@@ -40,7 +40,22 @@ the earliest timer is due) instead of giving up early. This is foundational
 with nothing else keeping the process alive (debounce logic, retry
 backoff, connection timeouts — all common in dev-server tooling like Vite).
 
-## 2. Dev-server preview (StackBlitz/vivari-style) — Phases 1–2 DONE, Phase 3 IN PROGRESS with one open bug
+**A second, related side-effect bug** found in a later session, once
+`main.ts` actually exercised a full `npm install left-pad` run through the
+normal boot path (not just the ad-hoc fork script from the first pass):
+`process.stdout`/`stderr.write()` in `workers/process/worker.ts` accepted an
+optional `callback` argument but silently dropped it. Real npm's own
+`lib/cli/exit-handler.js` flushes via
+`stderr.write('', () => stdout.write('', () => process.exit(...)))`
+specifically to avoid hanging on things like the update notifier — with the
+callback dropped, `process.exit()` was never reached, and the guest process
+hung forever right after its last real output (`npm install` would print
+`added 1 package in Ns` and then simply never exit). `--no-audit --no-fund`
+does **not** work around this — it's unrelated to which post-install network
+calls run. Fixed by threading `eventLoop.nextTick` through
+`createWritableStream()`.
+
+## 2. Dev-server preview (StackBlitz/vivari-style) — Phases 1–3 DONE
 
 Goal: run something like `npm run dev` (Vite) inside the sandbox and see it
 rendered live in the host page, the way StackBlitz/vivari do. Researched
@@ -96,11 +111,53 @@ Verified live: `dwc.preview.fetch(port, path)` from the host page correctly
 reached a server running in a spawned guest process and got back a byte-
 correct HTTP response (status/headers/body).
 
-### Phase 3 — Service Worker + iframe (the actual visual preview) — IN PROGRESS, NOT YET WORKING, NOT COMMITTED
+### Phase 3 — Service Worker + iframe (the actual visual preview) — DONE
 
-**Uncommitted files right now** (all present in the working tree, all
+Confirmed working end-to-end: `iframe.src = dwc.preview.url(port, path)`
+renders the real guest `http.createServer()` response inside the iframe,
+verified via a real (non-`claude-in-chrome`) Playwright-driven Chromium run —
+`frame.contentDocument.body.innerHTML` came back with the guest server's
+actual HTML.
+
+**Two real, unrelated bugs were found and fixed to get here** (neither of
+the two hypotheses guessed at the end of the previous session was quite
+right):
+
+1. **A guest-process hang, unrelated to preview** that was silently blocking
+   every demo downstream of it (including the preview demo itself, which
+   never even got a chance to run). `process.stdout`/`stderr.write()` in
+   `workers/process/worker.ts` accepted a `callback` argument but silently
+   dropped it. Real npm's own `lib/cli/exit-handler.js` flushes as
+   `stderr.write('', () => stdout.write('', () => process.exit(...)))`
+   specifically so it "doesn't hang on things like the update notifier"
+   instead of relying on the event loop draining naturally — with the
+   callback dropped, `process.exit()` was never reached, and the guest
+   process hung forever right after its last real output (visible as e.g.
+   `npm install` stopping dead right after printing `added 1 package in Ns`,
+   with no exit event ever following). Fixed by threading `eventLoop.nextTick`
+   through `createWritableStream()` and invoking the callback there.
+2. **The actual Phase 3 bug**: `net::ERR_BLOCKED_BY_RESPONSE` on the iframe
+   navigation. Root cause: Cross-Origin-Resource-Policy (already set, see
+   below) only covers cross-origin *subresources* under COEP — a **framed
+   document** is a separate rule. When the embedding page has
+   `Cross-Origin-Embedder-Policy: require-corp`, every nested iframe's own
+   document response (same-origin or not) must ALSO carry a compatible COEP
+   header, or Chromium blocks the navigation outright. Neither hypothesis
+   from the previous session (a genuine-but-undocumented async-navigation
+   timing bug, or an artifact of the `claude-in-chrome` automation extension)
+   was it — the previous session's plain-`fetch()` test never exercised a
+   real *navigation* response at all, so it never hit this. Fixed by adding
+   `Cross-Origin-Embedder-Policy: require-corp` alongside the existing CORP
+   header on every response `PreviewServiceWorker.ts` synthesizes.
+
+`event.waitUntil()` alongside `event.respondWith()` was also added
+defensively (candidate (a) from the previous session's list) — harmless,
+possibly unnecessary, left in since it's standard practice for async SW
+responses.
+
+**Previously-uncommitted files, now confirmed working** (all
 typecheck/test clean — `cd packages/core && npx tsc --noEmit -p
-tsconfig.json && npx vitest run` was green on the last check):
+tsconfig.json && npx vitest run` is green):
 
 - `packages/core/src/apis/previewProtocol.ts` (new) — tiny shared types
   (`PREVIEW_SCOPE_PREFIX`, `PreviewRelayRequest`/`PreviewRelayResponse`)
@@ -138,83 +195,22 @@ tsconfig.json && npx vitest run` was green on the last check):
 **What's verified working:**
 
 - The full relay pipeline (SW → host page → kernel → guest `http.Server`)
-  is 100% correct: a plain `fetch("/__dwc_preview__/<port>/")` call from
-  the host page (not iframe navigation, just a normal fetch that the SW
-  also intercepts) returns the exact right status/headers/body from the
-  real guest server, every time, verified repeatedly with fresh servers.
+  is 100% correct: both a plain `fetch("/__dwc_preview__/<port>/")` call
+  from the host page AND a real `<iframe>` navigation return the exact
+  right status/headers/body from the real guest server.
 - The Service Worker registers correctly, activates, claims clients, and
-  the `Service-Worker-Allowed`/`Cross-Origin-Resource-Policy: cross-origin`
-  headers are present and correct on its responses (the latter is required
-  because this playground's page has `Cross-Origin-Embedder-Policy:
-  require-corp` set for `SharedArrayBuffer`, and Chrome enforces COEP on
-  every nested browsing context it embeds — even a same-origin iframe needs
-  a permissive CORP header on its own response, or the embed is silently
-  blocked. This was one real, non-obvious bug already found and fixed in
-  `PreviewServiceWorker.ts`.)
+  the `Service-Worker-Allowed`/`Cross-Origin-Resource-Policy: cross-origin`/
+  `Cross-Origin-Embedder-Policy: require-corp` headers are present and
+  correct on its responses (see the two bugs above for why both COEP-related
+  headers are required).
+- `iframe.src = dwc.preview.url(port, path)` renders correctly:
+  `frame.contentDocument.body.innerHTML` reflects the real guest server's
+  HTML, verified via Playwright.
 
-**What's NOT working yet — the open bug:**
-
-Setting `iframe.src = dwc.preview.url(port, path)` does not render. The
-iframe shows a broken/failed-to-load state; `frame.contentDocument` stays
-inaccessible. This is despite the underlying response being byte-correct
-(proven via the plain `fetch()` test above, and via the CORP header fix).
-
-**Debugging done so far, and the key finding:** isolated the exact
-condition with a series of minimal, hand-written test Service Workers
-(created temporarily under `examples/playground/public/test-*.js`, since
-deleted — not part of the diff):
-
-1. A SW that returns a **synchronous** `new Response(...)` for an iframe
-   navigation: **works**, iframe renders fine, `contentDocument` accessible.
-2. The exact same SW, but with `event.respondWith((async () => { await new
-   Promise(r => setTimeout(r, 50)); return new Response(...) })())` — i.e.
-   the *only* change is adding a 50ms delay before resolving: **breaks**,
-   same broken-iframe symptom as the real PreviewServiceWorker.
-3. The same 50ms-delayed SW response, but as a **top-level** navigation
-   (`navigate(tabId, ".../async-test/")` instead of an iframe): **works
-   fine**, renders correctly, no delay-related problem at all.
-
-So the reproducible rule in this testing setup is: **an asynchronously-
-resolved Service Worker response to a *sub-frame* (iframe) navigation
-fails to render, while the identical response resolved synchronously, or
-resolved asynchronously for a *top-level* navigation, both work fine.**
-
-This was being investigated when work stopped. Two live hypotheses, neither confirmed:
-
-- **A genuine Chromium behavior** specific to async SW responses for iframe
-  (not top-level) navigations under COEP. This would be surprising — async
-  SW-intercepted navigation responses are an extremely common, well-
-  established pattern (offline-first PWAs rely on exactly this) — but
-  hasn't been ruled out, and the interaction with COEP specifically wasn't
-  something clearly documented that was found during this session.
-- **An artifact of the `claude-in-chrome` browser-automation extension**
-  used to drive this testing session specifically — e.g. the extension's
-  own content-script injection into frames might not reliably re-attach
-  after a delayed navigation completes, making `contentDocument` access
-  *from the automation tooling* unreliable even if a real end-user's
-  browser rendered the iframe correctly underneath. This was flagged as
-  plausible but not verified either way (would need testing in a normal,
-  non-automated Chrome window/profile to distinguish from the first
-  hypothesis).
-
-**Next step for whoever picks this up:** test the iframe flow in an
-ordinary Chrome tab, driven by hand (not through the `claude-in-chrome`
-extension) — if it renders correctly there, the bug is in the automation
-tooling and Phase 3's implementation is already correct as committed-ready;
-if it *also* fails in a normal browser, the async-iframe-navigation timing
-issue is real and needs a different fix (candidates to try: forcing the SW
-to `event.waitUntil()` in addition to `respondWith()`; checking whether
-`Response.clone()` or a fresh `Response` object constructed at the very
-end (not `await`ed through a stored variable) changes anything; checking
-whether disabling COEP entirely on the playground makes the async-iframe
-case work, which would confirm/deny the COEP-specific half of the first
-hypothesis in isolation).
-
-Do **not** commit `previewProtocol.ts`/`PreviewServiceWorker.ts`/the
-`Preview.ts`/`tsup.config.ts`/`package.json` changes until Phase 3 is
-confirmed actually working end-to-end (iframe rendering, not just the
-underlying fetch relay) — they're left uncommitted in the working tree
-specifically so that determination can still be made before they land.
+The three hand-written test Service Workers used mid-session to isolate the
+earlier (now-understood-to-be-a-red-herring) sync-vs-async/iframe-vs-top-level
+distinction were temporary and already deleted — the real fix ended up being
+unrelated to sync/async timing entirely.
 
 ## Next plan
 
@@ -223,40 +219,16 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-1. **Resolve the Phase 3 iframe bug** (see above). Concretely:
-   - Open the playground in a normal, hand-driven Chrome window (not
-     through `claude-in-chrome`). Register the SW, spawn a guest
-     `http.createServer()`, point the iframe at `dwc.preview.url(port)`.
-   - If it renders correctly by hand: the automation tooling was the
-     confound. Phase 3's code is done — just commit the files listed above
-     as uncommitted, then move to step 2.
-   - If it *also* fails by hand: the async-iframe-navigation issue is
-     real. Try, in order: (a) add `event.waitUntil(relayPromise)` alongside
-     `event.respondWith()` in `PreviewServiceWorker.ts`'s fetch handler,
-     in case iframe navigations need the extended-lifetime signal
-     `waitUntil` provides on top of what `respondWith` alone guarantees;
-     (b) temporarily strip `Cross-Origin-Embedder-Policy`/
-     `Cross-Origin-Opener-Policy` from `vite.config.ts`'s
-     `crossOriginIsolationHeaders()` and retest — if the async-iframe case
-     starts working with COEP off, the bug is a genuine COEP+SW+iframe
-     interaction and the fix likely has to live in how the response is
-     constructed (worth searching Chromium bug tracker / web.dev for
-     "service worker iframe navigation COEP" once confirmed); (c) as a
-     fallback, consider whether Phase 3 even needs the iframe to receive
-     the *first* navigation via the SW at all — an alternative is loading
-     the iframe from a same-origin static shell first (`about:blank` or a
-     trivial static page, which doesn't go through the SW) and then having
-     that shell's own script drive the real content in via
-     `dwc.preview.fetch()` + `document.write()`/DOM manipulation, sidestepping
-     SW-intercepted navigation for the top document entirely (sub-resource
-     fetches from an already-loaded document are confirmed working fine
-     even async, per the plain-`fetch()` test above — it's specifically
-     the *navigation* case in question).
+1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
+   unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
+   every guest process after its last output, and a missing
+   `Cross-Origin-Embedder-Policy` header on framed-document responses under
+   COEP), neither of which was either hypothesis this doc previously listed.
 
-2. **Commit Phase 3** once actually confirmed working, then update the
-   playground's `main.ts` with a real demo (spawn a small `http` server,
-   `enable()` the preview, point the iframe at it) so the feature is
-   exercised by the playground itself, not just by ad-hoc test scripts.
+2. ~~Commit Phase 3, update `main.ts` with a real demo~~ — **DONE.**
+   `examples/playground/src/main.ts` now spawns a guest `http.createServer()`,
+   calls `dwc.preview.enable()`, and points `<iframe id="preview">` at it,
+   verified rendering the real server's HTML.
 
 3. **Vite dev server, real end-to-end.** This is where new, currently-
    unknown gaps will surface, the same way `npm install` did — budget for
