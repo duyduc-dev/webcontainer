@@ -57,6 +57,11 @@ let exited = false;
 const pendingNetRequests = new Map<string, { resolve: (reply: NetReply) => void; reject: (error: unknown) => void }>();
 const pendingPipeConnects = new Map<string, { resolve: (v: { connId: number }) => void; reject: (error: unknown) => void }>();
 let pipeMessageHandler: ((msg: PipeRelayMessage) => void) | null = null;
+// Set inside boot() once process.stdin (a real vendored Readable) exists -
+// routes an incoming "stdin" message (dwc.process.spawn()'s host-facing
+// .stdin WritableStream, relayed through the kernel) into it. null until
+// boot() runs, same as pipeMessageHandler right above.
+let stdinPush: ((chunk: Uint8Array) => void) | null = null;
 const childSpawnHandlers = new Map<string, ChildProcessSpawnHandlers>();
 const pendingChildExecs = new Map<
   string,
@@ -390,6 +395,23 @@ const boot = async (payload: BootPayload): Promise<void> => {
   };
   const vendoredBuiltins = createBuiltinModules(processGlobal, netContext);
 
+  // process.stdin - a real vendored Readable (the same class require('stream')
+  // hands guest code, not a hand-rolled stand-in), pushed into from the
+  // "stdin" message case in self.onmessage below (see stdinPush's own doc
+  // comment). Traced need: real npm's own `read` dependency (used by
+  // promzard/npm init's y/n prompts) does
+  // `readline.createInterface({ input: process.stdin, ... })` - there was
+  // previously no path AT ALL for host-written stdin bytes to reach guest
+  // code; dwc.process.spawn()'s `.stdin` WritableStream sent PROCESS_STDIN
+  // requests that had no handler anywhere and were silently dropped.
+  const { Readable } = vendoredBuiltins.stream as { Readable: new (opts: { read(): void }) => { push(chunk: unknown): boolean } };
+  const { Buffer: BufferCtorForStdin } = vendoredBuiltins.buffer as { Buffer: { from(bytes: Uint8Array): unknown } };
+  const stdin = new Readable({ read() {} });
+  stdinPush = (chunk) => {
+    stdin.push(BufferCtorForStdin.from(chunk));
+  };
+  processGlobal.stdin = stdin;
+
   // Real Node's process is an EventEmitter (uncaughtException/unhandledRejection
   // listeners, npm's own proc-log wiring via process.emit('log'/'output', ...)) -
   // ours was a plain object until now, which every one of those calls would throw
@@ -588,4 +610,5 @@ self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   else if (event.data.type === "net-pipe-message") pipeMessageHandler?.(event.data.payload as PipeRelayMessage);
   else if (event.data.type === "cp-event") handleChildProcessEvent(event.data.payload as Parameters<typeof handleChildProcessEvent>[0]);
   else if (event.data.type === "cp-exec-response") handleChildExecResponse(event.data.payload as Parameters<typeof handleChildExecResponse>[0]);
+  else if (event.data.type === "stdin") stdinPush?.((event.data.payload as { chunk: Uint8Array }).chunk);
 };

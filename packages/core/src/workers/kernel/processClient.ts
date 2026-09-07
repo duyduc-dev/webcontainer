@@ -23,9 +23,22 @@ interface ShellExecPayload {
   cwd?: string;
 }
 
+interface StdinPayload {
+  processId: string;
+  chunk: Uint8Array;
+}
+
 interface ProcessClient {
   spawn(payload: SpawnPayload): Promise<{ processId: string }>;
   runShell(payload: ShellExecPayload): Promise<{ output: string; cwd: string }>;
+  /** Forwards a chunk written to dwc.process.spawn()'s returned `.stdin`
+   * WritableStream (host side) to the real, already-running guest process
+   * (apis/Process.ts's createForwardingWritableStream). Silently a no-op
+   * for an unknown/already-exited processId, matching how a real Node
+   * stream write past its consumer's lifetime is simply unobserved rather
+   * than a hard error - the host side already treats this call as
+   * fire-and-forget (`.catch(() => {})`). */
+  stdin(payload: StdinPayload): void;
 }
 
 interface BootProcessPayload {
@@ -129,6 +142,7 @@ const bootProcess = async (
     name: `Process:${processId}`,
   });
   netRelay.registerWorker(processId, worker);
+  processTable.setWorker(processId, worker);
   onWorkerCreated?.(worker);
 
   // child_process.spawn()'d children of THIS process: tracked by the spawn
@@ -373,8 +387,12 @@ const createProcessClient = (
     return { output, cwd };
   };
 
-  return { spawn, runShell };
+  const stdin = (payload: StdinPayload): void => {
+    processTable.getWorker(payload.processId)?.postMessage({ type: "stdin", payload: { chunk: payload.chunk } });
+  };
+
+  return { spawn, runShell, stdin };
 };
 
 export { createProcessClient };
-export type { ProcessClient, ShellExecPayload, SpawnPayload };
+export type { ProcessClient, ShellExecPayload, SpawnPayload, StdinPayload };

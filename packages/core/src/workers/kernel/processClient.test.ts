@@ -25,10 +25,15 @@ const fakeFsClient = (): FsClient =>
 
 const fakeProcessTable = () => {
   let counter = 0;
+  const workers = new Map<string, unknown>();
   return {
     register: vi.fn(() => ({ id: `p${++counter}` })),
     remove: vi.fn(),
     list: vi.fn(() => []),
+    setWorker: vi.fn((id: string, worker: unknown) => {
+      workers.set(id, worker);
+    }),
+    getWorker: vi.fn((id: string) => workers.get(id)),
   };
 };
 
@@ -109,6 +114,25 @@ describe("createProcessClient — net-request forwarding", () => {
     spawned!.onmessage?.({ data: { type: "stdout", payload: { chunk: new Uint8Array() } } } as MessageEvent);
 
     expect(fetcherClient.request).not.toHaveBeenCalled();
+  });
+
+  it("stdin() posts a chunk to the real process Worker previously registered for that processId (dwc.process.spawn()'s host-facing .stdin writable stream)", async () => {
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    const client = setup(fetcherClient);
+
+    const { processId } = await client.spawn({ entryPath: "/index.js" });
+    const chunk = new TextEncoder().encode("y\n");
+    client.stdin({ processId, chunk });
+
+    expect(spawned!.posted).toContainEqual({ type: "stdin", payload: { chunk } });
+  });
+
+  it("stdin() for an unknown/already-exited processId is a silent no-op, not a throw", async () => {
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    const client = setup(fetcherClient);
+    await client.spawn({ entryPath: "/index.js" });
+
+    expect(() => client.stdin({ processId: "no-such-process", chunk: new Uint8Array() })).not.toThrow();
   });
 });
 

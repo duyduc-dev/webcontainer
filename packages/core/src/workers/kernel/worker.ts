@@ -7,7 +7,7 @@ import type { NetRequestPayload } from "./fetcherClient";
 import { createFsClient } from "./fsClient";
 import { createNetRelay } from "./netRelay";
 import { createProcessClient } from "./processClient";
-import type { ShellExecPayload, SpawnPayload } from "./processClient";
+import type { ShellExecPayload, SpawnPayload, StdinPayload } from "./processClient";
 import { fetchFromGuestServer } from "./previewRelay";
 import type { PreviewFetchInit } from "./previewRelay";
 import { postErrorReply, postReply } from "./service";
@@ -28,6 +28,10 @@ router.handle("PROCESS_LIST", () => processTable.list());
 router.handle("FS_REQUEST", (payload) => fsClient.request(payload));
 router.handle("NET_REQUEST", (payload) => fetcherClient.request(payload as NetRequestPayload));
 router.handle("PROCESS_SPAWN", (payload) => processClient.spawn(payload as SpawnPayload));
+router.handle("PROCESS_STDIN", (payload) => {
+  processClient.stdin(payload as StdinPayload);
+  return undefined;
+});
 router.handle("SHELL_EXEC", (payload) => processClient.runShell(payload as ShellExecPayload));
 router.handle("PREVIEW_FETCH", (payload) => {
   const { port, path, init } = payload as { port: number; path: string; init?: PreviewFetchInit };
