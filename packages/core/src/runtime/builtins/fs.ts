@@ -98,7 +98,21 @@ interface FsBuiltin extends FsBuiltinCore {
   open(path: string, flags: string, mode: number, callback: NodeCallback<number>): void;
   open(path: string, flags: string, callback: NodeCallback<number>): void;
   openSync(path: string, flags: string, mode?: number): number;
-  read(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: NodeCallback<number>): void;
+  read(
+    fd: number,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number | null,
+    // Real Node's fs.read callback is (err, bytesRead, buffer) - THREE
+    // arguments, not NodeCallback<number>'s two. fs-minipass's ReadStream
+    // (real tar's own dependency) destructures all three positionally
+    // (`[_onread] (er, br, buf)`) and does `buf.length` unconditionally in
+    // `_handleChunk` - a callback that drops the third argument hands it
+    // undefined there, crashing with "Cannot read properties of undefined
+    // (reading 'length')" deep inside vendored, unmodified npm code.
+    callback: (error: unknown, bytesRead?: number, buffer?: Uint8Array) => void,
+  ): void;
   readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number;
   write(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: NodeCallback<number>): void;
   writeSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number;
@@ -454,7 +468,7 @@ const createFsBuiltin = (
   const read: FsBuiltin["read"] = (fd, buffer, offset, length, position, callback) => {
     nextTick(() => {
       try {
-        callback(null, readSync(fd, buffer, offset, length, position));
+        callback(null, readSync(fd, buffer, offset, length, position), buffer);
       } catch (error) {
         callback(error);
       }
@@ -591,8 +605,29 @@ const createFsPromisesBuiltin = (fs: FsBuiltin, nextTick: (callback: () => void)
     return toPromise(() => (options ? fs.readFileSync(path, options) : fs.readFileSync(path)));
   }
 
+  // Real Node's fs.promises.open() FileHandle - traced need: bin-links'
+  // fix-bin.js does `const { open } = require('fs/promises')` then
+  // `open(file, 'r').then(fh => fh.read(buf, 0, 2048, 0)...fh.close())` to
+  // sniff a freshly-linked bin script for a Windows-style hashbang line.
+  // Only the handful of FileHandle methods real npm's own dependency tree
+  // actually calls are implemented - not the full fs.promises.FileHandle
+  // surface.
+  const open = (path: string, flags: string, mode?: number) =>
+    toPromise(() => {
+      const fd = fs.openSync(path, flags, mode);
+      return {
+        fd,
+        read: (buffer: Uint8Array, offset: number, length: number, position: number | null) =>
+          toPromise(() => ({ bytesRead: fs.readSync(fd, buffer, offset, length, position), buffer })),
+        write: (buffer: Uint8Array, offset: number, length: number, position: number | null) =>
+          toPromise(() => ({ bytesWritten: fs.writeSync(fd, buffer, offset, length, position), buffer })),
+        close: () => toPromise(() => fs.closeSync(fd)),
+      };
+    });
+
   return {
     readFile,
+    open,
     writeFile: (path: string, contents: string | Uint8Array) => toPromise(() => fs.writeFileSync(path, contents)),
     appendFile: (path: string, contents: string | Uint8Array) => toPromise(() => fs.appendFileSync(path, contents)),
     mkdir: (path: string, options?: { recursive?: boolean }) => toPromise(() => fs.mkdirSync(path, options)),

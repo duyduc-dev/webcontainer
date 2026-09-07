@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { createVirtualFileSystem } from "../../kernel/fs/VirtualFileSystem";
-import { executeFsRequest } from "../../kernel/fs/syncServer";
+import { createSyncFsServerState, executeFsRequest } from "../../kernel/fs/syncServer";
 import { createFsBuiltin, createFsPromisesBuiltin } from "./fs";
 import type { FsBuiltinIO } from "./fs";
 
 const makeIO = (): FsBuiltinIO => {
   const vfs = createVirtualFileSystem();
-  return { callSync: (request) => executeFsRequest(vfs, request) };
+  const state = createSyncFsServerState();
+  return { callSync: (request) => executeFsRequest(vfs, state, request) };
 };
 
 describe("createFsBuiltin", () => {
@@ -446,6 +447,20 @@ describe("createFsPromisesBuiltin", () => {
 
     const result = await fsPromises.readFile("/a.txt");
     expect(result.toString()).toBe("wrapped:hi");
+  });
+
+  it("open() returns a FileHandle whose read()/close() work (real npm's own bin-links sniffs a script's hashbang line this way)", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const fsPromises = createFsPromisesBuiltin(fs, (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/script.js", "#!/usr/bin/env node\nconsole.log('hi');\n");
+
+    const fh = await fsPromises.open("/script.js", "r");
+    const buf = new Uint8Array(8);
+    const { bytesRead, buffer } = await fh.read(buf, 0, 8, 0);
+    expect(bytesRead).toBe(8);
+    expect(buffer).toBe(buf); // real Node hands back the SAME buffer it was given
+    expect(new TextDecoder().decode(buf)).toBe("#!/usr/b");
+    await fh.close();
   });
 
   it("resolves every call through the provided nextTick, not a bare native microtask", async () => {
