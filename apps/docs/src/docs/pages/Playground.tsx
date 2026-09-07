@@ -104,8 +104,12 @@ function Playground() {
     dwcRef.current = dwc;
 
     dwc.addEventListener('listen', (payload) => {
+      // Bump unconditionally (not reset to a fixed value) - a respawn can
+      // land on the exact same port, producing the exact same URL string,
+      // and the iframe still needs to remount against the new process
+      // behind it rather than keep whatever it already loaded.
       previewRetriesRef.current = 0;
-      setPreviewNonce(0);
+      setPreviewNonce((n) => n + 1);
       setPreviewSrc(dwc.preview.url((payload as { port: number }).port));
     });
 
@@ -143,8 +147,6 @@ function Playground() {
     // and re-spawning on a file change rather than leaking the old server.
     procRef.current?.kill();
     procRef.current = null;
-    previewRetriesRef.current = 0;
-    setPreviewNonce(0);
     setPreviewSrc(null);
 
     const thisRun = ++runIdRef.current;
@@ -369,14 +371,14 @@ function Playground() {
                 className="flex-1 bg-white"
                 key={`${previewSrc}#${previewNonce}`}
                 onLoad={(event) => {
-                  // A fresh page's very first preview occasionally beats the
-                  // Service Worker's own registration-vs-navigation timing
-                  // by a beat (a browser-level race, not this library's -
-                  // the same request always succeeds a moment later, see
-                  // Preview.ts/PreviewServiceWorker.ts's own comments for
-                  // the parts of this path that ARE this library's and are
-                  // fixed, not raced). Bounded, same-origin same as any
-                  // dev-tool reconnect-on-first-connect retry.
+                  // A fresh page's very first preview occasionally comes up
+                  // against a dead process id - re-navigating the same URL
+                  // never recovers from this (confirmed live: it's not a
+                  // moment-later timing blip, something about that specific
+                  // process/port pairing is actually gone), but a full
+                  // respawn always does, exactly like clicking "Run now"
+                  // does today. Bounded, same as any dev-tool
+                  // reconnect-on-first-connect retry.
                   if (previewRetriesRef.current >= MAX_PREVIEW_RETRIES) return;
                   let text = '';
                   try {
@@ -386,7 +388,7 @@ function Playground() {
                   }
                   if (!text.includes('dwc preview relay error')) return;
                   previewRetriesRef.current += 1;
-                  window.setTimeout(() => setPreviewNonce((n) => n + 1), PREVIEW_RETRY_DELAY_MS);
+                  window.setTimeout(() => run(), PREVIEW_RETRY_DELAY_MS);
                 }}
                 src={previewSrc}
                 title="Live preview"
