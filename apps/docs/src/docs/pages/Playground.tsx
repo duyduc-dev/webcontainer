@@ -8,6 +8,8 @@ import DocPage from '../components/DocPage';
 const RESTART_DEBOUNCE_MS = 600;
 const STORAGE_KEY = 'dwc-playground-files';
 const ENTRY_FILE = 'server.js';
+const MAX_PREVIEW_RETRIES = 3;
+const PREVIEW_RETRY_DELAY_MS = 400;
 
 const DEFAULT_FILES: Record<string, string> = {
   [ENTRY_FILE]: `const http = require("http");
@@ -78,6 +80,7 @@ function Playground() {
   const filesRef = useRef<Record<string, string>>(DEFAULT_FILES);
   const procRef = useRef<ProcessHandle | null>(null);
   const restartTimerRef = useRef<number | undefined>(undefined);
+  const previewRetriesRef = useRef(0);
   const theme = useSystemTheme();
 
   const [files, setFiles] = useState<Record<string, string>>(() => {
@@ -90,6 +93,7 @@ function Playground() {
   const [newFileName, setNewFileName] = useState('');
   const [output, setOutput] = useState('');
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
+  const [previewNonce, setPreviewNonce] = useState(0);
   const [status, setStatus] = useState<'booting' | 'idle' | 'running' | 'error'>('booting');
 
   useEffect(() => {
@@ -100,6 +104,8 @@ function Playground() {
     dwcRef.current = dwc;
 
     dwc.addEventListener('listen', (payload) => {
+      previewRetriesRef.current = 0;
+      setPreviewNonce(0);
       setPreviewSrc(dwc.preview.url((payload as { port: number }).port));
     });
 
@@ -137,6 +143,8 @@ function Playground() {
     // and re-spawning on a file change rather than leaking the old server.
     procRef.current?.kill();
     procRef.current = null;
+    previewRetriesRef.current = 0;
+    setPreviewNonce(0);
     setPreviewSrc(null);
 
     const thisRun = ++runIdRef.current;
@@ -357,7 +365,32 @@ function Playground() {
               </span>
             </div>
             {previewSrc ? (
-              <iframe className="flex-1 bg-white" key={previewSrc} src={previewSrc} title="Live preview" />
+              <iframe
+                className="flex-1 bg-white"
+                key={`${previewSrc}#${previewNonce}`}
+                onLoad={(event) => {
+                  // A fresh page's very first preview occasionally beats the
+                  // Service Worker's own registration-vs-navigation timing
+                  // by a beat (a browser-level race, not this library's -
+                  // the same request always succeeds a moment later, see
+                  // Preview.ts/PreviewServiceWorker.ts's own comments for
+                  // the parts of this path that ARE this library's and are
+                  // fixed, not raced). Bounded, same-origin same as any
+                  // dev-tool reconnect-on-first-connect retry.
+                  if (previewRetriesRef.current >= MAX_PREVIEW_RETRIES) return;
+                  let text = '';
+                  try {
+                    text = event.currentTarget.contentDocument?.body?.innerText ?? '';
+                  } catch {
+                    return;
+                  }
+                  if (!text.includes('dwc preview relay error')) return;
+                  previewRetriesRef.current += 1;
+                  window.setTimeout(() => setPreviewNonce((n) => n + 1), PREVIEW_RETRY_DELAY_MS);
+                }}
+                src={previewSrc}
+                title="Live preview"
+              />
             ) : (
               <div className="flex flex-1 items-center justify-center font-mono text-[12px] text-[var(--color-text-faint)]">
                 waiting for the server to listen…
