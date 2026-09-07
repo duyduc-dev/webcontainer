@@ -47,8 +47,20 @@ interface ModuleRecord {
   exports: unknown;
 }
 
+/** The exact same require() a CJS caller at `fromPath` would get, `.resolve`
+ * included (real Node's own require.resolve()/createRequire() contract) -
+ * not just a flat call, since `module.createRequire()`'s own real contract
+ * needs `.resolve` too (traced need: real rolldown's own WebContainer
+ * fallback does `__require.resolve('rolldown/package.json')`). */
+type RequireLike = ((specifier: string) => unknown) & { resolve(specifier: string): string };
+
 interface ModuleLoader {
   run(entryPath: string): Promise<unknown>;
+  /** Exposed so a caller-supplied builtins override (worker.ts's own
+   * `vendoredBuiltins`, built before this loader exists) can wire up
+   * `module.createRequire()` after the fact once this loader is actually
+   * ready. */
+  createRequire(fromPath: string): RequireLike;
 }
 
 // Real Node strips a leading shebang line before compiling a CommonJS module
@@ -204,7 +216,16 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
   const { sources } = options;
   const readSource = createSourceReader(sources, options.readFileSync);
   const builtins = {
-    ...createBuiltinModules(options.process ?? defaultProcess, options.netContext),
+    // `(fromPath) => createRequire(fromPath)` forward-references `createRequire`
+    // below (not yet initialized at this point in the function body) - safe
+    // because it's wrapped in a closure that's only ever CALLED later, via
+    // `module.createRequire()`'s returned function, well after this whole
+    // synchronous setup phase completes (same forward-reference pattern
+    // esmLoader's own `requireSync` option uses just below). Forwarding
+    // `createRequire` itself (not a flattened `(fromPath, specifier) => ...`
+    // call) is what gives `module.createRequire()`'s result a real
+    // `.resolve` too, matching real Node's own contract.
+    ...createBuiltinModules(options.process ?? defaultProcess, options.netContext, (fromPath) => createRequire(fromPath)),
     ...options.builtins,
   };
   const cache = new Map<string, ModuleRecord>();
@@ -414,6 +435,7 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
   });
 
   return {
+    createRequire,
     async run(entryPath: string): Promise<unknown> {
       if (esmLoader.isEsmPath(entryPath)) {
         return esmLoader.run(entryPath);

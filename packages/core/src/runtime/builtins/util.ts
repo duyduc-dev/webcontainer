@@ -149,6 +149,128 @@ const promisify = (
 };
 promisify.custom = promisifyCustomSymbol;
 
+// Real Node's util.styleText(format, text) wraps `text` in the ANSI codes
+// for the named style(s) (real Node's own `util.inspect.colors` table) -
+// traced need: real Vite's own CLI version-print path calls it directly.
+// Real Node skips styling entirely when the target stream isn't a
+// color-capable TTY (`options.validateStream`, default true, checked
+// against `options.stream`, default `process.stdout`) - this runtime's own
+// `process.stdout.isTTY` is always `false` (see worker.ts's
+// createWritableStream), so by design this correctly no-ops (returns `text`
+// unchanged) exactly like real Node would on any non-TTY stream (a piped
+// process, this runtime's own guest processes), not a shortcut specific to
+// this runtime.
+const STYLE_CODES: Record<string, [number, number]> = {
+  reset: [0, 0],
+  bold: [1, 22],
+  dim: [2, 22],
+  italic: [3, 23],
+  underline: [4, 24],
+  overlined: [53, 55],
+  inverse: [7, 27],
+  hidden: [8, 28],
+  strikethrough: [9, 29],
+  black: [30, 39],
+  red: [31, 39],
+  green: [32, 39],
+  yellow: [33, 39],
+  blue: [34, 39],
+  magenta: [35, 39],
+  cyan: [36, 39],
+  white: [37, 39],
+  gray: [90, 39],
+  grey: [90, 39],
+  redBright: [91, 39],
+  greenBright: [92, 39],
+  yellowBright: [93, 39],
+  blueBright: [94, 39],
+  magentaBright: [95, 39],
+  cyanBright: [96, 39],
+  whiteBright: [97, 39],
+  bgBlack: [40, 49],
+  bgRed: [41, 49],
+  bgGreen: [42, 49],
+  bgYellow: [43, 49],
+  bgBlue: [44, 49],
+  bgMagenta: [45, 49],
+  bgCyan: [46, 49],
+  bgWhite: [47, 49],
+  bgBlackBright: [100, 49],
+  bgRedBright: [101, 49],
+  bgGreenBright: [102, 49],
+  bgYellowBright: [103, 49],
+  bgBlueBright: [104, 49],
+  bgMagentaBright: [105, 49],
+  bgCyanBright: [106, 49],
+  bgWhiteBright: [107, 49],
+};
+
+interface StyleTextOptions {
+  validateStream?: boolean;
+  stream?: { isTTY?: boolean };
+}
+
+const styleText = (format: string | string[], text: string, options: StyleTextOptions = {}): string => {
+  const { validateStream = true, stream = (globalThis as { process?: { stdout?: { isTTY?: boolean } } }).process?.stdout } = options;
+  if (validateStream && !stream?.isTTY) return text;
+
+  const formats = Array.isArray(format) ? format : [format];
+  let open = "";
+  let close = "";
+  for (const name of formats) {
+    const codes = STYLE_CODES[name];
+    if (!codes) throw new TypeError(`The argument 'format' is invalid. Received '${name}'`);
+    open += `[${codes[0]}m`;
+    close = `[${codes[1]}m${close}`;
+  }
+  return `${open}${text}${close}`;
+};
+
+// Real Node's util.stripVTControlCharacters(str) removes ANSI/VT escape
+// sequences (the same codes styleText above produces) from a string -
+// traced need: real Vite's own CLI does
+// `import { stripVTControlCharacters } from 'node:util'` at its top level.
+// The pattern is the well-known "ansi-regex" (sindresorhus/ansi-regex,
+// MIT), the same one real Node's own implementation is built on: matches
+// both CSI sequences (`ESC [ ... letter`, e.g. styleText's own SGR color
+// codes) and OSC sequences terminated by BEL or ST.
+const ANSI_ESCAPE_RE = new RegExp(
+  "[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))",
+  "g",
+);
+
+const stripVTControlCharacters = (text: string): string => text.replace(ANSI_ESCAPE_RE, "");
+
+// Real Node's util.parseEnv(content) parses a .env-file-shaped string into a
+// plain key/value object - traced need: real Vite's own CLI does
+// `import { parseEnv } from 'node:util'` at its top level for its own
+// --envFile support. Real Node's own docs describe this as intentionally
+// dotenv-compatible; this is the well-known dotenv `parse()` algorithm
+// (single regex line-scanner: `KEY=VALUE`, `export KEY=VALUE`, or
+// `KEY: VALUE`, with single/double/backtick-quoted values, `\n`/`\r`
+// escapes unescaped only inside double-quoted values, `#`-prefixed
+// comments and blank lines ignored) - not this runtime's own invention.
+const ENV_LINE_RE =
+  /(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?(?:$|$)/gm;
+
+const parseEnv = (content: string): Record<string, string> => {
+  const result: Record<string, string> = {};
+  const normalized = content.replace(/\r\n?/g, "\n");
+  let match: RegExpExecArray | null;
+  ENV_LINE_RE.lastIndex = 0;
+  while ((match = ENV_LINE_RE.exec(normalized)) !== null) {
+    const key = match[1]!;
+    let value = (match[2] ?? "").trim();
+    const quote = value[0];
+    value = value.replace(/^(['"`])([\s\S]*)\1$/m, "$2");
+    if (quote === '"') {
+      value = value.replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+    }
+    result[key] = value;
+  }
+  return result;
+};
+
 // Real Node's util.TextEncoder/TextDecoder are literally the same
 // constructors as the global ones (`require('util').TextEncoder ===
 // TextEncoder`), kept for backward compatibility with code written before
@@ -163,9 +285,12 @@ const utilModule = {
   deprecate,
   inspect,
   promisify,
+  styleText,
+  stripVTControlCharacters,
+  parseEnv,
   TextEncoder: globalThis.TextEncoder,
   TextDecoder: globalThis.TextDecoder,
 };
 
 export default utilModule;
-export { deprecate, format, formatWithOptions, inherits, inspect, promisify };
+export { deprecate, format, formatWithOptions, inherits, inspect, promisify, styleText, stripVTControlCharacters, parseEnv };

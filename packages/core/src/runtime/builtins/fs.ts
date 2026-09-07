@@ -74,6 +74,16 @@ interface FsBuiltin extends FsBuiltinCore {
   // retry logic (`onmkdir`'s error handler calls `fs.lstat` to tell "already
   // exists as a directory, fine" apart from a real conflict).
   lstat(path: string, callback: NodeCallback<StatResult>): void;
+  // Traced need: real Vite's own dist/node/chunks/node.js does
+  // `import { readdir } from 'node:fs'` at its top level - the callback-form
+  // counterpart to readdirSync above, same as readFile/stat/lstat already
+  // are for their own *Sync forms.
+  readdir(path: string, callback: NodeCallback<string[]>): void;
+  // Same top-level import, same pattern, for realpathSync's own callback
+  // counterpart - real Vite's own package-resolution code calls this to
+  // follow a symlinked dependency (e.g. a pnpm/workspace-linked package) to
+  // its real on-disk path.
+  realpath(path: string, callback: NodeCallback<string>): void;
   mkdir(path: string, mode: number, callback: NodeCallback<void>): void;
   mkdir(path: string, callback: NodeCallback<void>): void;
   chmod(path: string, mode: number, callback: NodeCallback<void>): void;
@@ -326,6 +336,26 @@ const createFsBuiltin = (
     });
   };
 
+  const readdir: FsBuiltin["readdir"] = (path, callback) => {
+    nextTick(() => {
+      try {
+        callback(null, core.readdirSync(path));
+      } catch (error) {
+        callback(error);
+      }
+    });
+  };
+
+  const realpath: FsBuiltin["realpath"] = (path, callback) => {
+    nextTick(() => {
+      try {
+        callback(null, core.realpathSync(path));
+      } catch (error) {
+        callback(error);
+      }
+    });
+  };
+
   const mkdir: FsBuiltin["mkdir"] = (
     path: string,
     modeOrCallback: number | NodeCallback<void>,
@@ -536,6 +566,8 @@ const createFsBuiltin = (
     readFile,
     stat,
     lstat,
+    readdir,
+    realpath,
     mkdir,
     chmod,
     unlink,
@@ -626,6 +658,11 @@ const createFsPromisesBuiltin = (fs: FsBuiltin, nextTick: (callback: () => void)
     });
 
   return {
+    // Real fs.promises.constants is the exact same object as fs.constants
+    // (a plain passthrough, not a promise-wrapped async method) - traced
+    // need: real Vite's own dist/node/chunks/node.js does
+    // `import { constants, ... } from 'node:fs/promises'` at its top level.
+    constants: fs.constants,
     readFile,
     open,
     writeFile: (path: string, contents: string | Uint8Array) => toPromise(() => fs.writeFileSync(path, contents)),

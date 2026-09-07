@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import utilModule, { deprecate, inspect, promisify } from "./util";
+import utilModule, { deprecate, inspect, promisify, styleText, stripVTControlCharacters, parseEnv } from "./util";
 
 describe("util.TextEncoder/TextDecoder", () => {
   // Real npm's own react-dom/server output does
@@ -98,5 +98,65 @@ describe("util.promisify", () => {
 
   it("throws a TypeError when given a non-function", () => {
     expect(() => promisify(null as unknown as (...args: unknown[]) => unknown)).toThrow(TypeError);
+  });
+});
+
+describe("util.styleText", () => {
+  // Traced need: real Vite's own CLI version-print path calls this
+  // directly. This runtime's process.stdout.isTTY is always false (see
+  // worker.ts's createWritableStream), so by default (validateStream: true,
+  // matching real Node) styleText no-ops on the default stream - same as
+  // real Node piping into a non-TTY.
+  it("returns the text unchanged against a non-TTY stream (this runtime's real process.stdout.isTTY)", () => {
+    expect(styleText("red", "hello", { stream: { isTTY: false } })).toBe("hello");
+  });
+
+  it("wraps the text in the named style's real ANSI codes when the stream IS a TTY", () => {
+    expect(styleText("red", "hello", { stream: { isTTY: true } })).toBe("[31mhello[39m");
+  });
+
+  it("applies multiple styles, closing them in reverse order", () => {
+    expect(styleText(["bold", "red"], "hi", { stream: { isTTY: true } })).toBe("[1m[31mhi[39m[22m");
+  });
+
+  it("skips the TTY check entirely when validateStream is false", () => {
+    expect(styleText("red", "hello", { validateStream: false })).toBe("[31mhello[39m");
+  });
+
+  it("throws for an unknown style name", () => {
+    expect(() => styleText("not-a-real-style", "hi", { validateStream: false })).toThrow(TypeError);
+  });
+});
+
+// Traced need: real Vite's own CLI does
+// `import { stripVTControlCharacters } from 'node:util'` at its top level.
+describe("util.stripVTControlCharacters", () => {
+  it("removes the ANSI codes styleText itself produces, leaving the plain text", () => {
+    const styled = styleText("red", "hello", { validateStream: false });
+    expect(stripVTControlCharacters(styled)).toBe("hello");
+  });
+
+  it("leaves plain text with no escape codes unchanged", () => {
+    expect(stripVTControlCharacters("plain text")).toBe("plain text");
+  });
+});
+
+// Traced need: real Vite's own CLI does `import { parseEnv } from 'node:util'`
+// at its top level for its own --envFile support.
+describe("util.parseEnv", () => {
+  it("parses plain KEY=VALUE pairs, ignoring blank lines and # comments", () => {
+    expect(parseEnv("# a comment\nFOO=bar\n\nBAZ=qux\n")).toEqual({ FOO: "bar", BAZ: "qux" });
+  });
+
+  it("strips matching single/double/backtick quotes from a value", () => {
+    expect(parseEnv('A="hello"\nB=\'world\'\nC=`back`')).toEqual({ A: "hello", B: "world", C: "back" });
+  });
+
+  it("unescapes \\n and \\r only inside double-quoted values", () => {
+    expect(parseEnv('A="line1\\nline2"\nB=\'no\\nescape\'')).toEqual({ A: "line1\nline2", B: "no\\nescape" });
+  });
+
+  it("supports an `export` prefix (real shell-sourceable .env files)", () => {
+    expect(parseEnv("export FOO=bar")).toEqual({ FOO: "bar" });
   });
 });

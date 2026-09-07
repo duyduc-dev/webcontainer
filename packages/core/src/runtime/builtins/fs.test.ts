@@ -365,6 +365,64 @@ describe("createFsBuiltin stat (callback form)", () => {
   });
 });
 
+// Traced need: real Vite's own dist/node/chunks/node.js does
+// `import { readdir } from 'node:fs'` at its top level - the callback-form
+// counterpart to readdirSync, same relationship stat/lstat/readFile already
+// have with their own *Sync forms.
+describe("createFsBuiltin readdir (callback form)", () => {
+  it("defers via the provided nextTick and hands the callback the same names as readdirSync", async () => {
+    let nextTickInvocations = 0;
+    const fs = createFsBuiltin(makeIO(), (cb) => {
+      nextTickInvocations++;
+      queueMicrotask(cb);
+    });
+    fs.mkdirSync("/src");
+    fs.writeFileSync("/src/a.js", "");
+
+    const names = await new Promise<string[]>((resolve, reject) => {
+      fs.readdir("/src", (error, result) => (error ? reject(error) : resolve(result!)));
+    });
+    expect(nextTickInvocations).toBe(1);
+    expect(names).toEqual(["a.js"]);
+  });
+
+  it("rejects (via the callback's error) for a missing path", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const error = await new Promise((resolve) => {
+      fs.readdir("/missing", (err) => resolve(err));
+    });
+    expect(error).toEqual(expect.objectContaining({ code: "ENOENT" }));
+  });
+});
+
+// Traced need: real Vite's own dist/node/chunks/node.js does
+// `import { realpath } from 'node:fs'` at its top level - the callback-form
+// counterpart to realpathSync.
+describe("createFsBuiltin realpath (callback form)", () => {
+  it("defers via the provided nextTick and hands the callback the same path as realpathSync", async () => {
+    let nextTickInvocations = 0;
+    const fs = createFsBuiltin(makeIO(), (cb) => {
+      nextTickInvocations++;
+      queueMicrotask(cb);
+    });
+    fs.writeFileSync("/a.txt", "hi");
+
+    const resolved = await new Promise<string>((resolve, reject) => {
+      fs.realpath("/a.txt", (error, result) => (error ? reject(error) : resolve(result!)));
+    });
+    expect(nextTickInvocations).toBe(1);
+    expect(resolved).toBe(fs.realpathSync("/a.txt"));
+  });
+
+  it("rejects (via the callback's error) for a missing path", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const error = await new Promise((resolve) => {
+      fs.realpath("/missing", (err) => resolve(err));
+    });
+    expect(error).toEqual(expect.objectContaining({ code: "ENOENT" }));
+  });
+});
+
 // Real tar's own lib/mkdir.js and lib/unpack.js call every one of these
 // while physically recreating a package's directory tree during
 // extraction - traced need: `npm install left-pad` reaching real tar's
@@ -431,6 +489,16 @@ describe("createFsBuiltin extraction-support callback methods (lstat/mkdir/chmod
 });
 
 describe("createFsPromisesBuiltin", () => {
+  // Traced need: real Vite's own dist/node/chunks/node.js does
+  // `import { constants, ... } from 'node:fs/promises'` at its top level -
+  // a plain passthrough (real Node's fs.promises.constants is the same
+  // object as fs.constants), not a promise-wrapped async method.
+  it("constants is the same object as fs.constants (a plain passthrough)", () => {
+    const fs = createFsBuiltin(makeIO());
+    const fsPromises = createFsPromisesBuiltin(fs, (cb) => queueMicrotask(cb));
+    expect(fsPromises.constants).toBe(fs.constants);
+  });
+
   it("readFile with no options still wraps through the provided wrapBuffer (real npm's own cacache does `(await fs.promises.readFile(path)).toString()` on cached content)", async () => {
     class FakeBuffer extends Uint8Array {
       toString() {

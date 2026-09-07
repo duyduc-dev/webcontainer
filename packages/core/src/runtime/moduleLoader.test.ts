@@ -542,6 +542,41 @@ describe("moduleLoader ESM support", () => {
     expect(ns.dep.value).toBe(42);
   });
 
+  it("a dynamic import() of a missing/optional module doesn't crash module evaluation - resolution is deferred until the call actually runs, and only awaiting it rejects (real Vite's own optional-peer-dep pattern, e.g. `esbuild ||= import('esbuild')`, must not turn a textually-present but never-called import() into a fatal load-time error)", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/package.json": '{"type":"module"}',
+        "/index.js": [
+          "let pending;",
+          "const lazyImportOptionalDep = () => (pending ||= import('optional-missing-dep'));",
+          "export const evaluatedWithoutThrowing = true;",
+          "export const lazy = lazyImportOptionalDep;",
+        ].join("\n"),
+      },
+    });
+
+    const ns = (await loader.run("/index.js")) as { evaluatedWithoutThrowing: boolean; lazy: () => Promise<unknown> };
+    expect(ns.evaluatedWithoutThrowing).toBe(true);
+    await expect(ns.lazy()).rejects.toThrow(/Cannot find module/);
+  });
+
+  it("real Vite's own `createRequire(import.meta.url)` pattern: an ESM entry can build a require() scoped to itself and use it to load a relative CJS module", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/package.json": '{"type":"module"}',
+        "/index.js": [
+          "import { createRequire } from 'module';",
+          "const require = createRequire(import.meta.url);",
+          "export const dep = require('./dep.js');",
+        ].join("\n"),
+        "/dep.js": "module.exports = { value: 99 };",
+      },
+    });
+
+    const ns = (await loader.run("/index.js")) as { dep: { value: number } };
+    expect(ns.dep.value).toBe(99);
+  });
+
   it("a real-world-traced case: statically importing a genuinely ESM-only package (chalk@5's actual shape - a class instance as the default export)", async () => {
     const loader = createModuleLoader({
       sources: {

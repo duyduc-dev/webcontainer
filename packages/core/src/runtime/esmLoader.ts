@@ -375,6 +375,39 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
   // this same realm (they're not sandboxed - same Worker, same JS agent).
   const globalShims = ((globalThis as Record<string, unknown>).__dwcCjsShims ??= {}) as Record<string, unknown>;
 
+  /** Resolves `specifier` (as imported from `fromPath`) to a data: URL,
+   * either by recursing into the native ESM subgraph or falling back to a
+   * synthesized CJS shim - shared by both the eager static-import scan
+   * below and the lazy dynamic-import path (see `__dwcDynamicImport`). */
+  const resolveAndQueue = (fromPath: string, specifier: string): string => {
+    const target = tryResolveEsmPath(fromPath, specifier);
+    if (target && isEsmPath(target) && !building.has(target)) {
+      return buildModule(target);
+    }
+    return buildCjsShim(fromPath, specifier);
+  };
+
+  // Real dynamic `import(x)` is a Promise-returning, deferred operation -
+  // the specifier isn't even looked at until the call actually executes
+  // (that's the whole point of using it over a static import: an
+  // optional/conditional dependency that may not be installed, like real
+  // Vite's own `esbuild ||= import("esbuild")` for its optional esbuild
+  // peer dep, must not break module EVALUATION just because it's textually
+  // present). So unlike the static-import scans below, a matched
+  // `import("x")` call site is rewritten to a call to this shared global
+  // resolver instead of being resolved during the scan - resolution (and
+  // any "Cannot find module" throw) happens lazily, inside this `async`
+  // function, at the moment the rewritten call actually runs, which turns
+  // a would-be synchronous crash into a properly-deferred rejected Promise
+  // (exactly what real `import()` does for a missing/broken target).
+  // Assigned unconditionally (not `??=`) on every createEsmLoader() call so
+  // the global always points at the live instance's own caches/closures -
+  // there's exactly one esmLoader per process (see moduleLoader.ts).
+  (globalThis as Record<string, unknown>).__dwcDynamicImport = async (fromPath: string, specifier: string): Promise<unknown> => {
+    const dataUrl = resolveAndQueue(fromPath, specifier);
+    return import(/* @vite-ignore */ dataUrl);
+  };
+
   /** Runs `specifier` through the exact same require() a CJS caller would
    * get, and wraps the real result as a small ESM shim module - used both
    * for genuine CJS/builtin imports AND as the fallback for a circular ESM
@@ -438,14 +471,6 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
       const fileUrl = `file://${path}`;
       const edits: Edit[] = [];
 
-      const resolveAndQueue = (specifier: string): string => {
-        const target = tryResolveEsmPath(path, specifier);
-        if (target && isEsmPath(target) && !building.has(target)) {
-          return buildModule(target);
-        }
-        return buildCjsShim(path, specifier);
-      };
-
       // `matchAll` (not a manual `.exec()` loop): per spec it clones the
       // regex internally rather than mutating the shared module-level
       // constant's own `lastIndex` - `onMatch` below recursively calls
@@ -465,7 +490,7 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
         const full = match[0];
         const quote = match[1]!;
         const specifier = match[2]!;
-        const dataUrl = resolveAndQueue(specifier);
+        const dataUrl = resolveAndQueue(path, specifier);
         // full = "from" + whitespace + quote + specifier + quote - the
         // quoted region is always exactly its last (specifier.length + 2)
         // characters.
@@ -477,16 +502,19 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
         const full = match[0];
         const quote = match[1]!;
         const specifier = match[2]!;
-        const dataUrl = resolveAndQueue(specifier);
+        const dataUrl = resolveAndQueue(path, specifier);
         edits.push({ start: match.index!, end: match.index! + full.length, replacement: `import ${quote}${dataUrl}${quote}` });
       });
 
       scan(DYNAMIC_IMPORT_RE, (match) => {
         const full = match[0];
-        const quote = match[1]!;
         const specifier = match[2]!;
-        const dataUrl = resolveAndQueue(specifier);
-        edits.push({ start: match.index!, end: match.index! + full.length, replacement: `import(${quote}${dataUrl}${quote})` });
+        // Deferred - see `__dwcDynamicImport`'s own doc comment above.
+        edits.push({
+          start: match.index!,
+          end: match.index! + full.length,
+          replacement: `globalThis.__dwcDynamicImport(${JSON.stringify(path)}, ${JSON.stringify(specifier)})`,
+        });
       });
 
       scan(IMPORT_META_URL_RE, (match) => {

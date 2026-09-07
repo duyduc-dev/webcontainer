@@ -5,6 +5,7 @@ import { createAssertModule } from "./assert";
 import { createModuleModule } from "./module";
 import { createHttp2Module } from "./http2";
 import { createOsModule } from "./os";
+import { createPerfHooksModule } from "./perf_hooks";
 import { createV8Module } from "./v8";
 import { createQuerystringModule } from "./querystring";
 import { createReadlineModule } from "./readline";
@@ -13,6 +14,7 @@ import { createStringDecoderModule } from "./string_decoder";
 import { createTtyModule } from "./tty";
 import { createUrlModule } from "./url";
 import { createVmModule } from "./vm";
+import { createWorkerThreadsModule } from "./worker_threads";
 import pathModule from "./path";
 import utilModule from "./util";
 
@@ -56,6 +58,8 @@ const BUILTIN_NAMES = new Set([
   "child_process",
   "vm",
   "readline",
+  "perf_hooks",
+  "worker_threads",
 ]);
 
 const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(specifier);
@@ -75,8 +79,25 @@ const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(spe
  * (just without real close-phase ordering or cross-process reachability),
  * and `child_process.spawn()`/`exec()` throw clearly instead of silently
  * doing nothing.
+ *
+ * `createRequireForPath` backs the `module` builtin's `createRequire()`
+ * (real Vite's own `createRequire(import.meta.url)` pattern) - it's
+ * moduleLoader.ts's own createRequire(fromPath), `.resolve` included,
+ * threaded down as a plain callback rather than importing moduleLoader.ts
+ * directly, since moduleLoader.ts is itself what constructs the builtins
+ * registry this function returns (and worker.ts's own call site builds
+ * `module` before its own moduleLoader exists - see worker.ts's own comment
+ * at its call site). The callback is only ever actually invoked later, once
+ * guest code calls the returned require() function, by which point the real
+ * thing is wired up either way.
  */
-const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesContext): Record<string, unknown> => {
+const createBuiltinModules = (
+  process: ProcessLike,
+  netContext?: NodeModulesContext,
+  createRequireForPath: (fromPath: string) => ((specifier: string) => unknown) & { resolve(specifier: string): string } = () => {
+    throw new Error("module.createRequire()'s returned require() was called with no require() wired up");
+  },
+): Record<string, unknown> => {
   const nodeModules = createNodeModules(process, netContext);
   const EventEmitter = nodeModules.require("events") as new () => { emit(event: string, ...args: unknown[]): boolean };
   return {
@@ -89,7 +110,7 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     querystring: createQuerystringModule(),
     string_decoder: createStringDecoderModule(),
     "timers/promises": createTimersPromisesModule(),
-    module: createModuleModule(),
+    module: createModuleModule(createRequireForPath),
     assert: createAssertModule(),
     // Real Node exposes `process` both as a bare global AND as
     // require('process')/require('node:process'), the same object either
@@ -116,6 +137,8 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     child_process: nodeModules.require("child_process"),
     vm: createVmModule(),
     readline: createReadlineModule(EventEmitter),
+    perf_hooks: createPerfHooksModule(),
+    worker_threads: createWorkerThreadsModule(),
   };
 };
 
