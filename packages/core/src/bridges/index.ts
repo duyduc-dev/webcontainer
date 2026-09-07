@@ -11,6 +11,13 @@ type Handler = (payload?: any) => void;
 
 interface KernelBridgeOptions {
   bootTimeoutMs?: number;
+  /** Reuse an already-constructed Diagnostics instance instead of creating a
+   * new one - lets a caller (dwc.ts's synchronous bootDWC()) obtain the
+   * diagnostics object synchronously, before this async boot process even
+   * starts, and still have it correctly receive every event this bridge
+   * logs once booted. createDiagnostics() is plain and side-effect-free, so
+   * sharing it this way is safe. */
+  diagnostics?: Diagnostics;
 }
 
 interface KernelBridge {
@@ -22,7 +29,7 @@ interface KernelBridge {
 const DEFAULT_BOOT_TIMEOUT_MS = 10_000;
 
 const createKernelBridge = async (options: KernelBridgeOptions = {}): Promise<KernelBridge> => {
-  const diagnostics = createDiagnostics();
+  const diagnostics = options.diagnostics ?? createDiagnostics();
   const listeners = new Map<string, Set<Handler>>();
   const pending = new Map<string, { resolve: (value: any) => void; reject: (reason: unknown) => void }>();
 
