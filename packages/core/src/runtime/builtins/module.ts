@@ -11,7 +11,7 @@
 // (including `fs`, injected separately by worker.ts rather than through the
 // shared builtins registry - see builtins/index.ts's own BUILTIN_NAMES doc
 // comment), not real Node's much longer historical list (cluster, dgram,
-// readline, vm, worker_threads, ...) - this runtime doesn't implement those,
+// readline, worker_threads, ...) - this runtime doesn't implement those,
 // so claiming they're reserved would be a bigger lie than a shorter list.
 const BUILTIN_MODULE_NAMES = [
   "assert",
@@ -41,6 +41,7 @@ const BUILTIN_MODULE_NAMES = [
   "url",
   "util",
   "v8",
+  "vm",
   "zlib",
 ];
 

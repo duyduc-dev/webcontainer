@@ -11,6 +11,7 @@ import { createTimersPromisesModule } from "./timersPromises";
 import { createStringDecoderModule } from "./string_decoder";
 import { createTtyModule } from "./tty";
 import { createUrlModule } from "./url";
+import { createVmModule } from "./vm";
 import pathModule from "./path";
 import utilModule from "./util";
 
@@ -52,6 +53,7 @@ const BUILTIN_NAMES = new Set([
   "dns",
   "tls",
   "child_process",
+  "vm",
 ]);
 
 const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(specifier);
@@ -109,6 +111,7 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     dns: nodeModules.require("dns"),
     tls: nodeModules.require("tls"),
     child_process: nodeModules.require("child_process"),
+    vm: createVmModule(),
   };
 };
 
