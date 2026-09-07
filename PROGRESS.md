@@ -230,21 +230,75 @@ unverified steps together.
    calls `dwc.preview.enable()`, and points `<iframe id="preview">` at it,
    verified rendering the real server's HTML.
 
-3. **Vite dev server, real end-to-end.** This is where new, currently-
-   unknown gaps will surface, the same way `npm install` did — budget for
-   an iterative "run it, find the next break, fix it" loop, not a single
-   pass. Concretely: `npm install vite` (now unblocked by Phase 1's real
-   npm install work) into a sandboxed project, run `vite` (or
-   `node_modules/.bin/vite`) as a guest process, and see how far it gets
-   starting a dev server on top of the real `http`/`net` now in place.
-   Expect gaps in areas Vite specifically touches that npm's own install
-   flow never exercised: file-watching (`fs.watch`/chokidar — not
-   implemented at all yet, as far as this session got), possibly
-   `worker_threads` or other unimplemented builtins Vite's dependency tree
-   might reach for, and real static-asset serving through
-   `http.ServerResponse` (streaming large files — Phase 1's
-   whole-response-buffering simplification may need revisiting if a real
-   Vite bundle turns out too large to buffer comfortably).
+3. **Vite dev server, real end-to-end — IN PROGRESS.** `npm install vite`
+   (real registry, real dependency resolution, real tarball extraction) now
+   runs to completion: `added 13 packages in 1m`, exit 0. Three real runtime
+   bugs were found and fixed getting there, all via the same iterative
+   "run it, find the next break, fix it" method as Phase 1's original 22
+   gaps — none were guessable in advance, all were confirmed with a direct,
+   isolated repro before fixing (concurrent Playwright runs, not the
+   `claude-in-chrome` extension — see the Phase 3 postmortem above for why
+   that distinction matters):
+
+   - **Sync fs bridge 1MB frame cap.** The SharedArrayBuffer sync fs
+     channel (`kernel/fs/syncWireFormat.ts`) has a fixed 1MB data buffer;
+     `WRITE_FILE`/`READ_FILE` encoded a file's full contents into it
+     unbounded. Any file over ~1MB threw `RangeError: offset is out of
+     bounds` on write (and would have corrupted/crashed on read). Real npm
+     registry metadata for a popular package (even npm's own
+     `--install-v1` abbreviated "corgi" format) routinely exceeds 1MB - this
+     wasn't a rare edge case, it broke real `npm install vite`
+     deterministically, surfacing as a confusing cacache
+     `EEXIST`/`ENOENT` combo (the tmp file's write silently threw before
+     ever reaching the kernel, so a later move/rename legitimately found it
+     missing). Fixed with real chunking - `WRITE_FILE` gained a `more` flag,
+     `READ_FILE` gained a `more` flag plus a new `READ_CHUNK` op - both
+     fully transparent to callers of `readFileSync`/`writeFileSync`.
+   - **`fs.read()`'s callback dropped its `buffer` argument.** Real Node's
+     `fs.read(fd, buffer, offset, length, position, callback)` calls back
+     with `(err, bytesRead, buffer)` - ours only passed `(err, bytesRead)`.
+     `fs-minipass`'s `ReadStream` (real `tar`'s own dependency) destructures
+     all three positionally and does `buf.length` unconditionally, crashing
+     with "Cannot read properties of undefined (reading 'length')" deep
+     inside unmodified npm code - deterministically, for whichever package
+     happened to need a cache read-back via the streaming path (`postcss`,
+     `picomatch` in this session) rather than only ever being freshly
+     written.
+   - **`fs.promises.open()` didn't exist.** `bin-links`' `fix-bin.js` does
+     `const { open } = require('fs/promises')` to sniff a freshly-linked
+     bin script for a Windows-style hashbang line - crashed every install
+     of any package with a bin entry ("open is not a function"). Added a
+     minimal `FileHandle` (`read`/`write`/`close`) built on the existing
+     `openSync`/`readSync`/`writeSync`/`closeSync` - only the methods real
+     npm's own dependency tree actually calls, not the full
+     `fs.promises.FileHandle` surface.
+
+   **Next blocker, found immediately after**: running the installed
+   `node_modules/vite/bin/vite.js` fails with `Error: Cannot use import
+   statement outside a module` - real Vite ships as **ESM** (`import`/
+   `export` at the top level), and this project's module loader is
+   CommonJS-only (`require`/`module.exports`). This is a genuine
+   architecture decision, not a quick patch - comparable in scope to the
+   hand-written HTTP wire parser or the pure-JS gzip decoder, not to any of
+   the three fixes above. Don't start it without deciding deliberately
+   first (same standing instruction as the HMR item below): does the
+   loader need real ESM semantics (live bindings, static
+   import/export analysis, top-level await, dynamic `import()`,
+   `package.json` `"type": "module"`/`"exports"` resolution), or is a
+   transpile-to-CJS shim (e.g. running import specifiers through a
+   lightweight rewrite before the existing CJS loader) sufficient for what
+   Vite's own entry point and dependency tree actually need? Investigate
+   what Vite's `bin/vite.js` and its immediate `import`s actually require
+   before picking an approach.
+
+   Also still expected once ESM is unblocked (not yet reached): gaps in
+   areas Vite specifically touches that npm's own install flow never
+   exercised - file-watching (`fs.watch`/chokidar - not implemented at all
+   yet), possibly `worker_threads` or other unimplemented builtins, and
+   real static-asset serving through `http.ServerResponse` (streaming large
+   files - Phase 1's whole-response-buffering simplification may need
+   revisiting if a real Vite bundle turns out too large to buffer
+   comfortably).
 
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over
