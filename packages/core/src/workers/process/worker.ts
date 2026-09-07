@@ -311,7 +311,7 @@ const createModuleReadFileSync = (channel: SyncFsChannel | null): ((path: string
   };
 };
 
-const boot = (payload: BootPayload): void => {
+const boot = async (payload: BootPayload): Promise<void> => {
   const eventLoop = createEventLoop();
 
   // Real Node's process.umask() getter/setter affects default file-creation
@@ -413,6 +413,10 @@ const boot = (payload: BootPayload): void => {
     console: {
       log: (...args: unknown[]) => write("stdout", `${args.map(String).join(" ")}\n`),
       info: (...args: unknown[]) => write("stdout", `${args.map(String).join(" ")}\n`),
+      // Real Node's console.debug() is a literal alias for console.log(),
+      // not a separate stream/behavior - traced need: npm itself calls it
+      // somewhere in its own early bootstrap, before config resolution.
+      debug: (...args: unknown[]) => write("stdout", `${args.map(String).join(" ")}\n`),
       warn: (...args: unknown[]) => write("stderr", `${args.map(String).join(" ")}\n`),
       error: (...args: unknown[]) => write("stderr", `${args.map(String).join(" ")}\n`),
     },
@@ -527,7 +531,12 @@ const boot = (payload: BootPayload): void => {
   });
 
   try {
-    moduleLoader.run(payload.entryPath);
+    // A genuinely ESM entry point (see moduleLoader.ts/esmLoader.ts) is
+    // evaluated via real, Promise-based native import() - a throw becomes a
+    // rejection here rather than a synchronous throw, but the CJS fast path
+    // (the overwhelming common case) still throws synchronously exactly as
+    // before; either way, `await` catches it the same way.
+    await moduleLoader.run(payload.entryPath);
   } catch (error) {
     reportUncaught(error);
     return;

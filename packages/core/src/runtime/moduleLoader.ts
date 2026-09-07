@@ -1,6 +1,7 @@
 import { dirname, normalize } from "../kernel/fs/path";
 import { createBuiltinModules } from "./builtins";
 import type { ProcessLike } from "./builtins";
+import { createEsmLoader } from "./esmLoader";
 import { interopDefault, toNamespace, transformEsmToCjs } from "./esmInterop";
 import type { NodeModulesContext } from "./node/loader";
 import { fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, splitBareSpecifier } from "./resolveSpecifier";
@@ -47,7 +48,7 @@ interface ModuleRecord {
 }
 
 interface ModuleLoader {
-  run(entryPath: string): unknown;
+  run(entryPath: string): Promise<unknown>;
 }
 
 // Real Node strips a leading shebang line before compiling a CommonJS module
@@ -131,7 +132,11 @@ const resolveBareSync = (fromPath: string, specifier: string, readSource: Source
 const findPackageRoot = (fromPath: string, readSource: SourceReader): string | null => {
   let dir = dirname(fromPath);
   for (;;) {
-    if (readSource(`${dir}/package.json`) !== undefined) return dir;
+    // dir === "/" is the one case `${dir}/package.json` would double up the
+    // leading slash ("//package.json") and never match the real root-level
+    // "/package.json" key - same root-joining special case as
+    // resolveSpecifier.ts's nodeModulesDirsFrom.
+    if (readSource(dir === "/" ? "/package.json" : `${dir}/package.json`) !== undefined) return dir;
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;
@@ -394,8 +399,25 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
     return record;
   };
 
+  // Real, native-semantics ESM support (live bindings, dynamic import(),
+  // top-level await, package.json "exports" resolution) for a file
+  // positively identified as ESM ahead of time (a .mjs extension, or the
+  // nearest package.json has "type": "module") - see esmLoader.ts's own
+  // doc comment for the full design. Everything else (the overwhelming
+  // common case) stays on the synchronous CJS path above, completely
+  // unchanged - only an entry point (or something reached via a static/
+  // dynamic import FROM one) actually detected as ESM ever touches this.
+  const esmLoader = createEsmLoader({
+    readSource,
+    requireSync: (fromPath, specifier) => createRequire(fromPath)(specifier),
+    resolvePackageImports: (fromPath, specifier) => resolvePackageImportsSync(fromPath, specifier, readSource),
+  });
+
   return {
-    run(entryPath: string): unknown {
+    async run(entryPath: string): Promise<unknown> {
+      if (esmLoader.isEsmPath(entryPath)) {
+        return esmLoader.run(entryPath);
+      }
       return loadModule(entryPath).exports;
     },
   };
