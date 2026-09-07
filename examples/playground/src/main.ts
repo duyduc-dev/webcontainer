@@ -53,20 +53,19 @@ function waitForMarker(
   return found;
 }
 
-// The real, npm-installed React server-rendering the page on every request -
-// require('react') + require('react-dom/server') exactly as a real Node app
-// would, executed by this project's own real vendored `http` on top of the
-// sandboxed fs/process runtime. No bundler/dev-server involved (that's the
-// still-open next step - see PROGRESS.md: `npm create vite` and Vite's own
-// dev server both hit missing-builtin gaps this session found but hasn't
-// closed yet, `vm` and `perf_hooks` respectively) - this demo deliberately
-// takes the path that's actually fully working today.
-const REACT_SERVER_SOURCE = [
-  "const http = require('http');",
-  "const React = require('react');",
-  "const { renderToString } = require('react-dom/server');",
-  "",
-  "const FEATURES = [",
+// The App component's source, shared verbatim between the server (evaluated
+// via `new Function`, given the real require()d React as an argument) and
+// the client (embedded directly in a <script> tag, running against React
+// loaded from the real npm-installed UMD build below) - ONE definition, so
+// server-render and client-hydrate can never drift out of sync with each
+// other. Plain React.createElement calls, no JSX (no bundler/transform
+// exists to compile it yet - see PROGRESS.md's still-open Vite dev-server
+// item). Real React.useState: renderToString() runs it once for the
+// initial value same as any single-pass SSR render; hydrateRoot() on the
+// client then makes the SAME component live/interactive - clicking the
+// button re-renders through React's own reconciler, not a manual DOM write.
+const APP_COMPONENT_SOURCE = [
+  "var FEATURES = [",
   "  'Real npm install (real registry fetch, real gzip, real tar, real sha512)',",
   "  'Real CommonJS require() resolution through real node_modules',",
   "  'Real ES modules - live bindings, dynamic import(), top-level await',",
@@ -74,6 +73,10 @@ const REACT_SERVER_SOURCE = [
   "];",
   "",
   "function App() {",
+  "  var state = React.useState(0);",
+  "  var count = state[0];",
+  "  var setCount = state[1];",
+  "",
   "  return React.createElement(",
   "    'div',",
   "    { className: 'app' },",
@@ -81,21 +84,46 @@ const REACT_SERVER_SOURCE = [
   "    React.createElement(",
   "      'p',",
   "      { className: 'subtitle' },",
-  "      'This page was rendered by real, npm-installed React ' + React.version + ' - require(\\'react\\') + require(\\'react-dom/server\\') executing inside a spawned guest process, not on your machine.',",
+  "      'Server-rendered by real, npm-installed React via react-dom/server, then hydrated client-side by the SAME component - this button uses real React.useState, not a manual DOM write.',",
   "    ),",
   "    React.createElement(",
   "      'ul',",
   "      null,",
-  "      FEATURES.map((feature, i) => React.createElement('li', { key: i }, feature)),",
+  "      FEATURES.map(function (feature, i) { return React.createElement('li', { key: i }, feature); }),",
   "    ),",
   "    React.createElement(",
   "      'div',",
   "      { className: 'counter' },",
-  "      React.createElement('span', { id: 'count' }, '0'),",
-  "      React.createElement('button', { id: 'bump' }, '+1 (plain client-side JS, not React - no bundler here yet)'),",
+  "      React.createElement('span', { id: 'count' }, String(count)),",
+  "      React.createElement(",
+  "        'button',",
+  "        { onClick: function () { setCount(count + 1); } },",
+  "        'useState count: ' + count + ' (click me)',",
+  "      ),",
   "    ),",
   "  );",
   "}",
+].join("\n");
+
+// The real, npm-installed React server-rendering the page on every request -
+// require('react') + require('react-dom/server') exactly as a real Node app
+// would, executed by this project's own real vendored `http` on top of the
+// sandboxed fs/process runtime. Also serves React's own real UMD builds
+// (node_modules/react/umd/react.development.js,
+// node_modules/react-dom/umd/react-dom.development.js - both real files
+// inside the npm-installed packages, not a CDN) so the SAME component can
+// hydrate client-side too. No bundler/dev-server involved (that's the
+// still-open next step - see PROGRESS.md: `npm create vite` and Vite's own
+// dev server both hit missing-builtin gaps this session found but hasn't
+// fully closed yet) - this demo deliberately takes the path that's actually
+// fully working today.
+const REACT_SERVER_SOURCE = [
+  "const http = require('http');",
+  "const fs = require('fs');",
+  "const React = require('react');",
+  "const { renderToString } = require('react-dom/server');",
+  "",
+  APP_COMPONENT_SOURCE,
   "",
   "const PAGE = (body) => `<!doctype html>",
   "<html>",
@@ -114,17 +142,26 @@ const REACT_SERVER_SOURCE = [
   "</head>",
   "<body>",
   "<div id=\"root\">${body}</div>",
+  "<script src=\"/react.js\"></script>",
+  "<script src=\"/react-dom.js\"></script>",
   "<script>",
-  "  var n = 0;",
-  "  document.getElementById('bump').addEventListener('click', function () {",
-  "    n += 1;",
-  "    document.getElementById('count').textContent = String(n);",
-  "  });",
+  APP_COMPONENT_SOURCE.replace(/`/g, "\\`"),
+  "ReactDOM.hydrateRoot(document.getElementById('root'), React.createElement(App));",
   "</script>",
   "</body>",
   "</html>`;",
   "",
   "const server = http.createServer((req, res) => {",
+  "  if (req.url === '/react.js') {",
+  "    res.writeHead(200, { 'Content-Type': 'application/javascript' });",
+  "    res.end(fs.readFileSync(require.resolve('react/umd/react.development.js')));",
+  "    return;",
+  "  }",
+  "  if (req.url === '/react-dom.js') {",
+  "    res.writeHead(200, { 'Content-Type': 'application/javascript' });",
+  "    res.end(fs.readFileSync(require.resolve('react-dom/umd/react-dom.development.js')));",
+  "    return;",
+  "  }",
   "  const html = PAGE(renderToString(React.createElement(App)));",
   "  res.writeHead(200, { 'Content-Type': 'text/html' });",
   "  res.end(html);",
