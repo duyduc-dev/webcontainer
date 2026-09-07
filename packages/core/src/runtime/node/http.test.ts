@@ -111,6 +111,15 @@ describe("vendored 'https'/'http' (fetch-backed client)", () => {
     });
   });
 
+  it("exposes STATUS_CODES on 'http' (real npm's own minipass-fetch reads it even for an https:// request)", () => {
+    const { require } = createNodeModules(fakeProcess());
+    const http = require("http") as { STATUS_CODES: Record<number, string> };
+
+    expect(http.STATUS_CODES[200]).toBe("OK");
+    expect(http.STATUS_CODES[404]).toBe("Not Found");
+    expect(http.STATUS_CODES[500]).toBe("Internal Server Error");
+  });
+
   it("fails loudly on a protocol upgrade instead of hanging", async () => {
     (globalThis as any).__dwcFetchAsync = vi.fn();
     const { require } = createNodeModules(fakeProcess());
@@ -123,5 +132,145 @@ describe("vendored 'https'/'http' (fetch-backed client)", () => {
     });
 
     expect((error as any).code).toBe("ERR_DWC_UPGRADE_UNSUPPORTED");
+  });
+});
+
+// http.createServer() is new: real npm's own dependency tree never needed
+// an in-VM HTTP server, but an in-VM dev server (e.g. Vite, for the
+// StackBlitz/vivari-style "preview" feature this unblocks) does. It runs on
+// top of this runtime's own real, vendored `net` module (already working,
+// same-process and cross-process) plus a hand-written HTTP/1.1 parser
+// (internal/http_parser.js) - real Node's own server-side parsing isn't
+// pure JS (it hands bytes to `llhttp`, a native binding), so there's
+// nothing to vendor verbatim the way net.js/dns.js/tls.js were.
+describe("vendored 'http' Server (real net.js underneath, real HTTP/1.1 wire format)", () => {
+  it("round-trips a bodyless GET request end-to-end through a real net socket", async () => {
+    const { require } = createNodeModules(fakeProcess());
+    const http = require("http") as {
+      createServer(handler: (req: any, res: any) => void): { listen(port: number, cb?: () => void): unknown; close(): unknown };
+    };
+    const net = require("net") as { connect(port: number, cb?: () => void): any };
+
+    const server = http.createServer((req: any, res: any) => {
+      expect(req.method).toBe("GET");
+      expect(req.url).toBe("/hello");
+      expect(req.headers.host).toBe("localhost");
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("hi there");
+    });
+    await new Promise<void>((resolve) => server.listen(3000, resolve));
+
+    const response: string = await new Promise((resolve, reject) => {
+      const socket = net.connect(3000, () => {
+        socket.write("GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n");
+      });
+      let data = "";
+      socket.on("data", (chunk: { toString(): string }) => (data += chunk.toString()));
+      socket.on("end", () => resolve(data));
+      socket.on("error", reject);
+    });
+
+    expect(response).toMatch(/^HTTP\/1\.1 200 OK/);
+    // header names come back lowercased (this server always stores/emits
+    // them that way - spec-compliant, since HTTP header names are
+    // case-insensitive, just not byte-identical to what setHeader() was
+    // called with).
+    expect(response).toContain("content-type: text/plain");
+    expect(response).toContain("hi there");
+    server.close();
+  });
+
+  it("delivers a request body to the handler via req's real Readable interface", async () => {
+    const { require } = createNodeModules(fakeProcess());
+    const http = require("http") as {
+      createServer(handler: (req: any, res: any) => void): { listen(port: number, cb?: () => void): unknown; close(): unknown };
+    };
+    const net = require("net") as { connect(port: number, cb?: () => void): any };
+    const { Buffer } = require("buffer") as { Buffer: { concat(chunks: unknown[]): { toString(): string } } };
+
+    const server = http.createServer((req: any, res: any) => {
+      const chunks: unknown[] = [];
+      req.on("data", (chunk: unknown) => chunks.push(chunk));
+      req.on("end", () => {
+        res.end(`echo:${Buffer.concat(chunks).toString()}`);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(3001, resolve));
+
+    const body = "hello world";
+    const response: string = await new Promise((resolve, reject) => {
+      const socket = net.connect(3001, () => {
+        socket.write(`POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
+      });
+      let data = "";
+      socket.on("data", (chunk: { toString(): string }) => (data += chunk.toString()));
+      socket.on("end", () => resolve(data));
+      socket.on("error", reject);
+    });
+
+    expect(response).toContain("echo:hello world");
+    server.close();
+  });
+
+  it("computes Content-Length automatically and closes the connection after one response", async () => {
+    const { require } = createNodeModules(fakeProcess());
+    const http = require("http") as {
+      createServer(handler: (req: any, res: any) => void): { listen(port: number, cb?: () => void): unknown; close(): unknown };
+    };
+    const net = require("net") as { connect(port: number, cb?: () => void): any };
+
+    const server = http.createServer((_req: any, res: any) => {
+      res.write("part1 ");
+      res.write("part2");
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(3002, resolve));
+
+    const response: string = await new Promise((resolve, reject) => {
+      const socket = net.connect(3002, () => {
+        socket.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+      });
+      let data = "";
+      socket.on("data", (chunk: { toString(): string }) => (data += chunk.toString()));
+      socket.on("end", () => resolve(data));
+      socket.on("error", reject);
+    });
+
+    expect(response).toContain("content-length: 11");
+    expect(response).toContain("connection: close");
+    expect(response).toContain("part1 part2");
+    server.close();
+  });
+
+  it("handles multiple sequential requests on the same server (new connection per request)", async () => {
+    const { require } = createNodeModules(fakeProcess());
+    const http = require("http") as {
+      createServer(handler: (req: any, res: any) => void): { listen(port: number, cb?: () => void): unknown; close(): unknown };
+    };
+    const net = require("net") as { connect(port: number, cb?: () => void): any };
+
+    let count = 0;
+    const server = http.createServer((_req: any, res: any) => {
+      count++;
+      res.end(`response ${count}`);
+    });
+    await new Promise<void>((resolve) => server.listen(3003, resolve));
+
+    const doRequest = (): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const socket = net.connect(3003, () => {
+          socket.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        });
+        let data = "";
+        socket.on("data", (chunk: { toString(): string }) => (data += chunk.toString()));
+        socket.on("end", () => resolve(data));
+        socket.on("error", reject);
+      });
+
+    const first = await doRequest();
+    const second = await doRequest();
+    expect(first).toContain("response 1");
+    expect(second).toContain("response 2");
+    server.close();
   });
 });

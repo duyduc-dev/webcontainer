@@ -15,6 +15,15 @@ const FS_SYNC_CONTROL_LENGTH = 2;
 /** Default data buffer size (bytes) for one sync fs channel. */
 const FS_SYNC_DATA_BUFFER_SIZE = 1024 * 1024;
 
+/** Max payload bytes per WRITE_FILE/READ_FILE(_CHUNK) frame - the data buffer
+ * minus headroom for the op byte, path string, and length prefixes. Real npm
+ * packages/registry metadata routinely exceed one buffer's worth (e.g. a
+ * popular package's abbreviated packument alone can be several MB) - a
+ * request/response whose payload doesn't fit is split across multiple
+ * round-trips using WRITE_FILE's `more` flag and the READ_CHUNK op, fully
+ * transparent to callers of readFileSync/writeFileSync (see syncFsClient.ts). */
+const FS_SYNC_CHUNK_SIZE = FS_SYNC_DATA_BUFFER_SIZE - 4096;
+
 enum FsOp {
   READ_FILE = 1,
   WRITE_FILE = 2,
@@ -28,11 +37,19 @@ enum FsOp {
   READLINK = 10,
   LSTAT = 11,
   CHMOD = 12,
+  REALPATH = 13,
+  /** Continuation request: "give me the next chunk of the READ_FILE already
+   * in progress on this channel." No arguments - the server remembers what's
+   * being read (only one request is ever in flight per channel, since the
+   * client blocks on Atomics.wait between round-trips). */
+  READ_CHUNK = 14,
 }
 
 type FsRequest =
   | { op: FsOp.READ_FILE; path: string }
-  | { op: FsOp.WRITE_FILE; path: string; contents: Uint8Array }
+  // `more: true` means "more chunks for this write are coming" - the server
+  // accumulates rather than committing to the VFS until a chunk without it.
+  | { op: FsOp.WRITE_FILE; path: string; contents: Uint8Array; more?: boolean }
   | { op: FsOp.MKDIR; path: string; recursive: boolean }
   | { op: FsOp.READDIR; path: string }
   | { op: FsOp.STAT; path: string }
@@ -42,10 +59,15 @@ type FsRequest =
   | { op: FsOp.SYMLINK; target: string; path: string }
   | { op: FsOp.READLINK; path: string }
   | { op: FsOp.LSTAT; path: string }
-  | { op: FsOp.CHMOD; path: string; mode: number };
+  | { op: FsOp.CHMOD; path: string; mode: number }
+  | { op: FsOp.REALPATH; path: string }
+  | { op: FsOp.READ_CHUNK };
 
 type FsResponseOk =
-  | { ok: true; op: FsOp.READ_FILE; contents: Uint8Array }
+  // `more: true` means the file is bigger than fit in this frame - the
+  // client must keep issuing READ_CHUNK requests until it sees `more: false`.
+  | { ok: true; op: FsOp.READ_FILE; contents: Uint8Array; more: boolean }
+  | { ok: true; op: FsOp.READ_CHUNK; contents: Uint8Array; more: boolean }
   | { ok: true; op: FsOp.WRITE_FILE }
   | { ok: true; op: FsOp.MKDIR }
   | { ok: true; op: FsOp.READDIR; entries: string[] }
@@ -64,7 +86,8 @@ type FsResponseOk =
   | { ok: true; op: FsOp.EXISTS; exists: boolean }
   | { ok: true; op: FsOp.SYMLINK }
   | { ok: true; op: FsOp.READLINK; target: string }
-  | { ok: true; op: FsOp.CHMOD };
+  | { ok: true; op: FsOp.CHMOD }
+  | { ok: true; op: FsOp.REALPATH; path: string };
 
 type FsResponseError = { ok: false; code: FSErrorCode; path: string; message: string };
 
@@ -163,10 +186,12 @@ const encodeFsRequest = (request: FsRequest, buffer: ArrayBufferLike, byteOffset
     case FsOp.EXISTS:
     case FsOp.READLINK:
     case FsOp.LSTAT:
+    case FsOp.REALPATH:
       writer.writeString(request.path);
       break;
     case FsOp.WRITE_FILE:
       writer.writeString(request.path);
+      writer.writeUint8(request.more ? 1 : 0);
       writer.writeBytes(request.contents);
       break;
     case FsOp.MKDIR:
@@ -186,6 +211,8 @@ const encodeFsRequest = (request: FsRequest, buffer: ArrayBufferLike, byteOffset
       writer.writeString(request.path);
       writer.writeUint32(request.mode);
       break;
+    case FsOp.READ_CHUNK:
+      break;
   }
 
   return writer.bytesWritten;
@@ -202,9 +229,13 @@ const decodeFsRequest = (buffer: ArrayBufferLike, byteOffset = 0): FsRequest => 
     case FsOp.EXISTS:
     case FsOp.READLINK:
     case FsOp.LSTAT:
+    case FsOp.REALPATH:
       return { op, path: reader.readString() };
-    case FsOp.WRITE_FILE:
-      return { op, path: reader.readString(), contents: reader.readBytes() };
+    case FsOp.WRITE_FILE: {
+      const path = reader.readString();
+      const more = reader.readUint8() === 1;
+      return { op, path, more, contents: reader.readBytes() };
+    }
     case FsOp.MKDIR:
     case FsOp.RM:
       return { op, path: reader.readString(), recursive: reader.readUint8() === 1 };
@@ -214,6 +245,8 @@ const decodeFsRequest = (buffer: ArrayBufferLike, byteOffset = 0): FsRequest => 
       return { op, target: reader.readString(), path: reader.readString() };
     case FsOp.CHMOD:
       return { op, path: reader.readString(), mode: reader.readUint32() };
+    case FsOp.READ_CHUNK:
+      return { op };
     default:
       throw new Error(`Unknown FsOp: ${op}`);
   }
@@ -233,6 +266,8 @@ const encodeFsResponse = (response: FsResponse, buffer: ArrayBufferLike, byteOff
   writer.writeUint8(response.op);
   switch (response.op) {
     case FsOp.READ_FILE:
+    case FsOp.READ_CHUNK:
+      writer.writeUint8(response.more ? 1 : 0);
       writer.writeBytes(response.contents);
       break;
     case FsOp.READDIR:
@@ -253,6 +288,9 @@ const encodeFsResponse = (response: FsResponse, buffer: ArrayBufferLike, byteOff
       break;
     case FsOp.READLINK:
       writer.writeString(response.target);
+      break;
+    case FsOp.REALPATH:
+      writer.writeString(response.path);
       break;
     case FsOp.WRITE_FILE:
     case FsOp.MKDIR:
@@ -282,7 +320,10 @@ const decodeFsResponse = (buffer: ArrayBufferLike, byteOffset = 0): FsResponse =
   const op = reader.readUint8() as FsOp;
   switch (op) {
     case FsOp.READ_FILE:
-      return { ok: true, op, contents: reader.readBytes() };
+    case FsOp.READ_CHUNK: {
+      const more = reader.readUint8() === 1;
+      return { ok: true, op, contents: reader.readBytes(), more };
+    }
     case FsOp.READDIR: {
       const count = reader.readUint32();
       const entries: string[] = [];
@@ -305,6 +346,8 @@ const decodeFsResponse = (buffer: ArrayBufferLike, byteOffset = 0): FsResponse =
       return { ok: true, op, exists: reader.readUint8() === 1 };
     case FsOp.READLINK:
       return { ok: true, op, target: reader.readString() };
+    case FsOp.REALPATH:
+      return { ok: true, op, path: reader.readString() };
     case FsOp.WRITE_FILE:
     case FsOp.MKDIR:
     case FsOp.RM:
@@ -324,6 +367,7 @@ export {
   decodeFsResponse,
   encodeFsRequest,
   encodeFsResponse,
+  FS_SYNC_CHUNK_SIZE,
   FS_SYNC_CONTROL_LENGTH,
   FS_SYNC_DATA_BUFFER_SIZE,
   FS_SYNC_LENGTH_INDEX,

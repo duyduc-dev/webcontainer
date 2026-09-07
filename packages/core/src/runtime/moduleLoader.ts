@@ -1,9 +1,15 @@
 import { dirname, normalize } from "../kernel/fs/path";
 import { createBuiltinModules } from "./builtins";
 import type { ProcessLike } from "./builtins";
+import { createEsmLoader } from "./esmLoader";
 import { interopDefault, toNamespace, transformEsmToCjs } from "./esmInterop";
 import type { NodeModulesContext } from "./node/loader";
 import { fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, splitBareSpecifier } from "./resolveSpecifier";
+
+/** Marks an error as already tagged with the module path that actually threw
+ * it - see loadModule()'s own catch for why this must only happen once, at
+ * the originating frame. */
+const MODULE_PATH_TAG = Symbol("dwcModulePath");
 
 interface ModuleLoaderOptions {
   sources: Record<string, string>;
@@ -42,7 +48,7 @@ interface ModuleRecord {
 }
 
 interface ModuleLoader {
-  run(entryPath: string): unknown;
+  run(entryPath: string): Promise<unknown>;
 }
 
 // Real Node strips a leading shebang line before compiling a CommonJS module
@@ -126,7 +132,11 @@ const resolveBareSync = (fromPath: string, specifier: string, readSource: Source
 const findPackageRoot = (fromPath: string, readSource: SourceReader): string | null => {
   let dir = dirname(fromPath);
   for (;;) {
-    if (readSource(`${dir}/package.json`) !== undefined) return dir;
+    // dir === "/" is the one case `${dir}/package.json` would double up the
+    // leading slash ("//package.json") and never match the real root-level
+    // "/package.json" key - same root-joining special case as
+    // resolveSpecifier.ts's nodeModulesDirsFrom.
+    if (readSource(dir === "/" ? "/package.json" : `${dir}/package.json`) !== undefined) return dir;
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;
@@ -199,46 +209,78 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
   };
   const cache = new Map<string, ModuleRecord>();
 
+  /** A builtin resolves to a marker rather than a path - require.resolve()
+   * returns the specifier itself for a builtin (matching real Node), while
+   * require() itself short-circuits to the builtin value before ever
+   * needing a path at all. */
+  const BUILTIN = Symbol("builtin");
+
+  /** The specifier-to-path resolution require() and require.resolve() both
+   * need, shared so they can never disagree about what a specifier means.
+   * Returns BUILTIN for a builtin, the resolved path otherwise, or throws
+   * the same "Cannot find module" real Node would for a genuine miss. */
+  const resolveRequireTarget = (fromPath: string, rawSpecifier: string): string | typeof BUILTIN => {
+    // Real Node accepts a "node:"-prefixed specifier for any builtin (and,
+    // as of newer versions, requires it for a few) - strip it before every
+    // other check so `require('node:path')` and `require('path')` resolve
+    // identically.
+    const specifier = rawSpecifier.startsWith("node:") ? rawSpecifier.slice(5) : rawSpecifier;
+
+    if (specifier in builtins) return BUILTIN;
+
+    if (specifier.startsWith(".")) {
+      return resolveRelative(fromPath, specifier, readSource);
+    }
+
+    // An absolute-path specifier - real Node supports this directly (no
+    // node_modules walk, no "main" field, just the same file/directory
+    // candidate suffixes a relative require tries). This is how a thin
+    // `/bin/<name>.js` shim can load a real, separately-vendored program by
+    // its absolute VFS path (e.g. a vendored npm's bin/npm-cli.js).
+    if (specifier.startsWith("/")) {
+      const resolved = fileCandidates(specifier).find((candidate) => readSource(candidate) !== undefined);
+      if (resolved) return resolved;
+      throw new Error(`Cannot find module '${specifier}'`);
+    }
+
+    // A private package-imports specifier (real Node's "imports" field) -
+    // e.g. chalk@5's own `require('#ansi-styles')`. Checked before the
+    // node_modules walk below since a leading "#" can never be a bare
+    // package name.
+    if (specifier.startsWith("#")) {
+      const resolved = resolvePackageImportsSync(fromPath, specifier, readSource);
+      if (resolved) return resolved;
+      throw new Error(`Cannot find package import '${specifier}' from '${fromPath}'`);
+    }
+
+    const resolved = resolveBareSync(fromPath, specifier, readSource);
+    if (resolved) return resolved;
+
+    throw new Error(`Cannot find module '${specifier}' from '${fromPath}'`);
+  };
+
   const createRequire = (fromPath: string) => {
-    return (rawSpecifier: string): unknown => {
-      // Real Node accepts a "node:"-prefixed specifier for any builtin (and,
-      // as of newer versions, requires it for a few) - strip it before every
-      // other check so `require('node:path')` and `require('path')` resolve
-      // identically.
-      const specifier = rawSpecifier.startsWith("node:") ? rawSpecifier.slice(5) : rawSpecifier;
-
-      if (specifier in builtins) return builtins[specifier];
-
-      if (specifier.startsWith(".")) {
-        return loadModule(resolveRelative(fromPath, specifier, readSource)).exports;
+    const requireFn = (rawSpecifier: string): unknown => {
+      const target = resolveRequireTarget(fromPath, rawSpecifier);
+      if (target === BUILTIN) {
+        const specifier = rawSpecifier.startsWith("node:") ? rawSpecifier.slice(5) : rawSpecifier;
+        return builtins[specifier];
       }
-
-      // An absolute-path specifier - real Node supports this directly (no
-      // node_modules walk, no "main" field, just the same file/directory
-      // candidate suffixes a relative require tries). This is how a thin
-      // `/bin/<name>.js` shim can load a real, separately-vendored program by
-      // its absolute VFS path (e.g. a vendored npm's bin/npm-cli.js).
-      if (specifier.startsWith("/")) {
-        const resolved = fileCandidates(specifier).find((candidate) => readSource(candidate) !== undefined);
-        if (resolved) return loadModule(resolved).exports;
-        throw new Error(`Cannot find module '${specifier}'`);
-      }
-
-      // A private package-imports specifier (real Node's "imports" field) -
-      // e.g. chalk@5's own `require('#ansi-styles')`. Checked before the
-      // node_modules walk below since a leading "#" can never be a bare
-      // package name.
-      if (specifier.startsWith("#")) {
-        const resolved = resolvePackageImportsSync(fromPath, specifier, readSource);
-        if (resolved) return loadModule(resolved).exports;
-        throw new Error(`Cannot find package import '${specifier}' from '${fromPath}'`);
-      }
-
-      const resolved = resolveBareSync(fromPath, specifier, readSource);
-      if (resolved) return loadModule(resolved).exports;
-
-      throw new Error(`Cannot find module '${specifier}' from '${fromPath}'`);
+      return loadModule(target).exports;
     };
+
+    // require.resolve() - real Node's "give me the path, don't load it"
+    // escape hatch. Traced need: real npm's own dependency tree (e.g.
+    // @npmcli/run-script's make-spawn-args.js) calls this directly to find
+    // a binary/script's location without actually require()ing it.
+    requireFn.resolve = (rawSpecifier: string): string => {
+      const target = resolveRequireTarget(fromPath, rawSpecifier);
+      // Real Node's require.resolve() returns a core module's own name back
+      // (`require.resolve('fs') === 'fs'`), not a file path.
+      return target === BUILTIN ? rawSpecifier : target;
+    };
+
+    return requireFn;
   };
 
   /** Backs a compiled module's rewritten `__dwcImport(...)` call - real
@@ -320,15 +362,62 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
         throw new Error(`${message} while parsing '${path}'`);
       }
     }
-    const moduleObj = { exports: record.exports };
-    wrapper(moduleObj, moduleObj.exports, createRequire(path), path, dirname(path), createDynamicImport(path), interopDefault);
-    record.exports = moduleObj.exports;
+    // `record` itself is passed as `module`, NOT a separate `{ exports:
+    // record.exports }` copy - a circular require() (real, confirmed case:
+    // pacote's fetcher.js does `module.exports = FetcherBase` THEN
+    // `require('./file.js')`, which itself `require('./fetcher.js')`s back)
+    // resolves via this SAME cached `record` (loadModule's cache hit above
+    // returns it as-is, mid-execution). If guest code does
+    // `module.exports = X` (a full reassignment, not a `exports.foo = ...`
+    // mutation of the original object), that has to be visible to the
+    // circular caller IMMEDIATELY - a separate `moduleObj` copied back to
+    // `record` only after `wrapper()` returns would leave the circular
+    // caller holding the stale initial `{}` the whole time, exactly the
+    // shape of bug real npm's own pacote hit (a base class handed to
+    // `class X extends Y` as a plain object instead of the real class).
+    const initialExports = record.exports;
+    try {
+      wrapper(record, initialExports, createRequire(path), path, dirname(path), createDynamicImport(path), interopDefault);
+    } catch (error) {
+      // Every stack frame `new Function`-compiled code produces is an
+      // anonymous "eval at loadModule" line - real Node's own file:line
+      // frames don't exist here at all, so a deep require chain's error
+      // (npm's own dependency tree routinely runs 10+ requires deep) is
+      // otherwise unattributable to any specific file. Tagged once, on the
+      // ORIGINATING module only - the same error re-throws up through every
+      // enclosing require() on its way out, and re-tagging at each of THOSE
+      // levels would misattribute it to the wrong (calling, not failing)
+      // file.
+      const tagged = error as unknown as Record<symbol, unknown>;
+      if (error instanceof Error && !tagged[MODULE_PATH_TAG]) {
+        tagged[MODULE_PATH_TAG] = path;
+        error.message = `${error.message} (while executing '${path}')`;
+      }
+      throw error;
+    }
 
     return record;
   };
 
+  // Real, native-semantics ESM support (live bindings, dynamic import(),
+  // top-level await, package.json "exports" resolution) for a file
+  // positively identified as ESM ahead of time (a .mjs extension, or the
+  // nearest package.json has "type": "module") - see esmLoader.ts's own
+  // doc comment for the full design. Everything else (the overwhelming
+  // common case) stays on the synchronous CJS path above, completely
+  // unchanged - only an entry point (or something reached via a static/
+  // dynamic import FROM one) actually detected as ESM ever touches this.
+  const esmLoader = createEsmLoader({
+    readSource,
+    requireSync: (fromPath, specifier) => createRequire(fromPath)(specifier),
+    resolvePackageImports: (fromPath, specifier) => resolvePackageImportsSync(fromPath, specifier, readSource),
+  });
+
   return {
-    run(entryPath: string): unknown {
+    async run(entryPath: string): Promise<unknown> {
+      if (esmLoader.isEsmPath(entryPath)) {
+        return esmLoader.run(entryPath);
+      }
       return loadModule(entryPath).exports;
     },
   };

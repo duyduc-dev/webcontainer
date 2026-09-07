@@ -94,6 +94,11 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
   const setTimeoutFn = (fn: Task, delayMs = 0, ...args: unknown[]): number => {
     const id = nextId++;
     timers.set(id, { id, fn, args, dueAt: now() + Math.max(0, delayMs) });
+    // A runOnce() already parked in the activeHandles-or-earlier-timer wait
+    // below needs to re-evaluate once a new timer exists (it may be due
+    // sooner than whatever it was already waiting on) - matches
+    // setImmediate/nextTick/unref/queueClose, all of which already wake().
+    wake();
     return id;
   };
 
@@ -169,8 +174,31 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
     // network request) means the loop isn't actually done — its reply arrives via
     // a real message from another worker, not anything already queued here, so
     // wait for that to happen (it will call nextTick/unref, both of which wake()).
-    if (activeHandles > 0) {
-      await waitForWake();
+    //
+    // A scheduled-but-not-yet-due timer is the same situation, just with a known
+    // wake time instead of an unknown one: without this branch, a bare
+    // `setTimeout(fn, 500)` with nothing else pending fell all the way through to
+    // `return false` below, and the caller (worker.ts's own drain()) reads a
+    // `false` runOnce() result as "truly nothing left to do" and tears the whole
+    // process down — abandoning the timer before it ever got a chance to become
+    // due, even though hasPendingWork() correctly reported `timers.size > 0` the
+    // whole time. Racing waitForWake() against a real host-clock timeout for
+    // "however long until the earliest timer is due" lets a new, even-earlier
+    // timer (or any other work) still cut the wait short via wake().
+    if (activeHandles > 0 || timers.size > 0) {
+      const earliestPending = [...timers.values()].reduce(
+        (earliest: Timer | null, timer) => (!earliest || timer.dueAt < earliest.dueAt ? timer : earliest),
+        null,
+      );
+      if (earliestPending) {
+        const delay = Math.max(0, earliestPending.dueAt - now());
+        await Promise.race([
+          waitForWake(),
+          new Promise<void>((resolve) => setTimeout(resolve, delay)),
+        ]);
+      } else {
+        await waitForWake();
+      }
       return true;
     }
 

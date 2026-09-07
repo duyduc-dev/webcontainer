@@ -14,6 +14,7 @@ export default defineConfig([
       "workers/fs/worker": "src/workers/fs/worker.ts",
       "workers/process/worker": "src/workers/process/worker.ts",
       "workers/fetcher/worker": "src/workers/fetcher/worker.ts",
+      "workers/preview/PreviewServiceWorker": "src/workers/preview/PreviewServiceWorker.ts",
     },
     format: ["esm"],
     sourcemap: true,

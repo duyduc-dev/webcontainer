@@ -52,6 +52,7 @@ interface VirtualFileSystem {
   chmod(path: string, mode: number): void;
   symlink(target: string, path: string): void;
   readlink(path: string): string;
+  realpath(path: string): string;
   rm(path: string, options?: RmOptions): void;
   rename(from: string, to: string): void;
   exists(path: string): boolean;
@@ -256,6 +257,12 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     return node.target;
   };
 
+  /** Resolves every symlink in `path`, including the final component
+   * (real Node's fs.realpathSync() semantics) - reuses the same
+   * resolveRealPath() every other op already resolves symlinks through, just
+   * exposed directly rather than as an internal step toward a tree walk. */
+  const realpath = (path: string): string => resolveRealPath(normalize(path), true);
+
   const rm = (path: string, options: RmOptions = {}): void => {
     const normalized = normalize(path);
     const { parent, name } = resolveParent(normalized);
@@ -289,7 +296,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     }
   };
 
-  return { mkdir, writeFile, readFile, readdir, stat, lstat, chmod, symlink, readlink, rm, rename, exists };
+  return { mkdir, writeFile, readFile, readdir, stat, lstat, chmod, symlink, readlink, realpath, rm, rename, exists };
 };
 
 export { createVirtualFileSystem };

@@ -8,6 +8,8 @@ import { createFsClient } from "./fsClient";
 import { createNetRelay } from "./netRelay";
 import { createProcessClient } from "./processClient";
 import type { ShellExecPayload, SpawnPayload } from "./processClient";
+import { fetchFromGuestServer } from "./previewRelay";
+import type { PreviewFetchInit } from "./previewRelay";
 import { postErrorReply, postReply } from "./service";
 
 const processTable = createProcessTable();
@@ -27,6 +29,10 @@ router.handle("FS_REQUEST", (payload) => fsClient.request(payload));
 router.handle("NET_REQUEST", (payload) => fetcherClient.request(payload as NetRequestPayload));
 router.handle("PROCESS_SPAWN", (payload) => processClient.spawn(payload as SpawnPayload));
 router.handle("SHELL_EXEC", (payload) => processClient.runShell(payload as ShellExecPayload));
+router.handle("PREVIEW_FETCH", (payload) => {
+  const { port, path, init } = payload as { port: number; path: string; init?: PreviewFetchInit };
+  return fetchFromGuestServer(netRelay, port, path, init);
+});
 
 self.onmessage = async (event: MessageEvent<RequestEnvelope>) => {
   const { id, type, payload } = event.data;

@@ -12,9 +12,8 @@ interface Router {
  * onmessage adapter. Every future worker (FS, Process, Preview) proxies through
  * a handler registered here rather than being reachable directly from the bridge.
  *
- * Reserved, not yet registered: FS_REQUEST, PROCESS_SPAWN, PREVIEW_* (later phases),
- * NET_REQUEST / NPM_INSTALL (Fetcher Worker seam, deferred). Dispatching any of
- * these today falls through to the ERR_NOT_IMPLEMENTED default below.
+ * Reserved, not yet registered: NPM_INSTALL (Fetcher Worker seam, deferred).
+ * Dispatching it today falls through to the ERR_NOT_IMPLEMENTED default below.
  */
 const createRouter = (): Router => {
   const handlers = new Map<string, Handler>();

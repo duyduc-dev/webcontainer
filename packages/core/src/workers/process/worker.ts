@@ -260,10 +260,20 @@ const write = (stream: "stdout" | "stderr", chunk: string | Uint8Array): void =>
  * `process.stdout.write(...)` idiom (real Node's own convention, which every
  * demo/script so far has avoided in favor of console.log). Reference-equality
  * checks against these in vendored lib code (net.js, streams/readable.js)
- * stay correct either way; nothing there calls .write() on them. */
-const createWritableStream = (stream: "stdout" | "stderr") => ({
-  write: (chunk: string | Uint8Array): boolean => {
+ * stay correct either way; nothing there calls .write() on them.
+ *
+ * `write()`'s optional callback matters more than it looks: real npm's own
+ * exit-handler.js flushes with `stderr.write('', () => stdout.write('', () =>
+ * process.exit(...)))` specifically so it "doesn't hang on things like the
+ * update notifier" instead of waiting for the event loop to drain on its
+ * own — if that callback is silently dropped, process.exit() is never
+ * reached and the guest process hangs forever right after its last output,
+ * regardless of anything actually still pending. */
+const createWritableStream = (stream: "stdout" | "stderr", nextTick: (callback: () => void) => void) => ({
+  write: (chunk: string | Uint8Array, encodingOrCallback?: string | (() => void), callback?: () => void): boolean => {
     write(stream, chunk);
+    const cb = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+    if (cb) nextTick(cb);
     return true;
   },
   isTTY: false,
@@ -272,10 +282,14 @@ const createWritableStream = (stream: "stdout" | "stderr") => ({
 const createSyncFsChannel = (syncFs: SyncFsChannelPayload | null): SyncFsChannel | null =>
   syncFs ? { port: syncFs.port, control: new Int32Array(syncFs.control), data: syncFs.data } : null;
 
-const createFsBuiltinFromChannel = (channel: SyncFsChannel | null): FsBuiltin => {
+const createFsBuiltinFromChannel = (
+  channel: SyncFsChannel | null,
+  nextTick: (callback: () => void) => void,
+  wrapBuffer: (bytes: Uint8Array) => Uint8Array,
+): FsBuiltin => {
   const io: FsBuiltinIO = {};
   if (channel) io.callSync = (request) => callSyncFs(channel, request);
-  return createFsBuiltin(io);
+  return createFsBuiltin(io, nextTick, wrapBuffer);
 };
 
 const decoder = new TextDecoder();
@@ -297,8 +311,16 @@ const createModuleReadFileSync = (channel: SyncFsChannel | null): ((path: string
   };
 };
 
-const boot = (payload: BootPayload): void => {
+const boot = async (payload: BootPayload): Promise<void> => {
   const eventLoop = createEventLoop();
+
+  // Real Node's process.umask() getter/setter affects default file-creation
+  // permissions - there's no real host umask to report on, so this is a
+  // plausible, fixed stand-in (0o022, the most common Linux default),
+  // mutable via the real setter form since that's a cheap, correct addition
+  // once the getter exists. Traced need: real npm's own bin-links dependency
+  // computes an executable's mode as `0o777 & ~process.umask()`.
+  let currentUmask = 0o022;
 
   const processGlobal: { nextTick: typeof eventLoop.nextTick; env: Record<string, string>; [key: string]: unknown } = {
     argv: ["node", payload.entryPath, ...payload.argv],
@@ -310,8 +332,8 @@ const boot = (payload: BootPayload): void => {
       exitProcess(exitCode);
     },
     nextTick: eventLoop.nextTick,
-    stdout: createWritableStream("stdout"),
-    stderr: createWritableStream("stderr"),
+    stdout: createWritableStream("stdout", eventLoop.nextTick),
+    stderr: createWritableStream("stderr", eventLoop.nextTick),
     title: "node",
     // Matches the pinned version the vendored lib/*.js sources actually come
     // from (see e.g. lib/net.js's own "VENDORED VERBATIM from Node.js
@@ -327,6 +349,28 @@ const boot = (payload: BootPayload): void => {
     // mounted at /usr/lib/node_modules/npm, so that derivation lands on the
     // same /usr a real global npm install would also compute.
     execPath: "/usr/bin/node",
+    umask(mask?: number): number {
+      const previous = currentUmask;
+      if (mask !== undefined) currentUmask = mask;
+      return previous;
+    },
+    // Real Node's process.report is a whole diagnostic-report subsystem
+    // (getReport()/writeReport(), signal-triggered reports, .directory,
+    // .filename, ...) - not implemented here beyond the two members real
+    // npm's own npm-install-checks actually touches while probing libc
+    // family: it toggles `excludeNetwork` around a `getReport()` call, then
+    // reads `report.header.glibcVersionRuntime` and `report.sharedObjects`.
+    // There's no real glibc/musl to detect from inside a browser sandbox,
+    // so an empty header/sharedObjects shape is the honest answer - it
+    // makes that probe correctly conclude "family unknown" (null), the same
+    // outcome real Node reaches on a platform report can't identify either,
+    // rather than fabricating a specific libc.
+    report: {
+      excludeNetwork: false,
+      getReport(): { header: Record<string, never>; sharedObjects: string[] } {
+        return { header: {}, sharedObjects: [] };
+      },
+    },
   };
 
   // 'net' needs the loop's close phase + liveness ref/unref (see eventLoop.ts's
@@ -369,6 +413,10 @@ const boot = (payload: BootPayload): void => {
     console: {
       log: (...args: unknown[]) => write("stdout", `${args.map(String).join(" ")}\n`),
       info: (...args: unknown[]) => write("stdout", `${args.map(String).join(" ")}\n`),
+      // Real Node's console.debug() is a literal alias for console.log(),
+      // not a separate stream/behavior - traced need: npm itself calls it
+      // somewhere in its own early bootstrap, before config resolution.
+      debug: (...args: unknown[]) => write("stdout", `${args.map(String).join(" ")}\n`),
       warn: (...args: unknown[]) => write("stderr", `${args.map(String).join(" ")}\n`),
       error: (...args: unknown[]) => write("stderr", `${args.map(String).join(" ")}\n`),
     },
@@ -405,7 +453,8 @@ const boot = (payload: BootPayload): void => {
   // on, so every accepted cross-process connection dispatches into a
   // `pipeServers` map nothing ever populated and gets closed immediately.
   const syncFsChannel = createSyncFsChannel(payload.syncFs);
-  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel);
+  const BufferCtor = (vendoredBuiltins.buffer as { Buffer: { from(bytes: Uint8Array): Uint8Array } }).Buffer;
+  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel, eventLoop.nextTick, (bytes) => BufferCtor.from(bytes));
   // Real Node's `fs` module also carries a `.promises` namespace, the same
   // object `require('fs/promises')` returns directly - both point at the
   // one fsBuiltin instance so a `fs.promises.readFile()` and a
@@ -482,7 +531,12 @@ const boot = (payload: BootPayload): void => {
   });
 
   try {
-    moduleLoader.run(payload.entryPath);
+    // A genuinely ESM entry point (see moduleLoader.ts/esmLoader.ts) is
+    // evaluated via real, Promise-based native import() - a throw becomes a
+    // rejection here rather than a synchronous throw, but the CJS fast path
+    // (the overwhelming common case) still throws synchronously exactly as
+    // before; either way, `await` catches it the same way.
+    await moduleLoader.run(payload.entryPath);
   } catch (error) {
     reportUncaught(error);
     return;

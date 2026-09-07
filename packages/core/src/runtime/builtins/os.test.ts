@@ -29,4 +29,15 @@ describe("createOsModule", () => {
   it("EOL is a plain newline", () => {
     expect(createOsModule().EOL).toBe("\n");
   });
+
+  it("constants.errno exposes standard Linux errno codes by name", () => {
+    const os = createOsModule();
+    // Real, fixed Linux/glibc values (traced need: @npmcli/fs's own
+    // cp/polyfill.js destructures exactly these four at module load).
+    expect(os.constants.errno.ENOENT).toBe(2);
+    expect(os.constants.errno.EEXIST).toBe(17);
+    expect(os.constants.errno.ENOTDIR).toBe(20);
+    expect(os.constants.errno.EISDIR).toBe(21);
+    expect(os.constants.errno.EINVAL).toBe(22);
+  });
 });

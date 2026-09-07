@@ -21,6 +21,7 @@ const requireCrypto = () => {
     randomBytes(size: number, callback?: (err: Error | null, buf: unknown) => void): { length: number } | undefined;
     randomUUID(): string;
     randomInt(min: number, max?: number, callback?: (err: Error | null, n: number) => void): number | undefined;
+    getHashes(): string[];
   };
 };
 
@@ -47,6 +48,16 @@ describe("vendored 'crypto' (pure-JS hash/hmac/random subset)", () => {
     );
   });
 
+  it("matches known sha512 test vectors (real npm's own ssri dependency defaults every integrity check to this algorithm)", () => {
+    const crypto = requireCrypto();
+    expect(crypto.createHash("sha512").update("").digest("hex")).toBe(
+      "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+    );
+    expect(crypto.createHash("sha512").update("abc").digest("hex")).toBe(
+      "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+    );
+  });
+
   it("accumulates multiple update() calls before digesting", () => {
     const crypto = requireCrypto();
     const incremental = crypto.createHash("sha256").update("ab").update("c").digest("hex");
@@ -64,7 +75,17 @@ describe("vendored 'crypto' (pure-JS hash/hmac/random subset)", () => {
 
   it("throws a clear error for an unsupported digest", () => {
     const crypto = requireCrypto();
-    expect(() => crypto.createHash("sha512")).toThrow(/sha512.*not supported/);
+    expect(() => crypto.createHash("sha384")).toThrow(/sha384.*not supported/);
+  });
+
+  it("getHashes() reports exactly the digests createHash() actually supports - no more, no less", () => {
+    const crypto = requireCrypto();
+    const hashes = crypto.getHashes();
+
+    expect(hashes.sort()).toEqual(["md5", "sha1", "sha256", "sha512"]);
+    for (const algorithm of hashes) {
+      expect(() => crypto.createHash(algorithm)).not.toThrow();
+    }
   });
 
   it("matches a known HMAC-SHA256 test vector (RFC 4231 test case 1)", () => {
@@ -72,6 +93,15 @@ describe("vendored 'crypto' (pure-JS hash/hmac/random subset)", () => {
     const key = String.fromCharCode(0x0b).repeat(20); // "binary"-encoded 0x0b x 20
     const hmac = crypto.createHmac("sha256", key).update("Hi There").digest("hex");
     expect(hmac).toBe("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+  });
+
+  it("matches a known HMAC-SHA512 test vector (RFC 4231 test case 1)", () => {
+    const crypto = requireCrypto();
+    const key = String.fromCharCode(0x0b).repeat(20);
+    const hmac = crypto.createHmac("sha512", key).update("Hi There").digest("hex");
+    expect(hmac).toBe(
+      "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854",
+    );
   });
 
   it("produces different output for different keys", () => {

@@ -58,6 +58,8 @@ import blobFactory from "./internal/blob";
 import optionsFactory from "./internal/options";
 import startupSnapshotFactory from "./internal/v8/startup_snapshot";
 import fetchTransportFactory from "./internal/fetch-transport";
+import inflateFactory from "./internal/inflate";
+import httpParserFactory from "./internal/http_parser";
 import internalTimersFactory from "./internal/timers";
 import internalAsyncHooksFactory from "./internal/async_hooks";
 import blocklistFactory from "./internal/blocklist";
@@ -138,6 +140,8 @@ const FACTORIES: Record<string, NodeFactory> = {
   "internal/options": optionsFactory,
   "internal/v8/startup_snapshot": startupSnapshotFactory,
   "internal/fetch-transport": fetchTransportFactory,
+  "internal/inflate": inflateFactory,
+  "internal/http_parser": httpParserFactory,
   "internal/timers": internalTimersFactory,
   "internal/async_hooks": internalAsyncHooksFactory,
   "internal/blocklist": blocklistFactory,

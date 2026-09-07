@@ -91,14 +91,41 @@ describe("eventLoop", () => {
     expect(loop.hasPendingWork()).toBe(false);
   });
 
-  it("runOnce returns false when nothing is ready yet", async () => {
-    const loop = createEventLoop({ now: () => 0 });
-    loop.setTimeout(() => {}, 1000);
+  it("runOnce waits for a scheduled-but-not-yet-due timer instead of giving up on it (regression: a bare setTimeout with nothing else pending used to make runOnce() return false immediately, which drain() read as 'nothing left to do' and tore the process down before the timer ever fired)", async () => {
+    const loop = createEventLoop();
+    let fired = false;
+    loop.setTimeout(() => {
+      fired = true;
+    }, 20);
 
+    // Mirrors drain()'s own loop: the first call waits until the timer
+    // becomes due (returning true because time passed / work happened),
+    // the next call is what actually runs it - a single runOnce() call is
+    // "wait or run one thing," never both in the same call.
+    for (let i = 0; i < 5 && !fired; i++) {
+      const didWork = await loop.runOnce();
+      expect(didWork).toBe(true);
+    }
+
+    expect(fired).toBe(true);
+    expect(loop.hasPendingWork()).toBe(false);
+  });
+
+  it("runOnce returns false only when there is truly nothing pending at all - no timers, no active handles", async () => {
+    const loop = createEventLoop();
     const didWork = await loop.runOnce();
-
     expect(didWork).toBe(false);
-    expect(loop.hasPendingWork()).toBe(true);
+  });
+
+  it("scheduling a timer while runOnce is already waiting (e.g. on an active handle) wakes it immediately rather than only on the next active-handle event", async () => {
+    const loop = createEventLoop();
+    loop.ref(); // simulate an in-flight request with no timer of its own yet
+
+    const runOncePromise = loop.runOnce();
+    queueMicrotask(() => loop.setTimeout(() => {}, 10));
+
+    const didWork = await runOncePromise;
+    expect(didWork).toBe(true);
   });
 
   it("runs close callbacks after immediates but before the loop considers itself done", async () => {
