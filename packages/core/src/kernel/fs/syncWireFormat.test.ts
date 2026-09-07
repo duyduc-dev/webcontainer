@@ -36,6 +36,7 @@ describe("syncWireFormat requests", () => {
       op: FsOp.WRITE_FILE,
       path: "/a.bin",
       contents,
+      more: false,
     });
   });
 
@@ -114,10 +115,11 @@ describe("syncWireFormat requests", () => {
 describe("syncWireFormat responses", () => {
   it("round-trips a READ_FILE success response", () => {
     const contents = new Uint8Array([9, 8, 7]);
-    expect(roundTripResponse({ ok: true, op: FsOp.READ_FILE, contents })).toEqual({
+    expect(roundTripResponse({ ok: true, op: FsOp.READ_FILE, contents, more: false })).toEqual({
       ok: true,
       op: FsOp.READ_FILE,
       contents,
+      more: false,
     });
   });
 

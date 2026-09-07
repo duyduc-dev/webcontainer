@@ -2,7 +2,7 @@ import { COREUTILS } from "../../kernel/fs/coreutils";
 import { FSError } from "../../kernel/fs/FSError";
 import type { FileSystemTree } from "../../kernel/fs/mount";
 import { mount } from "../../kernel/fs/mount";
-import { serviceSyncFsRequest } from "../../kernel/fs/syncServer";
+import { createSyncFsServerState, serviceSyncFsRequest } from "../../kernel/fs/syncServer";
 import { createVirtualFileSystem } from "../../kernel/fs/VirtualFileSystem";
 import type { RequestEnvelope } from "../../protocol/envelope";
 import { ERR_INTERNAL } from "../../protocol/errors";
@@ -104,7 +104,8 @@ interface AttachSyncChannelPayload {
 
 const attachSyncChannel = (payload: AttachSyncChannelPayload): void => {
   const control = new Int32Array(payload.control);
-  payload.port.onmessage = () => serviceSyncFsRequest(vfs, control, payload.data);
+  const state = createSyncFsServerState();
+  payload.port.onmessage = () => serviceSyncFsRequest(vfs, state, control, payload.data);
 };
 
 type AttachSyncChannelMessage = { type: "ATTACH_SYNC_CHANNEL"; payload: AttachSyncChannelPayload };
