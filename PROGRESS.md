@@ -219,6 +219,19 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
+**Pick up here:** item 3 below (Vite dev server) is the active thread and
+stopped at a specific, well-understood point - a real `node:wasi` builtin
+(traced against exactly what `@rolldown/binding-wasm32-wasi`'s own `.wasm`
+file imports, via `WebAssembly.Module.imports()` on the real downloaded
+binary, not a guessed-at preview1 surface), plus likely making
+`worker_threads.Worker` genuinely work. See item 3's own tail for the full
+context - what's already verified working (the whole `execFileSync` +
+`pnpm` shim + `.resolve` chain, live, including a real npm-registry
+install of the WASM binding package) and exactly where `require('node:wasi')`
+fails. Item 6 (`npm exec`/`@npmcli/promise-spawn`) is a separate, lower-
+priority gap - explicitly deprioritized versus item 3 in an earlier
+session's own decision, still true.
+
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
    every guest process after its last output, and a missing
@@ -362,15 +375,191 @@ unverified steps together.
    (not an ESM problem at all - `perf_hooks` was simply never in
    `createBuiltinModules()`'s registry, unrelated to this work).
 
-   **Next, still expected** (not yet reached - this is what "run it, find
-   the next break" surfaces from here): missing Node builtins Vite's own
-   entry point and dependency tree reach for (`perf_hooks` confirmed
-   missing already; `module`, possibly `worker_threads`, others likely),
-   file-watching (`fs.watch`/chokidar - not implemented at all yet), and
-   real static-asset serving through `http.ServerResponse` (streaming large
-   files - Phase 1's whole-response-buffering simplification may need
-   revisiting if a real Vite bundle turns out too large to buffer
-   comfortably).
+   **A real correctness bug in the ESM loader itself, found continuing this
+   work in a later session: dynamic `import()` was resolved EAGERLY, at
+   scan time, instead of lazily, at call time.** `esmLoader.ts`'s
+   `buildModule()` statically scans a module's source for `import(...)`
+   call sites and, for every match, immediately resolved and built the
+   target - correct for a real STATIC `import` (genuinely evaluated eager
+   per spec) but wrong for dynamic `import()`, whose entire point is
+   deferred, Promise-returning resolution: a specifier that's optional or
+   conditionally-never-called must not crash module evaluation just
+   because it's textually present. This surfaced as real Vite's own
+   `dist/node/chunks/node.js` crashing immediately with `Cannot find
+   module 'esbuild'` - `esbuild` is a real, optional peer dependency
+   (`peerDependenciesMeta: { esbuild: { optional: true } }`, correctly NOT
+   installed by real npm), referenced only inside
+   `const importEsbuild = () => (esbuild ||= import('esbuild'))`, a
+   function never even called by `vite --version`. Fixed: a matched
+   dynamic `import(x)` call site is now rewritten to
+   `globalThis.__dwcDynamicImport(fromPath, specifier)`, a shared async
+   function (assigned fresh on every `createEsmLoader()` call, since
+   there's exactly one esmLoader per process) that only resolves `x` when
+   actually invoked - any resolution failure becomes a properly rejected
+   Promise, not a synchronous crash during module load, matching real
+   `import()` semantics exactly. Verified live (the `esbuild` crash is
+   gone) and by a new moduleLoader.test.ts case asserting a module
+   referencing-but-never-calling a dynamic import of a missing package
+   evaluates cleanly, rejecting only if actually awaited.
+
+   That one fix alone advanced the real error several times in a row -
+   each of the following was found by re-running the real installed
+   `vite.js` after the previous fix and reading whatever `SyntaxError:
+   ... does not provide an export named 'X'` (a real ESM named-export
+   miss - see the CJS-shim mechanism above for why a builtin's missing
+   member surfaces exactly this way) or `Cannot find module 'X'` came back
+   next, same iterative method as everywhere else in this project:
+
+   - `module.createRequire` - real Vite repeatedly does
+     `createRequire(import.meta.url)`, both stored (`const require =
+     createRequire(import.meta.url)`) and called inline
+     (`createRequire(import.meta.url)('pnpapi')`, wrapped in its own
+     try/catch). Added, reusing moduleLoader.ts's real `createRequire`
+     machinery (see the `.resolve` bug below for a subtlety found later).
+   - `util.styleText` - real Vite's CLI version-print path. Implemented
+     with real Node's own ANSI code table and the real TTY-aware no-op
+     rule (`validateStream` checked against `stream.isTTY`, default
+     `process.stdout` - whose `.isTTY` is always `false` in this runtime,
+     so this correctly no-ops exactly like real Node would on any
+     non-TTY stream, not a shortcut).
+   - `fs.readdir`/`fs.realpath` (callback forms) - only the `*Sync`
+     versions existed; real Vite's own node.js chunk does
+     `import { readdir, realpath } from 'node:fs'` at its top level.
+   - `fs.promises.constants` - a plain passthrough (same object as
+     `fs.constants`), not a promise-wrapped method; real Vite does
+     `import { constants } from 'node:fs/promises'`.
+   - `module.Module` - the `Module` *class* itself (`import { Module, ...
+     } from 'node:module'`), used only as `Module.register`/
+     `Module.registerHooks` presence checks (Node 20.6/22.15 experimental
+     loader-hook APIs, feature-detected to build an off-thread config-file
+     importer). Left genuinely `undefined` on both, matching the
+     `vm.ts`/`worker_threads.ts` precedent - correctly makes Vite fall back
+     to its own no-off-thread-importer path, same as a real older Node.
+   - `util.parseEnv` - real Node's own dotenv-compatible `.env` parser
+     (Vite's `--envFile` support); implemented as the actual well-known
+     dotenv `parse()` algorithm (single-regex line scanner), not a
+     reduced approximation.
+   - `util.stripVTControlCharacters` - the real, well-known "ansi-regex"
+     pattern (matches both CSI and OSC escape sequences), the same codes
+     `styleText` above produces.
+
+   **`perf_hooks`/`worker_threads` — DONE.** `perf_hooks` needed only
+   `performance.now()`/`.timeOrigin` (traced against real Vite's own CLI
+   entry point - `PerformanceObserver`/marks/measures aren't touched).
+   `worker_threads` needed `MessageChannel`/`MessagePort` for real (already
+   a native Web API in this Worker realm, just missing Node's own
+   `.ref()`/`.unref()`, added as safe no-ops) plus a `Worker` class that
+   **throws a clear "not implemented" error** if actually constructed,
+   matching the existing `vm.ts` precedent (`runInNewContext`/
+   `createContext` left unimplemented rather than faked) - real in-VM
+   worker-thread execution is a substantial separate undertaking, not
+   something to fake quietly. `module.builtinModules`/`isBuiltin` was
+   already implemented from earlier session work.
+
+   **A real, structural wall was hit next: rolldown-vite's native binding.**
+   Real Vite has migrated its bundler internals to **rolldown** (a
+   Rust-based bundler, "rolldown-vite"), loaded through a native N-API
+   `.node` addon on every real OS platform - fundamentally impossible to
+   load inside a browser Worker sandbox (no native binary execution at
+   all). This is a different *class* of gap than everything above: not a
+   missing JS shim to write, but a genuine capability this environment
+   structurally lacks on the native path.
+
+   Real rolldown's own source already anticipates exactly this class of
+   sandbox: `node_modules/rolldown/dist/shared/binding-*.mjs` checks
+   `globalThis.process?.versions?.["webcontainer"]` (the real, published
+   StackBlitz WebContainers convention for "I'm in a WebContainer-shaped
+   sandbox, adapt") and, if set, calls its own
+   `src/webcontainer-fallback.cjs`: downloads a **WASM/WASI** build of the
+   binding (`@rolldown/binding-wasm32-wasi`) via
+   `execFileSync('pnpm', ['i', bindingPkg], { cwd, stdio: 'inherit' })`,
+   then `require()`s the result instead of the native addon. Since this
+   runtime genuinely IS that same shape of sandbox, `process.versions.webcontainer`
+   was set (worker.ts, an honest one-line marker - this project's own
+   version number, not a claim to literally be StackBlitz's product) to
+   let rolldown's own real fallback code run, rather than reimplementing
+   any of its logic.
+
+   That fallback needed three things this runtime didn't have, all now
+   built and verified live:
+
+   - **`child_process.execFileSync` — a real, new synchronous kernel
+     bridge**, the same *class* of mechanism Phase 4/5 built for
+     `fs.*Sync` (a SharedArrayBuffer + `Atomics.wait`/`notify` pair), but
+     serviced by the **kernel worker's own thread** rather than a
+     dedicated FS-Worker-style server, since "run this program to
+     completion" means reusing the real spawn/boot orchestration
+     `cp-spawn`/`cp-exec` already do (async internally; only the
+     *requesting* process worker's thread blocks, via `Atomics.wait`, for
+     however long the real program takes to exit - up to a 15-minute
+     timeout, since this bridge's own traced call runs a real npm-registry
+     install and this project's own installs have taken minutes live).
+     New: `kernel/childProcess/syncExecWireFormat.ts` (wire format, unit
+     tested), `workers/process/syncExecClient.ts` (guest-side blocking
+     client), `processClient.ts`'s `createSyncExecChannelFor`/
+     `runProgramToCompletion` (kernel-side server + program-runner,
+     resolving `command`/`args` via the same `resolveEntryPoint` `cp-spawn`
+     uses, not shell tokenization, so real `env` threads through cleanly).
+     `spawnSync`/`execSync` remain deliberately unimplemented (no traced
+     need yet) - only `execFileSync` is real.
+   - **A `pnpm` compatibility shim** (`examples/playground/src/vendorNpm.ts`,
+     `/bin/pnpm.js`) - not real pnpm (a whole separate CLI not worth
+     vendoring for one call shape). Rewrites `pnpm i <pkg>` into
+     `npm install <pkg> --no-save` and hands off to the SAME real,
+     already-vendored npm CLI already installed at `/bin/npm.js`, via the
+     exact same `require(NPM_VFS_ROOT + '/bin/npm-cli.js')` + `process.argv`
+     mutation technique the existing `npm.js`/`npx.js` shims already use.
+     Only `pnpm i <one package>` is supported; anything else exits
+     non-zero with a clear message.
+   - **A real bug in `module.createRequire()`, found by this new path**:
+     it returned a plain function with no `.resolve` property at all.
+     TypeScript's structural typing silently accepted this (a function
+     with fewer declared params **is** assignable to a type expecting
+     more, a real, easy-to-miss TS conformance gap) - `tsc --noEmit`
+     reported zero errors while the feature was actually broken. Real
+     rolldown's own fallback code calls
+     `__require.resolve('rolldown/package.json')` before anything else,
+     so every `execFileSync` attempt was silently failing at that exact
+     line and being swallowed by rolldown's own `try/catch`, making the
+     symptom look identical to "nothing happened at all." Fixed by
+     threading moduleLoader.ts's real `createRequire(fromPath)` (which
+     already had a working `.resolve`) all the way down through
+     `builtins/index.ts` and `module.ts`, instead of a flattened
+     `(fromPath, specifier) => unknown` callback - `worker.ts`'s own
+     wiring needed a mutable "fill in after moduleLoader exists" cell
+     either way (same chicken-and-egg `vendoredBuiltins`-built-before-
+     `moduleLoader` situation `net`/`child_process` already have), just
+     now filled with `moduleLoader.createRequire` instead of a narrower
+     `requireSync`.
+
+   **Verified live, all three together**: a direct diagnostic script
+   calling `require('child_process').execFileSync('pnpm', ['i', 'left-pad'], ...)`
+   completed synchronously with the real npm install output and exit code
+   0. Then, running the real installed `vite.js` end-to-end: the console
+   log line `[rolldown] Downloading @rolldown/binding-wasm32-wasi@1.2.7 on
+   WebContainer...` appeared (rolldown's own real fallback code, actually
+   reached and running), and `/tmp/rolldown-1.2.7/node_modules/@rolldown/binding-wasm32-wasi/`
+   was confirmed to exist on disk afterward, with its own real dependencies
+   (`@emnapi/*`, `@napi-rs/*`, `@tybys/*`, `tslib`) - a genuine npm-registry
+   install completed entirely through the new sync bridge + pnpm shim + the
+   `.resolve` fix, exactly as designed.
+
+   **Where it stops now, deliberately** (this session's own explicit
+   choice, not a forced stop): loading the downloaded binding itself needs
+   `require('node:wasi')` (Node's WASI preview1 `WASI` class, for real
+   WebAssembly instantiation) - `Error: Cannot find module 'wasi'`,
+   confirmed via a direct `require()` of
+   `rolldown-binding.wasi.cjs`. That same auto-generated NAPI-RS glue file
+   also imports `worker_threads`'s real `Worker` (for `asyncWorkPoolSize`/
+   `reuseWorker`-driven async NAPI work, not obviously avoidable) - and
+   `Worker` is this project's own deliberately-throwing stub (see above).
+   Implementing a real `node:wasi` (traced against exactly what THIS
+   `.wasm` module imports, via `WebAssembly.Module.imports()`, not a
+   speculative full preview1 surface) plus making `Worker` genuinely work
+   is comparable in size to the sync-exec bridge just built, or larger,
+   with no guarantee the WASI binding doesn't surface further gaps once it
+   actually loads. Explicitly scoped out of this session; the next
+   concrete step for whoever picks this up.
 
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over
