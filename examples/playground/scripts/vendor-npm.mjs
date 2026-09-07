@@ -17,12 +17,20 @@
 
 import { execSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const NPM_VERSION = "10.9.2";
 const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
-const VENDOR_DIR = process.env.DWC_VENDOR_DIR || path.join(ROOT, ".vendor-scratch");
+// Must live OUTSIDE the repo: npm walks up from an empty cwd looking for the
+// nearest package.json to use as the "project" context. A scratch dir inside
+// this monorepo hits examples/playground/package.json, whose
+// "@dwc/core": "workspace:*" dependency real (non-workspace) npm can't parse
+// (EUNSUPPORTEDPROTOCOL). /tmp has no package.json in its ancestry, so npm
+// stops there and installs only what we asked for. Same approach as vivari's
+// own vendor-npm.mjs (VV_VENDOR_DIR default of /tmp/vv-vendor).
+const VENDOR_DIR = process.env.DWC_VENDOR_DIR || path.join(os.tmpdir(), "dwc-vendor-npm");
 const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules", "npm");
 const OUT_FILE = path.join(ROOT, "public", "vendor", "npm.json");
 
