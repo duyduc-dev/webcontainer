@@ -389,6 +389,48 @@ unverified steps together.
    and pure-JS-inflate decisions were surfaced explicitly earlier in this
    project rather than silently picked.
 
+5. **Playground demo replaced with a real React app** (not yet reflected
+   above since it landed after the ESM work's own PROGRESS.md entry).
+   `examples/playground/src/main.ts` now does a real `npm install react@18
+   react-dom@18` (pinned to 18, not `@latest`/19.x - React 19's
+   `react-dom/server` pulls in `node:async_hooks`'s `AsyncLocalStorage`,
+   which needs real V8 async-context propagation this runtime deliberately
+   doesn't fake), then a real guest `http.createServer()` that `require()`s
+   the actual installed React and server-renders a page with it on every
+   request, previewed live through the Service Worker relay. No bundler/
+   dev-server involved - deliberately takes the path that's fully working
+   today rather than the still-blocked Vite dev-server path. Found and
+   fixed one more real gap along the way: `util.TextEncoder`/`TextDecoder`
+   were missing (real Node re-exports the same globals from `require('util')`
+   for backward compat; `react-dom/server`'s own bundled output relies on
+   this).
+
+6. **`npm create`/`npm init` — `vm` fixed, `readline` is next.** Real npm's
+   own `promzard` dependency (used by `npm init`/`npm create` to evaluate a
+   project's init-defaults script) does
+   `const { runInThisContext } = require('vm')`, which crashed immediately
+   with "Cannot find module 'vm'". Added a real `vm.runInThisContext()`
+   (`runtime/builtins/vm.ts`) - scoped to exactly this one traced need, not
+   the full `vm` module: real Node's `vm` is backed by native V8
+   Context/Script bindings for true isolated-global-object sandboxing,
+   which can't be replicated in userland JS at all, but `runInThisContext`
+   specifically doesn't need that - real Node's own semantics for it are
+   "shares the caller's real global scope, not an isolated sandbox" (that's
+   what `runInNewContext`/`createContext` are for), which indirect `eval`
+   already provides correctly, not merely approximately.
+   `runInNewContext`/`createContext`/the `Script` class are deliberately
+   left unimplemented rather than faking isolation, matching the
+   `AsyncLocalStorage` precedent above.
+
+   Verified: `npm create vite@latest` no longer fails on the missing `vm`
+   module and gets measurably further into npm's init flow. It now hits a
+   **different, new** gap: `Cannot find module 'readline'`, from the `read`
+   package (npm's own interactive-prompt dependency, pulled in even with
+   `-- --template vanilla` supplied to skip create-vite's own prompts - npm
+   init's own flow still reaches for it somewhere upstream of that). Not
+   yet investigated - the next "run it, find the next break" candidate for
+   whoever picks this up, separate from the Vite-dev-server gaps in item 3.
+
 ## Reminder: no AI attribution in commits
 
 Per standing preference, commit messages for this project should not
