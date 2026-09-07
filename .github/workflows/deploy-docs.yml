@@ -32,7 +32,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter docs build
+      - run: pnpm --filter docs... build
       - uses: actions/upload-pages-artifact@v3
         with:
           path: apps/docs/dist
