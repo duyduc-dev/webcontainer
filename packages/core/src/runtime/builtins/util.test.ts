@@ -1,5 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { deprecate, inspect, promisify } from "./util";
+import utilModule, { deprecate, inspect, promisify } from "./util";
+
+describe("util.TextEncoder/TextDecoder", () => {
+  // Real npm's own react-dom/server output does
+  // `new (require('util').TextEncoder)()` rather than relying on the global
+  // - traced need found running a real npm-installed react-dom/server.
+  it("are the same real, standard constructors as the globals (a passthrough, not a reimplementation)", () => {
+    expect(utilModule.TextEncoder).toBe(globalThis.TextEncoder);
+    expect(utilModule.TextDecoder).toBe(globalThis.TextDecoder);
+  });
+
+  it("actually work when constructed and called through util's own reference", () => {
+    const bytes = new utilModule.TextEncoder().encode("hello");
+    expect(new utilModule.TextDecoder().decode(bytes)).toBe("hello");
+  });
+});
 
 describe("util.deprecate", () => {
   let errorSpy: ReturnType<typeof vi.spyOn>;

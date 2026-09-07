@@ -149,7 +149,23 @@ const promisify = (
 };
 promisify.custom = promisifyCustomSymbol;
 
-const utilModule = { format, formatWithOptions, inherits, deprecate, inspect, promisify };
+// Real Node's util.TextEncoder/TextDecoder are literally the same
+// constructors as the global ones (`require('util').TextEncoder ===
+// TextEncoder`), kept for backward compatibility with code written before
+// they became real globals - traced need: react-dom/server's own bundled
+// output does `new (require('util').TextEncoder)()` rather than relying on
+// the global. Both are real, standard Web APIs already available natively
+// in this Worker realm, so this is a passthrough, not an implementation.
+const utilModule = {
+  format,
+  formatWithOptions,
+  inherits,
+  deprecate,
+  inspect,
+  promisify,
+  TextEncoder: globalThis.TextEncoder,
+  TextDecoder: globalThis.TextDecoder,
+};
 
 export default utilModule;
 export { deprecate, format, formatWithOptions, inherits, inspect, promisify };
