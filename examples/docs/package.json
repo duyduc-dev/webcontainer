@@ -1,0 +1,9 @@
+{
+  "name": "docs",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Public overview page for duck-webcontainer-api / @dwc/core - deployed to GitHub Pages from this directory (see .github/workflows/deploy-docs.yml).",
+  "scripts": {
+    "dev": "npx --yes serve . -l 4321"
+  }
+}
