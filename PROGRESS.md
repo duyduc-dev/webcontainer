@@ -405,9 +405,10 @@ unverified steps together.
    for backward compat; `react-dom/server`'s own bundled output relies on
    this).
 
-6. **`npm create`/`npm init` — `vm` fixed, `readline` is next.** Real npm's
-   own `promzard` dependency (used by `npm init`/`npm create` to evaluate a
-   project's init-defaults script) does
+6. **`npm create`/`npm init` — `vm`, `readline`, and real stdin all fixed;
+   `npm exec`'s own spawn mechanics are next.** Real npm's own `promzard`
+   dependency (used by `npm init`/`npm create` to evaluate a project's
+   init-defaults script) does
    `const { runInThisContext } = require('vm')`, which crashed immediately
    with "Cannot find module 'vm'". Added a real `vm.runInThisContext()`
    (`runtime/builtins/vm.ts`) - scoped to exactly this one traced need, not
@@ -422,14 +423,47 @@ unverified steps together.
    left unimplemented rather than faking isolation, matching the
    `AsyncLocalStorage` precedent above.
 
-   Verified: `npm create vite@latest` no longer fails on the missing `vm`
-   module and gets measurably further into npm's init flow. It now hits a
-   **different, new** gap: `Cannot find module 'readline'`, from the `read`
-   package (npm's own interactive-prompt dependency, pulled in even with
-   `-- --template vanilla` supplied to skip create-vite's own prompts - npm
-   init's own flow still reaches for it somewhere upstream of that). Not
-   yet investigated - the next "run it, find the next break" candidate for
-   whoever picks this up, separate from the Vite-dev-server gaps in item 3.
+   That unblocked npm's init flow only as far as a **different** gap:
+   `Cannot find module 'readline'`, from the `read` package (npm's own
+   interactive-prompt dependency, pulled in even with `-- --template
+   vanilla` supplied to skip create-vite's own prompts). Investigating
+   `readline`'s actual call site surfaced something bigger underneath it:
+   **`dwc.process.spawn()`'s `.stdin` WritableStream had no path to the
+   guest process at all** - `PROCESS_STDIN` requests had no handler
+   anywhere in the kernel's router and were silently dropped by the host
+   side's own `.catch(() => {})`. Fixed with a real end-to-end pipe
+   (`processTable` now tracks the real Worker backing each process, kept
+   deliberately separate from `ProcessEntry` itself since that's sent to
+   the host via `PROCESS_LIST` and can't carry a raw `Worker` across
+   structured clone; a new `PROCESS_STDIN` route forwards a chunk to that
+   worker; the guest process worker exposes `process.stdin` as a real
+   vendored `Readable`). Then added a real `readline` module
+   (`runtime/builtins/readline.ts`) - scoped to "cooked mode" line reading
+   (buffer bytes, split on newlines, emit one `'line'` event per complete
+   line), not real Node's raw-mode/per-keystroke-echo/in-place-line-editing
+   `readline` (which needs a real raw-mode TTY this runtime doesn't have -
+   a real, documented gap for a caller driving this from a live interactive
+   terminal, not silently faked).
+
+   **Verified**: `npm create vite@latest my-app -- --template vanilla`,
+   with a "y\n" written to the process's real `.stdin` a few seconds after
+   spawning (auto-answering whatever confirmation prompt npm's own `exec`
+   flow shows), now runs to **exit 0** with no missing-module errors at
+   all. But the actual scaffolding didn't happen: `/create-vite-test` came
+   back completely empty afterward, even though
+   `/home/user/.npm/_npx/<hash>` shows npm's `exec` machinery DID fetch and
+   cache `create-vite@9.2.0` correctly - the "> npx / > create-vite my-app
+   --template vanilla" echo line printed (matching real npm's own
+   about-to-run-this-command output), then nothing further, straight to a
+   clean exit. This points at `npm exec`'s own mechanism for actually
+   *launching* the fetched package (likely `@npmcli/promise-spawn`, a real
+   `child_process.spawn()` wrapper - possibly needing `shell: true` or
+   another `child_process` option/mode this runtime's own spawn
+   implementation doesn't yet support) rather than anything about
+   `vm`/`readline`/stdin, which are now all confirmed working correctly.
+   Not yet investigated further - the next "run it, find the next break"
+   candidate for whoever picks this up, separate from the Vite-dev-server
+   gaps in item 3.
 
 ## Reminder: no AI attribution in commits
 
