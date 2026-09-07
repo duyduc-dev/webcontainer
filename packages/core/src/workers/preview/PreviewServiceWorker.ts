@@ -47,6 +47,18 @@ const NAVIGATION_ISOLATION_HEADERS: Record<string, string> = {
   "Cross-Origin-Embedder-Policy": "require-corp",
 };
 
+// Base-path aware: this Service Worker's own registered scope may not be
+// the domain root (e.g. a GitHub Pages project page registers it under
+// "/my-repo/") - `self.registration.scope` is the browser's own resolved,
+// absolute answer for that, always available once this script is running.
+// Every incoming request this worker is asked to handle already carries
+// that scope as a path prefix (the browser only ever routes requests
+// inside a Service Worker's scope to it in the first place), so requests
+// under PREVIEW_SCOPE_PREFIX must be matched with the scope prefixed on,
+// matching Preview.ts's own `url()` doing the same on the host-page side.
+const SCOPE_PATH = new URL(self.registration.scope).pathname;
+const EFFECTIVE_PREVIEW_PREFIX = (SCOPE_PATH.endsWith("/") ? SCOPE_PATH.slice(0, -1) : SCOPE_PATH) + PREVIEW_SCOPE_PREFIX;
+
 const clientPorts = new Map<string, number>();
 const pending = new Map<string, { resolve: (result: RelayResult) => void; reject: (error: unknown) => void }>();
 
@@ -85,8 +97,8 @@ async function relay(request: Omit<PreviewRelayRequest, "requestId">): Promise<R
 }
 
 function resolvePreviewTarget(url: URL, event: FetchEvent): { port: number; path: string } | undefined {
-  if (url.pathname.startsWith(PREVIEW_SCOPE_PREFIX)) {
-    const rest = url.pathname.slice(PREVIEW_SCOPE_PREFIX.length);
+  if (url.pathname.startsWith(EFFECTIVE_PREVIEW_PREFIX)) {
+    const rest = url.pathname.slice(EFFECTIVE_PREVIEW_PREFIX.length);
     const slashIndex = rest.indexOf("/");
     const port = Number(slashIndex === -1 ? rest : rest.slice(0, slashIndex));
     const path = (slashIndex === -1 ? "/" : rest.slice(slashIndex)) + url.search;

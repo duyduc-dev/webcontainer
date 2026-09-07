@@ -47,6 +47,14 @@ type Requester = <T = unknown>(type: string, payload?: unknown) => Promise<T>;
  * PREVIEW_FETCH handler (workers/kernel/previewRelay.ts). */
 const createPreviewAPI = (request: Requester): PreviewAPI => {
   let serviceWorkerReady: Promise<ServiceWorkerRegistration> | undefined;
+  // The pathname the Service Worker actually ended up registered under
+  // (read back from the real ServiceWorkerRegistration, not `options.scope`
+  // as passed in - the browser resolves it to an absolute URL, which is the
+  // authoritative answer regardless of what shape the caller passed).
+  // `null` until `enable()` resolves; `url()` treats that as root ("/"),
+  // matching this API's original root-only behavior for a caller who
+  // doesn't need `enable()` at all (using `fetch()` directly instead).
+  let previewScope: string | null = null;
 
   const fetchImpl = (port: number, path: string, init: PreviewFetchInit = {}): Promise<PreviewFetchResult> =>
     request<PreviewFetchResult>("PREVIEW_FETCH", { port, path, init });
@@ -73,7 +81,17 @@ const createPreviewAPI = (request: Requester): PreviewAPI => {
   return {
     fetch: fetchImpl,
 
-    url: (port, path = "/") => `${PREVIEW_SCOPE_PREFIX}${port}${path}`,
+    // Base-path aware: a host app registered under a non-root scope (e.g.
+    // GitHub Pages project page at "/my-repo/") needs that prefix on the
+    // returned URL too, or it falls outside the Service Worker's own
+    // registered scope and is never actually intercepted (see
+    // PreviewServiceWorker.ts's matching fix on its own incoming-request
+    // side).
+    url: (port, path = "/") => {
+      const scope = previewScope ?? "/";
+      const base = scope.endsWith("/") ? scope.slice(0, -1) : scope;
+      return `${base}${PREVIEW_SCOPE_PREFIX}${port}${path}`;
+    },
 
     enable: (options) => {
       if (!("serviceWorker" in navigator)) {
@@ -82,6 +100,7 @@ const createPreviewAPI = (request: Requester): PreviewAPI => {
 
       if (!serviceWorkerReady) {
         serviceWorkerReady = navigator.serviceWorker.register(options.swUrl, { scope: options.scope ?? "/" }).then(async (registration) => {
+          previewScope = new URL(registration.scope).pathname;
           await navigator.serviceWorker.ready;
           navigator.serviceWorker.addEventListener("message", handleRelay);
           return registration;

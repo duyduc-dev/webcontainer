@@ -106,6 +106,22 @@ describe("createProcessClient — net-request forwarding", () => {
     });
   });
 
+  // Traced need: dwc.preview's iframe-preview flow depends on
+  // dwc.addEventListener("listen", ({ port }) => ...) actually firing -
+  // previously net-listen only updated netRelay's internal port->processId
+  // map and never reached the host page at all.
+  it("posts a top-level 'listen' event to the host page when a guest process reports net-listen", async () => {
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    const client = setup(fetcherClient);
+
+    await client.spawn({ entryPath: "/index.js" });
+    spawned!.onmessage?.({ data: { type: "net-listen", payload: { port: 4321 } } } as MessageEvent);
+
+    const postMessage = (globalThis as unknown as { self: { postMessage: ReturnType<typeof vi.fn> } }).self
+      .postMessage;
+    expect(postMessage).toHaveBeenCalledWith({ type: "listen", payload: { port: 4321 } });
+  });
+
   it("does not touch the fetcher client for stdout/stderr/exit messages", async () => {
     const fetcherClient: FetcherClient = { request: vi.fn() };
     const client = setup(fetcherClient);

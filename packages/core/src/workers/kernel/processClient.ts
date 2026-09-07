@@ -222,6 +222,11 @@ const bootProcess = async (
     // relaying bytes/EOF/close over an already-established connection.
     if (type === "net-listen") {
       netRelay.listen(processId, eventPayload.port);
+      // Also surfaced as a top-level "listen" event (dwc.addEventListener) -
+      // traced need: the host page has no other way to learn a guest
+      // process just started listening on a port, which dwc.preview's own
+      // iframe-preview flow depends on.
+      onEvent("listen", { port: eventPayload.port }, processId);
       return;
     }
     if (type === "net-close-server") {
@@ -489,6 +494,13 @@ const createProcessClient = (
       }
       if (type === "exit") {
         postEvent("process:exit", { processId, code: eventPayload.code });
+        return;
+      }
+      if (type === "listen") {
+        // Global, not scoped to processId - matches dwc.addEventListener's
+        // documented `{ port }` contract (a host page cares that SOMETHING
+        // is listening on a port, not which spawn() call produced it).
+        postEvent("listen", { port: eventPayload.port });
       }
     });
   };
