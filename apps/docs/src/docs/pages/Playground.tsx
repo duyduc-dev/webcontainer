@@ -88,6 +88,8 @@ function Playground() {
   const procRef = useRef<ProcessHandle | null>(null);
   const restartTimerRef = useRef<number | undefined>(undefined);
   const previewRetriesRef = useRef(0);
+  const previewIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const previewCheckTimerRef = useRef<number | undefined>(undefined);
   const theme = useSystemTheme();
 
   const [files, setFiles] = useState<Record<string, string>>(() => {
@@ -118,6 +120,7 @@ function Playground() {
       previewRetriesRef.current = 0;
       setPreviewNonce((n) => n + 1);
       setPreviewSrc(dwc.preview.url((payload as { port: number }).port));
+      schedulePreviewCheck();
     });
 
     (async () => {
@@ -147,6 +150,10 @@ function Playground() {
     if (restartTimerRef.current !== undefined) {
       window.clearTimeout(restartTimerRef.current);
       restartTimerRef.current = undefined;
+    }
+    if (previewCheckTimerRef.current !== undefined) {
+      window.clearTimeout(previewCheckTimerRef.current);
+      previewCheckTimerRef.current = undefined;
     }
 
     // Dev-server-style restart: stop whatever's still listening from the
@@ -205,10 +212,35 @@ function Playground() {
   useEffect(
     () => () => {
       if (restartTimerRef.current !== undefined) window.clearTimeout(restartTimerRef.current);
+      if (previewCheckTimerRef.current !== undefined) window.clearTimeout(previewCheckTimerRef.current);
       procRef.current?.kill();
     },
     [],
   );
+
+  // Polls the iframe's own document rather than relying on its onLoad event -
+  // confirmed live that onLoad does not reliably fire for a navigation the
+  // Service Worker intercepted and answered itself (a fresh page's very
+  // first preview can go a good 10+ seconds with zero onLoad firing despite
+  // the iframe visibly showing a loaded error page), so this is the only
+  // signal that's actually observed to work for detecting it.
+  const schedulePreviewCheck = () => {
+    if (previewCheckTimerRef.current !== undefined) window.clearTimeout(previewCheckTimerRef.current);
+    const attempt = previewRetriesRef.current;
+    if (attempt >= MAX_PREVIEW_RETRIES) return;
+    previewCheckTimerRef.current = window.setTimeout(() => {
+      previewCheckTimerRef.current = undefined;
+      let text = '';
+      try {
+        text = previewIframeRef.current?.contentDocument?.body?.innerText ?? '';
+      } catch {
+        return;
+      }
+      if (!text.includes('dwc preview relay error')) return;
+      previewRetriesRef.current += 1;
+      run();
+    }, PREVIEW_RETRY_DELAY_MS[attempt]);
+  };
 
   const scheduleRestart = () => {
     if (restartTimerRef.current !== undefined) window.clearTimeout(restartTimerRef.current);
@@ -377,26 +409,7 @@ function Playground() {
               <iframe
                 className="flex-1 bg-white"
                 key={`${previewSrc}#${previewNonce}`}
-                onLoad={(event) => {
-                  // A fresh page's very first preview occasionally comes up
-                  // against a dead process id, and needs real wall-clock
-                  // time (not just a retry attempt) to clear - see
-                  // PREVIEW_RETRY_DELAY_MS. A full respawn is what actually
-                  // recovers it once that time has passed, same as clicking
-                  // "Run now" does today. Bounded, same as any dev-tool
-                  // reconnect-on-first-connect retry.
-                  const attempt = previewRetriesRef.current;
-                  if (attempt >= MAX_PREVIEW_RETRIES) return;
-                  let text = '';
-                  try {
-                    text = event.currentTarget.contentDocument?.body?.innerText ?? '';
-                  } catch {
-                    return;
-                  }
-                  if (!text.includes('dwc preview relay error')) return;
-                  previewRetriesRef.current += 1;
-                  window.setTimeout(() => run(), PREVIEW_RETRY_DELAY_MS[attempt]);
-                }}
+                ref={previewIframeRef}
                 src={previewSrc}
                 title="Live preview"
               />
