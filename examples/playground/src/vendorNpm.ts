@@ -38,6 +38,34 @@ const NODE_GYP_TARGETS = [
  * case moduleLoader.ts's absolute-path require() support was added for. */
 const npmShim = (entry: string): string => `require(${JSON.stringify(`${NPM_VFS_ROOT}/bin/${entry}`)});\n`;
 
+// A narrow `pnpm` compatibility shim, not a real pnpm implementation -
+// traced need: real rolldown's own `src/webcontainer-fallback.cjs` (its
+// first-party fallback for exactly this class of sandbox, gated on
+// `process.versions.webcontainer` - see @dwc/core's own worker.ts comment on
+// that marker) does `execFileSync('pnpm', ['i', bindingPkg], { cwd, stdio:
+// 'inherit' })` to fetch its WASM binding. Rather than vendoring real pnpm
+// (a whole separate, much larger CLI) just to satisfy this one call shape,
+// this rewrites `pnpm i <pkg>` into the equivalent `npm install <pkg>
+// --no-save` and hands off to the SAME real, already-vendored npm CLI this
+// file already installs at /bin/npm.js - same technique as npmShim() above
+// (mutate process.argv, then require() the real CLI entry in place), not a
+// child spawn. Only the one shape rolldown's own fallback actually calls
+// (`i`/`install` with exactly one package-spec positional arg) is
+// supported; anything else exits non-zero with a clear message rather than
+// silently doing the wrong thing.
+const PNPM_SHIM = `const argv = process.argv.slice(2);
+const sub = argv[0];
+const pkg = argv[1];
+if ((sub === 'i' || sub === 'install') && pkg && argv.length === 2) {
+  process.argv.length = 2;
+  process.argv.push('install', pkg, '--no-save', '--no-audit', '--no-fund', '--loglevel=warn');
+  require(${JSON.stringify(`${NPM_VFS_ROOT}/bin/npm-cli.js`)});
+} else {
+  process.stderr.write('pnpm (shim): only "pnpm i <package>" is supported in this runtime (real pnpm is not vendored - this delegates to the real npm CLI instead)\\n');
+  process.exit(1);
+}
+`;
+
 interface FlatNpmAsset {
   version: string;
   files: Record<string, string>;
@@ -98,6 +126,7 @@ const loadVendoredNpm = async (dwc: BootDWCReturn): Promise<{ version: string; f
   await dwc.fs.mkdir("/bin", { recursive: true });
   await dwc.fs.writeFile("/bin/npm.js", npmShim("npm-cli.js"));
   await dwc.fs.writeFile("/bin/npx.js", npmShim("npx-cli.js"));
+  await dwc.fs.writeFile("/bin/pnpm.js", PNPM_SHIM);
 
   return { version: asset.version, fileCount: Object.keys(asset.files).length };
 };

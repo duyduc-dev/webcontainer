@@ -1,5 +1,13 @@
 import type { ProcessTable } from "../../kernel/processTable";
 import { FS_SYNC_CONTROL_LENGTH, FS_SYNC_DATA_BUFFER_SIZE } from "../../kernel/fs/syncWireFormat";
+import {
+  decodeSyncExecRequest,
+  encodeSyncExecResponse,
+  SYNC_EXEC_CONTROL_LENGTH,
+  SYNC_EXEC_DATA_BUFFER_SIZE,
+  SYNC_EXEC_STATE_INDEX,
+  SYNC_EXEC_STATE_RESPONDED,
+} from "../../kernel/childProcess/syncExecWireFormat";
 import { DWCError, ERR_INTERNAL } from "../../protocol/errors";
 import { postWithTransfer } from "../../protocol/transfer";
 import { preloadModuleGraph } from "../../runtime/preload";
@@ -96,6 +104,56 @@ const createSyncFsChannelFor = (fsClient: FsClient): { port: MessagePort; contro
   const data = new SharedArrayBuffer(FS_SYNC_DATA_BUFFER_SIZE);
 
   fsClient.attachSyncChannel({ port: port2, control, data });
+
+  return { port: port1, control, data };
+};
+
+/**
+ * When cross-origin isolated, gives a new process a dedicated MessageChannel
+ * + a pair of SharedArrayBuffers for synchronous child_process.execFileSync()
+ * calls - traced need: real rolldown's own WebContainer-detection fallback
+ * (see runtime/builtins/module.ts's own doc comment on `process.versions.webcontainer`)
+ * does `execFileSync('pnpm', ['i', bindingPkg], { cwd, stdio: 'inherit' })`
+ * to fetch its WASM binding, and execFileSync is fully synchronous by real
+ * Node's own contract - unlike sync fs (serviced by a separate, always-idle
+ * FS Worker with instant in-memory VFS ops), this one is serviced by the
+ * KERNEL WORKER'S OWN thread, since running a command to completion means
+ * reusing the exact same spawn/boot orchestration `cp-spawn`/`cp-exec`
+ * already do - `port2.onmessage` fires synchronously (this thread is never
+ * itself blocked; only the REQUESTING process worker blocks, via
+ * Atomics.wait, on a completely different thread) but its body is async,
+ * awaiting the real spawned program's exit exactly like `runShellInternal`
+ * already does for `cp-exec` - the response (and the Atomics.notify wake-up)
+ * only happens once that program has actually finished running, which for
+ * an install-shaped command can take minutes (see syncExecClient.ts's own
+ * timeout).
+ */
+const createSyncExecChannelFor = (
+  fsClient: FsClient,
+  processTable: ProcessTable,
+  fetcherClient: FetcherClient,
+  netRelay: NetRelay,
+): { port: MessagePort; control: SharedArrayBuffer; data: SharedArrayBuffer } | null => {
+  if (!self.crossOriginIsolated) return null;
+
+  const { port1, port2 } = new MessageChannel();
+  const control = new SharedArrayBuffer(SYNC_EXEC_CONTROL_LENGTH * Int32Array.BYTES_PER_ELEMENT);
+  const data = new SharedArrayBuffer(SYNC_EXEC_DATA_BUFFER_SIZE);
+  const controlView = new Int32Array(control);
+
+  port2.onmessage = () => {
+    const request = decodeSyncExecRequest(data);
+    void (async () => {
+      try {
+        const result = await runProgramToCompletion(fsClient, processTable, fetcherClient, netRelay, request);
+        encodeSyncExecResponse({ ok: true, exitCode: result.exitCode, output: result.output }, data);
+      } catch (error) {
+        encodeSyncExecResponse({ ok: false, message: error instanceof Error ? error.message : String(error) }, data);
+      }
+      Atomics.store(controlView, SYNC_EXEC_STATE_INDEX, SYNC_EXEC_STATE_RESPONDED);
+      Atomics.notify(controlView, SYNC_EXEC_STATE_INDEX);
+    })();
+  };
 
   return { port: port1, control, data };
 };
@@ -263,8 +321,9 @@ const bootProcess = async (
   };
 
   const syncFs = createSyncFsChannelFor(fsClient);
-  const transfer = syncFs ? [syncFs.port] : [];
-  postWithTransfer(worker, { type: "boot", payload: { entryPath, sources, argv, env, cwd, syncFs } }, transfer);
+  const syncExec = createSyncExecChannelFor(fsClient, processTable, fetcherClient, netRelay);
+  const transfer = [...(syncFs ? [syncFs.port] : []), ...(syncExec ? [syncExec.port] : [])];
+  postWithTransfer(worker, { type: "boot", payload: { entryPath, sources, argv, env, cwd, syncFs, syncExec } }, transfer);
 
   return { processId };
 };
@@ -302,6 +361,58 @@ const runProgramViaShell = async (
       resolveExit();
     }
   });
+
+  await exited;
+  return { output, exitCode };
+};
+
+/** child_process.execFileSync()'s own kernel-side counterpart to
+ * runProgramViaShell above: same "boot, collect stdout+stderr, wait for
+ * exit" shape, but resolving `command`/`args` the same way cp-spawn does
+ * (resolveEntryPoint - PATH-style /bin/<name>.js lookup, or the `node
+ * <script>` special case) rather than through the shell tokenizer, since
+ * execFileSync's whole contract (unlike exec()'s shell line) is running one
+ * program with an explicit argv, no shell parsing involved - and threading
+ * through `env`, which execFileSync's real options support and cp-exec's
+ * shell-line protocol has no field for. Throws (doesn't return null) when
+ * the command can't be resolved, matching execFileSync's own real
+ * ENOENT-shaped throw. */
+const runProgramToCompletion = async (
+  fsClient: FsClient,
+  processTable: ProcessTable,
+  fetcherClient: FetcherClient,
+  netRelay: NetRelay,
+  payload: { command: string; args: string[]; cwd: string; env: Record<string, string> },
+): Promise<{ output: string; exitCode: number }> => {
+  const resolved = await resolveEntryPoint(fsClient, payload.command, payload.args, payload.cwd);
+  if (!resolved) {
+    throw new Error(`${payload.command}: command not found`);
+  }
+
+  let output = "";
+  let exitCode = 0;
+  let resolveExit!: () => void;
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
+
+  await bootProcess(
+    fsClient,
+    processTable,
+    fetcherClient,
+    netRelay,
+    { entryPath: resolved.entryPath, argv: resolved.args, env: payload.env, cwd: payload.cwd },
+    (type, eventPayload) => {
+      if (type === "stdout" || type === "stderr") {
+        output += decoder.decode(eventPayload.chunk);
+        return;
+      }
+      if (type === "exit") {
+        exitCode = eventPayload.code;
+        resolveExit();
+      }
+    },
+  );
 
   await exited;
   return { output, exitCode };

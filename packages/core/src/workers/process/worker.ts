@@ -6,9 +6,18 @@ import { createModuleLoader } from "../../runtime/moduleLoader";
 import { FsOp } from "../../kernel/fs/syncWireFormat";
 import { callSyncFs } from "./syncFsClient";
 import type { SyncFsChannel } from "./syncFsClient";
+import { callSyncExec } from "./syncExecClient";
+import type { SyncExecChannel } from "./syncExecClient";
+import { DWCError, ERR_NOT_ISOLATED } from "../../protocol/errors";
 import { postEvent } from "./service";
 
 interface SyncFsChannelPayload {
+  port: MessagePort;
+  control: SharedArrayBuffer;
+  data: SharedArrayBuffer;
+}
+
+interface SyncExecChannelPayload {
   port: MessagePort;
   control: SharedArrayBuffer;
   data: SharedArrayBuffer;
@@ -21,6 +30,7 @@ interface BootPayload {
   env: Record<string, string>;
   cwd: string;
   syncFs: SyncFsChannelPayload | null;
+  syncExec: SyncExecChannelPayload | null;
 }
 
 interface NetReply {
@@ -154,8 +164,17 @@ const handlePipeConnectResponse = (payload: { id: string; connId: number }): voi
  * bootProcess()). spawn() is an ongoing relay (stdout/stderr/exit events
  * tagged by request id, like net's pipe relay), refed for the child's whole
  * lifetime; exec() is one-shot request/response, same shape as
- * createNetRequest. */
-const createChildProcessBridge = (eventLoop: ReturnType<typeof createEventLoop>) => ({
+ * createNetRequest. execFileSync() is the one genuinely synchronous member -
+ * see syncExecClient.ts/processClient.ts's createSyncExecChannelFor for why
+ * it needs its own SharedArrayBuffer bridge rather than reusing spawn/exec's
+ * postMessage relay (a response delivered via postMessage to this SAME,
+ * Atomics.wait-blocked thread would never be processed - exactly the reason
+ * fs.*Sync needed its own Phase 5 bridge instead of reusing the async fs
+ * relay). `syncExecChannel` is `null` when this context isn't cross-origin
+ * isolated (no SharedArrayBuffer available at all) - matches fs.ts's own
+ * `requireSyncChannel` precedent: throw a clear ERR_NOT_ISOLATED rather than
+ * silently doing nothing. */
+const createChildProcessBridge = (eventLoop: ReturnType<typeof createEventLoop>, syncExecChannel: SyncExecChannel | null) => ({
   spawn: (command: string, args: string[], cwd: string, env: Record<string, string>, handlers: ChildProcessSpawnHandlers): { kill(): void } => {
     const id = crypto.randomUUID();
     eventLoop.ref();
@@ -188,6 +207,24 @@ const createChildProcessBridge = (eventLoop: ReturnType<typeof createEventLoop>)
       });
       self.postMessage({ type: "cp-exec", payload: { id, line, cwd } });
     });
+  },
+  // Combines stdout+stderr into one `output` string, same as exec()/shell
+  // exec()'s own already-established buffered contract above (real
+  // execFileSync separates them; this runtime's own process-event plumbing
+  // doesn't preserve that distinction anywhere yet, and nothing has traced
+  // an actual need for it on the synchronous path specifically) - lib/
+  // child_process.js's real-Node-shaped execFileSync() is what turns a
+  // non-zero exitCode into the thrown, `.status`/`.stdout`-carrying Error
+  // real Node's own execFileSync throws.
+  execFileSync: (command: string, args: string[], cwd: string, env: Record<string, string>): { exitCode: number; output: string } => {
+    if (!syncExecChannel) {
+      throw new DWCError(ERR_NOT_ISOLATED, "Synchronous child_process calls require cross-origin isolation (COOP/COEP)");
+    }
+    const response = callSyncExec(syncExecChannel, { command, args, cwd, env });
+    if (!response.ok) {
+      throw new Error(response.message);
+    }
+    return { exitCode: response.exitCode, output: response.output };
   },
 });
 
@@ -287,6 +324,9 @@ const createWritableStream = (stream: "stdout" | "stderr", nextTick: (callback: 
 const createSyncFsChannel = (syncFs: SyncFsChannelPayload | null): SyncFsChannel | null =>
   syncFs ? { port: syncFs.port, control: new Int32Array(syncFs.control), data: syncFs.data } : null;
 
+const createSyncExecChannel = (syncExec: SyncExecChannelPayload | null): SyncExecChannel | null =>
+  syncExec ? { port: syncExec.port, control: new Int32Array(syncExec.control), data: syncExec.data } : null;
+
 const createFsBuiltinFromChannel = (
   channel: SyncFsChannel | null,
   nextTick: (callback: () => void) => void,
@@ -345,7 +385,20 @@ const boot = async (payload: BootPayload): Promise<void> => {
     // v24.18.0" header) - the most honest answer for anything (like npm's own
     // engines check) that compares process.version against what's running.
     version: "v24.18.0",
-    versions: { node: "24.18.0" },
+    // `versions.webcontainer` is a real, publicly-documented convention
+    // StackBlitz's own WebContainers uses so a package can feature-detect
+    // "I'm running inside a WebContainer-shaped sandbox, not a real OS
+    // process" and adapt - traced need: real rolldown's own
+    // dist/shared/binding-*.mjs (rolldown-vite's bundler, loaded via a
+    // native N-API addon everywhere else) checks exactly
+    // `globalThis.process?.versions?.["webcontainer"]` as its own
+    // documented, first-party fallback trigger before giving up with
+    // "Cannot find native binding" - since this runtime genuinely IS that
+    // same shape of sandbox (no real native-binding loading is possible
+    // here either), this is an honest, traced signal, not a lie to dodge a
+    // check; the value is this project's own version, not a claim to BE
+    // StackBlitz's product.
+    versions: { node: "24.18.0", webcontainer: "0.0.1" },
     platform: "linux",
     arch: "x64",
     // Real Node code (traced need: @npmcli/config's own loadGlobalPrefix())
@@ -386,14 +439,28 @@ const boot = async (payload: BootPayload): Promise<void> => {
   // reads it from there) is the one guest code's `require('buffer')` gets too;
   // building two separate instances would make `instanceof Buffer` disagree
   // between them.
+  const syncExecChannel = createSyncExecChannel(payload.syncExec);
   const netContext = {
     queueClose: eventLoop.queueClose,
     ref: eventLoop.ref,
     unref: eventLoop.unref,
     netBridge: createNetBridge(eventLoop),
-    childProcessBridge: createChildProcessBridge(eventLoop),
+    childProcessBridge: createChildProcessBridge(eventLoop, syncExecChannel),
   };
-  const vendoredBuiltins = createBuiltinModules(processGlobal, netContext);
+  // `module.createRequire()`'s returned require() needs moduleLoader's own
+  // createRequire - but moduleLoader itself is constructed below FROM
+  // vendoredBuiltins (via options.builtins), so there's no instance to
+  // reference yet at this point. Filled in right after moduleLoader is
+  // created; guest code never actually calls `module.createRequire()` this
+  // early (require('module') isn't even reachable until a module body
+  // starts running), so the cell is always populated before real use.
+  let moduleLoaderCreateRequire: ((fromPath: string) => ((specifier: string) => unknown) & { resolve(specifier: string): string }) | undefined;
+  const vendoredBuiltins = createBuiltinModules(processGlobal, netContext, (fromPath) => {
+    if (!moduleLoaderCreateRequire) {
+      throw new Error("module.createRequire()'s returned require() was called before this process's module loader finished booting");
+    }
+    return moduleLoaderCreateRequire(fromPath);
+  });
 
   // process.stdin - a real vendored Readable (the same class require('stream')
   // hands guest code, not a hand-rolled stand-in), pushed into from the
@@ -493,6 +560,7 @@ const boot = async (payload: BootPayload): Promise<void> => {
     process: processGlobal,
     readFileSync: createModuleReadFileSync(syncFsChannel),
   });
+  moduleLoaderCreateRequire = moduleLoader.createRequire;
 
   // Real Node emits 'uncaughtException' on `process` before its own default
   // reporting - real npm relies on this (its ExitHandler installs a listener

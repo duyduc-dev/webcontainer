@@ -19,6 +19,7 @@ interface ChildProcessSpawnHandlers {
 interface ChildProcessBridge {
   spawn(command: string, args: string[], cwd: string, env: Record<string, string>, handlers: ChildProcessSpawnHandlers): { kill(): void };
   exec(line: string, cwd: string): Promise<{ output: string; cwd: string; exitCode: number }>;
+  execFileSync(command: string, args: string[], cwd: string, env: Record<string, string>): { exitCode: number; output: string };
 }
 
 interface ChildProcessBindingContext {
@@ -28,6 +29,7 @@ interface ChildProcessBindingContext {
 interface ChildProcessBindings {
   spawn(command: string, args: string[], cwd: string, env: Record<string, string>, handlers: ChildProcessSpawnHandlers): { kill(): void };
   exec(line: string, cwd: string): Promise<{ output: string; cwd: string; exitCode: number }>;
+  execFileSync(command: string, args: string[], cwd: string, env: Record<string, string>): { exitCode: number; output: string };
 }
 
 const createChildProcessBindings = (context: ChildProcessBindingContext): ChildProcessBindings => {
@@ -39,6 +41,7 @@ const createChildProcessBindings = (context: ChildProcessBindingContext): ChildP
   return {
     spawn: (command, args, cwd, env, handlers) => requireBridge().spawn(command, args, cwd, env, handlers),
     exec: (line, cwd) => requireBridge().exec(line, cwd),
+    execFileSync: (command, args, cwd, env) => requireBridge().execFileSync(command, args, cwd, env),
   };
 };
 

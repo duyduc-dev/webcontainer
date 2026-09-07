@@ -6,10 +6,14 @@
 // this identically: their child_process is its own hand-written file
 // (packages/runtime/builtins/child_process.js), not vendored Node source.
 //
-// Async only: spawn/exec/execFile. spawnSync/execSync/execFileSync need a
-// synchronous kernel bridge this runtime doesn't have yet (the same kind
-// Phase 4/5 built for fs.*Sync) — they throw a clear error rather than
-// silently doing the wrong thing.
+// spawn/exec/execFile are async. execFileSync is real, backed by its own
+// SharedArrayBuffer sync kernel bridge (the same kind Phase 4/5 built for
+// fs.*Sync - see workers/process/syncExecClient.ts and
+// workers/kernel/processClient.ts's createSyncExecChannelFor) - traced need:
+// real rolldown's own WebContainer-detection fallback calls it directly to
+// fetch its WASM binding via `pnpm i`. spawnSync/execSync don't have a
+// traced need yet and still throw a clear error rather than silently doing
+// the wrong thing.
 //
 // No child.stdin: there is no bidirectional byte relay from a parent's
 // guest code down into an already-running child's stdin yet (the same cut
@@ -170,11 +174,37 @@ export default function (exports, require, module, process, internalBinding, pri
     return undefined;
   }
 
+  // Genuinely, fully synchronous - blocks this worker thread (via
+  // cp.execFileSync()'s own Atomics.wait bridge) until the spawned program
+  // has actually exited. Combines stdout+stderr into one string, same
+  // documented simplification as exec() above (this runtime's process-event
+  // plumbing doesn't track them separately) - real Node's own `.stdout`/
+  // `.stderr` on a thrown error would differ; here both carry the same
+  // combined text, which is enough for what actually reads them today (real
+  // rolldown's own WebContainer fallback never inspects execFileSync's
+  // return value or a thrown error's fields at all - it only cares that the
+  // call blocks and throws on a non-zero exit).
+  function execFileSync(file, args, options) {
+    const norm = normalizeArgs(file, args, options);
+    const cwd = norm.options.cwd || process.cwd();
+    const env = norm.options.env || process.env;
+
+    const result = cp.execFileSync(norm.command, norm.args, cwd, env);
+    if (result.exitCode !== 0) {
+      const err = new Error(`Command failed: ${[norm.command, ...norm.args].join(" ")}\n${result.output}`);
+      err.status = result.exitCode;
+      err.stdout = result.output;
+      err.stderr = result.output;
+      throw err;
+    }
+    return result.output;
+  }
+
   exports.ChildProcess = ChildProcess;
   exports.spawn = spawn;
   exports.execFile = execFile;
   exports.exec = exec;
+  exports.execFileSync = execFileSync;
   exports.spawnSync = notImplemented("spawnSync");
   exports.execSync = notImplemented("execSync");
-  exports.execFileSync = notImplemented("execFileSync");
 }

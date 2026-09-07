@@ -22,7 +22,7 @@ interface ChildProcessModule {
   ): void;
   spawnSync(): never;
   execSync(): never;
-  execFileSync(): never;
+  execFileSync(file: string, args?: string[], options?: Record<string, unknown>): string;
 }
 interface ChildLike {
   stdout: { on(event: string, listener: (chunk: Uint8Array) => void): void };
@@ -45,7 +45,9 @@ afterEach(() => {
  * emission and this module's process.nextTick(() => emit('error', ...)) both
  * run through the custom event loop's nextTick queue, which (like net.test.ts)
  * only drains while something is actively pumping it. */
-const setup = (bridge: { spawn?: ReturnType<typeof vi.fn>; exec?: ReturnType<typeof vi.fn> } = {}) => {
+const setup = (
+  bridge: { spawn?: ReturnType<typeof vi.fn>; exec?: ReturnType<typeof vi.fn>; execFileSync?: ReturnType<typeof vi.fn> } = {},
+) => {
   const eventLoop = createEventLoop();
   const process = { env: {}, cwd: () => "/", nextTick: eventLoop.nextTick };
   const nodeModules = createNodeModules(process, {
@@ -55,6 +57,7 @@ const setup = (bridge: { spawn?: ReturnType<typeof vi.fn>; exec?: ReturnType<typ
     childProcessBridge: {
       spawn: vi.fn(),
       exec: vi.fn(),
+      execFileSync: vi.fn(),
       ...bridge,
     } as any,
   });
@@ -195,10 +198,54 @@ describe("child_process (guest module against a fake bridge)", () => {
     expect(err?.code).toBe(1);
   });
 
-  it("spawnSync/execSync/execFileSync throw a clear not-implemented error", () => {
+  it("spawnSync/execSync throw a clear not-implemented error (no traced need yet - execFileSync IS real, see below)", () => {
     const { child_process } = setup();
     expect(() => child_process.spawnSync()).toThrow(/not implemented/);
     expect(() => child_process.execSync()).toThrow(/not implemented/);
-    expect(() => child_process.execFileSync()).toThrow(/not implemented/);
+  });
+
+  // Traced need: real rolldown's own WebContainer-detection fallback calls
+  // `execFileSync('pnpm', ['i', pkg], { cwd, stdio: 'inherit' })` directly -
+  // genuinely synchronous, backed by cp.execFileSync()'s own SharedArrayBuffer
+  // bridge (workers/process/syncExecClient.ts), not the async spawn/exec
+  // relay above. The bridge itself is proven live in the browser (same as
+  // net's cross-process relay); this only exercises the guest-visible
+  // module's own real-Node-shaped contract on top of a fake bridge.
+  describe("execFileSync()", () => {
+    it("returns the combined output on a zero exit code", () => {
+      const execFileSync = vi.fn().mockReturnValue({ exitCode: 0, output: "added 1 package\n" });
+      const { child_process } = setup({ execFileSync });
+
+      const result = child_process.execFileSync("pnpm", ["i", "left-pad"], { cwd: "/tmp/rolldown-1.0.0" });
+
+      expect(result).toBe("added 1 package\n");
+      expect(execFileSync).toHaveBeenCalledWith("pnpm", ["i", "left-pad"], "/tmp/rolldown-1.0.0", {});
+    });
+
+    it("throws a real-Node-shaped error (.status/.stdout) on a non-zero exit code", () => {
+      const execFileSync = vi.fn().mockReturnValue({ exitCode: 1, output: "network error\n" });
+      const { child_process } = setup({ execFileSync });
+
+      let error: (Error & { status?: number; stdout?: string }) | undefined;
+      try {
+        child_process.execFileSync("pnpm", ["i", "left-pad"]);
+      } catch (e) {
+        error = e as Error & { status?: number; stdout?: string };
+      }
+
+      expect(error).toBeDefined();
+      expect(error!.status).toBe(1);
+      expect(error!.stdout).toBe("network error\n");
+      expect(error!.message).toContain("Command failed");
+    });
+
+    it("propagates a thrown error from the bridge itself (e.g. command not found)", () => {
+      const execFileSync = vi.fn().mockImplementation(() => {
+        throw new Error("pnpm: command not found");
+      });
+      const { child_process } = setup({ execFileSync });
+
+      expect(() => child_process.execFileSync("pnpm", ["i", "left-pad"])).toThrow(/command not found/);
+    });
   });
 });
