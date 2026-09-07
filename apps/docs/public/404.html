@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>duck-webcontainer-api</title>
+    <script>
+      // GitHub Pages serves this file for any path it doesn't recognize as a
+      // real static asset - which, for a client-routed single-page app,
+      // includes every real page except the one that was last deployed as
+      // index.html. Encode the actual requested path into a query string and
+      // redirect to index.html, which decodes it back (see the inline script
+      // in index.html) and hands it to the router before it ever mounts.
+      var path = location.pathname + location.search + location.hash;
+      location.replace(location.origin + '/webcontainer/?redirect=' + encodeURIComponent(path));
+    </script>
+  </head>
+  <body></body>
+</html>

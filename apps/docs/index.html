@@ -9,6 +9,16 @@
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <title>duck-webcontainer-api</title>
     <meta name="description" content="A WebContainer-style Node.js sandbox that runs entirely in the browser — kernel/worker architecture, real npm, live preview." />
+    <script>
+      // Decode a path 404.html encoded (see that file's own comment) back
+      // into a real URL before the router mounts, so a direct load or
+      // refresh of e.g. /webcontainer/docs/filesystem lands on that route
+      // instead of the redirect having visibly round-tripped through "/".
+      (function () {
+        var redirect = new URLSearchParams(location.search).get('redirect');
+        if (redirect) history.replaceState(null, '', redirect);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

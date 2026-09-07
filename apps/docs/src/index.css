@@ -53,6 +53,61 @@ body {
   color: var(--color-accent-ink);
 }
 
+/* Prose inside a DocPage body - kept as plain CSS rather than repeating
+   utility classes on every nested tag across every docs page. */
+.doc-body h2 {
+  margin-top: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 19px;
+  font-weight: 700;
+}
+.doc-body h3 {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  font-weight: 600;
+}
+.doc-body ul,
+.doc-body ol {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding-left: 1.4rem;
+}
+.doc-body li {
+  list-style: disc;
+}
+.doc-body ol li {
+  list-style: decimal;
+}
+.doc-body code {
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-2);
+  padding: 1px 5px;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+.doc-body a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.doc-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+.doc-body th,
+.doc-body td {
+  border: 1px solid var(--color-border);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.doc-body th {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--color-surface-2);
+}
+
 @keyframes blink {
   50% {
     opacity: 0;
