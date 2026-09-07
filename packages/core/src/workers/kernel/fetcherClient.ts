@@ -1,6 +1,6 @@
 import { createRequest, isReply } from "../../protocol/envelope";
 import type { ReplyEnvelope } from "../../protocol/envelope";
-import { DWCError } from "../../protocol/errors";
+import { DWCError, ERR_WORKER } from "../../protocol/errors";
 import { postWithTransfer } from "../../protocol/transfer";
 import { spawnChildWorker } from "./spawn";
 
@@ -35,6 +35,14 @@ const createFetcherClient = (): FetcherClient => {
 
       if (data.ok) waiting.resolve(data.result);
       else waiting.reject(new DWCError(data.error.code, data.error.message));
+    };
+
+    fetcherWorker.onerror = (event) => {
+      const error = new DWCError(ERR_WORKER, `Fetcher Worker failed to load or crashed: ${event.message || "unknown error"}`);
+      for (const [id, waiting] of pending) {
+        pending.delete(id);
+        waiting.reject(error);
+      }
     };
 
     worker = fetcherWorker;

@@ -1,6 +1,6 @@
 import { createRequest, isReply } from "../../protocol/envelope";
 import type { ReplyEnvelope } from "../../protocol/envelope";
-import { DWCError } from "../../protocol/errors";
+import { DWCError, ERR_WORKER } from "../../protocol/errors";
 import { postWithTransfer } from "../../protocol/transfer";
 import { spawnChildWorker } from "./spawn";
 
@@ -35,6 +35,19 @@ const createFsClient = (): FsClient => {
 
       if (data.ok) waiting.resolve(data.result);
       else waiting.reject(new DWCError(data.error.code, data.error.message));
+    };
+
+    // Without this, a script-load failure (e.g. a broken build that ships
+    // an unresolvable import inside this worker's file) leaves every
+    // pending and future request hanging forever instead of surfacing
+    // anything - confirmed live via a bundling regression that did exactly
+    // this before this handler existed.
+    fsWorker.onerror = (event) => {
+      const error = new DWCError(ERR_WORKER, `FS Worker failed to load or crashed: ${event.message || "unknown error"}`);
+      for (const [id, waiting] of pending) {
+        pending.delete(id);
+        waiting.reject(error);
+      }
     };
 
     worker = fsWorker;

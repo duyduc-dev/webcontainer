@@ -325,6 +325,20 @@ const bootProcess = async (
     onEvent(type, eventPayload, processId);
   };
 
+  // Without this, a script-load failure (e.g. a broken build that ships an
+  // unresolvable import inside this worker's file) leaves the caller
+  // waiting on stdout/exit forever with no signal anything went wrong -
+  // confirmed live via a bundling regression that did exactly this before
+  // this handler existed. Mirrors the "exit" cleanup above so the caller
+  // sees a normal-shaped exit rather than a distinct error path.
+  worker.onerror = (event) => {
+    processTable.remove(processId);
+    netRelay.unregisterWorker(processId);
+    worker.terminate();
+    onEvent("stderr", { chunk: new TextEncoder().encode(`Process worker failed to load or crashed: ${event.message || "unknown error"}\n`) }, processId);
+    onEvent("exit", { code: 1 }, processId);
+  };
+
   const syncFs = createSyncFsChannelFor(fsClient);
   const syncExec = createSyncExecChannelFor(fsClient, processTable, fetcherClient, netRelay);
   const transfer = [...(syncFs ? [syncFs.port] : []), ...(syncExec ? [syncExec.port] : [])];
