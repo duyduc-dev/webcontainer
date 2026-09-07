@@ -3,8 +3,7 @@
 A WebContainer-style sandbox that runs in the browser: a virtual filesystem, a
 shell, real `node`/`npm` execution against the live npm registry, and live
 preview of servers started inside it — all in Web Workers, no backend
-required. Inspired by [StackBlitz WebContainers](https://webcontainers.io/)
-and [vivari](https://github.com/maitrungduc1410/vivari).
+required. Inspired by [StackBlitz WebContainers](https://webcontainers.io/).
 
 ## Install
 

@@ -14,7 +14,6 @@
 //
 // Unlike a real socket-based http, egress here is unconditional: there is no
 // in-VM TLS socket at all, so even https://localhost has nothing to talk to.
-// Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/lib/https.js.
 export default function (exports, require, module, process, internalBinding, primordials) {
   "use strict";
   const EventEmitter = require("events");

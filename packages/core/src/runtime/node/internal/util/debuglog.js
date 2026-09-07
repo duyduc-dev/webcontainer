@@ -1,7 +1,8 @@
 // internal/util/debuglog — stub.
 //
-// NODE_DEBUG channels are disabled in Vivari; debuglog() returns an inert
-// logger so `const debug = debuglog('net')` at the top of a module is free.
+// NODE_DEBUG channels are disabled in this runtime; debuglog() returns an
+// inert logger so `const debug = debuglog('net')` at the top of a module is
+// free.
 
 export default function (exports, require, module, process, internalBinding, primordials) {
   "use strict";

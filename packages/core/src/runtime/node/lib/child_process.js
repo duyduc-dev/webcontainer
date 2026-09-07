@@ -2,9 +2,7 @@
 // lib/child_process.js reaches libuv process spawning through
 // internalBinding('spawn_sync')/'process_wrap', neither of which translates
 // to a Worker-based sandbox any more directly than net.js's TCP/pipe handles
-// did (see bindings/net.ts's own header for that same reasoning). vivari hits
-// this identically: their child_process is its own hand-written file
-// (packages/runtime/builtins/child_process.js), not vendored Node source.
+// did (see bindings/net.ts's own header for that same reasoning).
 //
 // spawn/exec/execFile are async. execFileSync is real, backed by its own
 // SharedArrayBuffer sync kernel bridge (the same kind Phase 4/5 built for
@@ -137,8 +135,8 @@ export default function (exports, require, module, process, internalBinding, pri
   // Runs the WHOLE command string through this runtime's own shell
   // (workers/kernel/processClient.ts's runShell — the same one
   // dwc.shell.exec() uses), not a literal /bin/sh: there is no vendored
-  // POSIX shell here (Phase 8c kept a &&/>-only tokenizer, not vivari's
-  // full interpreter). Real &&/>/PATH-coreutils support comes along for
+  // POSIX shell here (Phase 8c kept a &&/>-only tokenizer, not a full
+  // interpreter). Real &&/>/PATH-coreutils support comes along for
   // free as a result. That shell doesn't track stdout/stderr separately
   // (see runShellInternal's single `output` accumulator), so both callback
   // arguments carry the same combined, in-order text; stderr alone is never

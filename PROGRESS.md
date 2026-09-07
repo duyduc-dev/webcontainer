@@ -55,10 +55,10 @@ does **not** work around this — it's unrelated to which post-install network
 calls run. Fixed by threading `eventLoop.nextTick` through
 `createWritableStream()`.
 
-## 2. Dev-server preview (StackBlitz/vivari-style) — Phases 1–3 DONE
+## 2. Dev-server preview (StackBlitz-style) — Phases 1–3 DONE
 
 Goal: run something like `npm run dev` (Vite) inside the sandbox and see it
-rendered live in the host page, the way StackBlitz/vivari do. Researched
+rendered live in the host page, the way StackBlitz WebContainers do. Researched
 first (a background fork read the existing net/kernel architecture and
 found this exact feature was built once already on the *previous* kernel
 architecture, then deleted in the rewrite — old commits `43de44d`/`5989ab7`
@@ -293,11 +293,11 @@ session's own decision, still true.
    loader was CommonJS-only. Real ESM semantics (not a transpile shim) were
    deliberately chosen - see the plan this shipped under
    (`.claude/plans/quirky-dazzling-umbrella.md` at the time, since
-   archived) for the full design discussion, including consulting a peer
-   session on the reference architecture (vivari) about how it solved the
-   same problem (it went transpile-to-CJS, for the same
-   synchronous-require-via-Atomics.wait reason this project has - several
-   of its concrete lessons were folded in anyway, see below).
+   archived) for the full design discussion, including researching how a
+   comparable in-browser sandbox could solve the same problem (a
+   transpile-to-CJS approach, for the same synchronous-require-via-
+   Atomics.wait reason this project has - several of its concrete lessons
+   were folded in anyway, see below).
 
    New `runtime/esmLoader.ts`: a file positively identified as ESM ahead of
    time (`.mjs` extension, or the nearest `package.json` has `"type":

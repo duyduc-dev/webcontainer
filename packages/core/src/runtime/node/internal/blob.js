@@ -31,7 +31,7 @@ export default function (exports, require, module, process, internalBinding, pri
       return undefined;
     },
     createBlobFromFilePath() {
-      throw new Error("Vivari: fs.openAsBlob() is not supported yet");
+      throw new Error("fs.openAsBlob() is not supported yet");
     },
   };
 }

@@ -1,4 +1,4 @@
-// internal/worker/js_transferable — Vivari shim, not a vendored body.
+// internal/worker/js_transferable — a hand-written shim, not a vendored body.
 //
 // The real module marks an object cloneable/transferable for Node's structured
 // serializer by setting a private symbol, and it reaches internalBinding('messaging')

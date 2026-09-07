@@ -10,12 +10,11 @@
 // The request is buffered, sent as one fetch (method + headers + body), and the
 // response is delivered as a standard http.IncomingMessage-shaped Readable with
 // statusCode/headers, streaming the body bytes the Fetcher Worker already
-// resolved (handed back as a transferred ArrayBuffer, not round-tripped through
-// the filesystem the way vivari's design does — our worker links aren't bounded
-// by a fixed-size SharedArrayBuffer window, so there's nothing to work around).
+// resolved (handed back as a transferred ArrayBuffer - our worker links
+// aren't bounded by a fixed-size SharedArrayBuffer window, so there's no
+// filesystem round-trip needed to move the bytes across).
 // This is what carries the real npm (npm-registry-fetch -> make-fetch-happen ->
 // minipass-fetch), which drives a ClientRequest and reads an IncomingMessage.
-// Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/internal/fetch-transport.js.
 export default function (exports, require, module, process, internalBinding, primordials) {
   "use strict";
   const { Readable, Writable } = require("stream");

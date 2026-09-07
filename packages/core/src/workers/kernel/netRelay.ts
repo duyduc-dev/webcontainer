@@ -26,7 +26,7 @@ interface NetRelay {
   unregisterVirtualClient(clientId: string): void;
   /** Fire-and-forget port/path registration — see bindings/net.ts's file
    * header for why this can't be a synchronous, retryable kernel round-trip
-   * the way vivari's Atomics.wait-backed bridge allows. */
+   * the way an Atomics.wait-backed bridge would allow. */
   listen(processId: string, port: number): void;
   closeServer(port: number): void;
   pipeListen(processId: string, key: string): void;

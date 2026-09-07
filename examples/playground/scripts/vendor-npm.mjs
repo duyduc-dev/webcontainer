@@ -1,17 +1,14 @@
 // vendor-npm — pack a real, pinned npm release into public/vendor/npm.json,
 // a gitignored build artifact fetched once at runtime and unpacked into the
-// VFS (see src/vendorNpm.ts). Modeled on vivari's own scripts/vendor-npm.mjs
-// (github.com/maitrungduc1410/vivari, MIT): vendor a pinned npm into a
-// scratch dir with the host's own npm/network (needed once), then pack it.
+// VFS (see src/vendorNpm.ts): vendor a pinned npm into a scratch dir with
+// the host's own npm/network (needed once), then pack it.
 //
-// Unlike vivari's custom binary archive (they control both ends and wanted
-// to dodge tar's long-path edge cases), this writes a plain JSON
-// { relativePath: contents } map - simpler, and fine for a local dev asset
-// that isn't shipped to end users. Non-runtime weight is dropped: source
-// maps, docs (.md/.html), images, node-gyp's own bundled .py (node-gyp is
-// fully stubbed at runtime - see vendorNpm.ts - so it's never actually
-// invoked), and Windows-only launcher scripts (.cmd/.ps1 - this VFS is
-// POSIX-only).
+// Writes a plain JSON { relativePath: contents } map - simple, and fine for
+// a local dev asset that isn't shipped to end users. Non-runtime weight is
+// dropped: source maps, docs (.md/.html), images, node-gyp's own bundled
+// .py (node-gyp is fully stubbed at runtime - see vendorNpm.ts - so it's
+// never actually invoked), and Windows-only launcher scripts (.cmd/.ps1 -
+// this VFS is POSIX-only).
 //
 // Usage: node scripts/vendor-npm.mjs [--force]
 
@@ -28,8 +25,7 @@ const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 // this monorepo hits examples/playground/package.json, whose
 // "@dwc/core": "workspace:*" dependency real (non-workspace) npm can't parse
 // (EUNSUPPORTEDPROTOCOL). /tmp has no package.json in its ancestry, so npm
-// stops there and installs only what we asked for. Same approach as vivari's
-// own vendor-npm.mjs (VV_VENDOR_DIR default of /tmp/vv-vendor).
+// stops there and installs only what we asked for.
 const VENDOR_DIR = process.env.DWC_VENDOR_DIR || path.join(os.tmpdir(), "dwc-vendor-npm");
 const VENDOR_NPM = path.join(VENDOR_DIR, "node_modules", "npm");
 const OUT_FILE = path.join(ROOT, "public", "vendor", "npm.json");

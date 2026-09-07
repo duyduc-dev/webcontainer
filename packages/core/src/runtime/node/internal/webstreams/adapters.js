@@ -11,10 +11,10 @@
 // Why it is not vendored verbatim like internal/streams/*:
 //   * Upstream builds on Node's OWN bundled Web Streams implementation
 //     (internal/webstreams/{readablestream,writablestream,queuingstrategies}).
-//     Vivari bundles none: `stream/web` (see node/loader.js) re-exports whichever
-//     WHATWG globals the host realm provides — the browser Worker's own classes
-//     in the studio, Node's globals in the headless twin. So the classes are
-//     resolved from `globalThis`.
+//     This runtime bundles none: `stream/web` (see node/loader.js) re-exports
+//     whichever WHATWG globals the host realm provides — the browser
+//     Worker's own real, native classes. So the classes are resolved from
+//     `globalThis`.
 //   * Upstream uses the `SafePromiseAll` / `SafePromisePrototypeFinally`
 //     primordials, which node/primordials.js cannot resolve (they don't follow
 //     the <Ns><Member> naming scheme) — reading them THROWS. This file therefore
@@ -70,7 +70,7 @@ export default function (exports, require, module, process, internalBinding, pri
     const C = globalThis[name];
     if (typeof C !== "function") {
       const err = new Error(
-        `Vivari: cannot convert between Node and Web streams — this realm has no ` +
+        `Cannot convert between Node and Web streams — this realm has no ` +
           `global ${name}. Web Streams are not bundled; \`stream/web\` re-exports ` +
           `whatever the host realm provides (see node/loader.js).`,
       );
@@ -767,17 +767,18 @@ export default function (exports, require, module, process, internalBinding, pri
   //
   // Upstream wraps a libuv StreamBase handle directly: it drives readStart /
   // readStop / onread / writeBuffer and reads the results out of the
-  // internalBinding('stream_wrap') scratch array. Vivari's stream_wrap is a JS
-  // shim for the in-process loopback (bindings/net.js) and does not expose that
-  // contract, so a "working" version here would be a partially-correct
-  // conversion that drops writes. Nothing in this runtime calls either function
-  // (net/http reach Web Streams through Readable.toWeb/Writable.toWeb on the
-  // socket); they are exported only so a caller that does gets this message
-  // rather than "undefined is not a function".
+  // internalBinding('stream_wrap') scratch array. This runtime's own
+  // stream_wrap is a JS shim for the in-process loopback (bindings/net.js)
+  // and does not expose that contract, so a "working" version here would be
+  // a partially-correct conversion that drops writes. Nothing in this
+  // runtime calls either function (net/http reach Web Streams through
+  // Readable.toWeb/Writable.toWeb on the socket); they are exported only so
+  // a caller that does gets this message rather than "undefined is not a
+  // function".
   // ---------------------------------------------------------------------------
   const streamBaseNotImplemented = (name) => () => {
     const err = new Error(
-      `Vivari: ${name}() is not implemented — it wraps a libuv StreamBase handle, ` +
+      `${name}() is not implemented — it wraps a libuv StreamBase handle, ` +
         `and this runtime's internalBinding('stream_wrap') is a JS shim without the ` +
         `readStart/onread/writeBuffer contract it needs. Convert the socket with ` +
         `Readable.toWeb()/Writable.toWeb() instead.`,

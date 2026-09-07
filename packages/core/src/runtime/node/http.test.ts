@@ -137,7 +137,7 @@ describe("vendored 'https'/'http' (fetch-backed client)", () => {
 
 // http.createServer() is new: real npm's own dependency tree never needed
 // an in-VM HTTP server, but an in-VM dev server (e.g. Vite, for the
-// StackBlitz/vivari-style "preview" feature this unblocks) does. It runs on
+// StackBlitz-style "preview" feature this unblocks) does. It runs on
 // top of this runtime's own real, vendored `net` module (already working,
 // same-process and cross-process) plus a hand-written HTTP/1.1 parser
 // (internal/http_parser.js) - real Node's own server-side parsing isn't

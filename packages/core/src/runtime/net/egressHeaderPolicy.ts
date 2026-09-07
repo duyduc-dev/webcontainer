@@ -19,7 +19,6 @@
 // `Range` returns the whole object) rather than an error. So the strip is
 // scoped to the hosts that actually need it; every other target keeps its
 // headers, pays for a preflight, and either works or fails loudly.
-// Ported from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/egress-header-policy.js.
 
 const CORS_SAFELISTED = new Set(["accept", "accept-language", "content-language", "content-type"]);
 

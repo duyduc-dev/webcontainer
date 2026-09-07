@@ -16,17 +16,17 @@
 // serve, `netBridge` (if provided) relays it through the kernel to whichever
 // process does — the same architectural pattern as the Phase 7 net-request/
 // net-response fetch bridge, generalized to a persistent connection instead
-// of one request/response. Unlike vivari's design (which has a synchronous,
-// Atomics.wait-backed kernel bridge and so can retry listen() on a cross-
-// process ephemeral-port conflict), our kernel link is plain async postMessage:
-// listen()/pipeListen() registration is fire-and-forget (best-effort — a
-// same-process ephemeral-port conflict is still always correctly rejected via
-// the local `listeners` Map, which is synchronous), and pipeConnect() returns
-// a Promise instead of a synchronous connId, which fits libuv's own contract
-// fine since uv_tcp_connect() itself only ever returns "pending" (0) or an
-// immediate local failure — the real connection always completes later via a
-// callback, exactly what a Promise resolving in a later turn already gives us.
-// Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/bindings/net.js.
+// of one request/response. Our kernel link is plain async postMessage, not a
+// synchronous Atomics.wait-backed bridge, so it can't retry listen() on a
+// cross-process ephemeral-port conflict the way a synchronous kernel round-
+// trip could: listen()/pipeListen() registration is fire-and-forget
+// (best-effort — a same-process ephemeral-port conflict is still always
+// correctly rejected via the local `listeners` Map, which is synchronous),
+// and pipeConnect() returns a Promise instead of a synchronous connId, which
+// fits libuv's own contract fine since uv_tcp_connect() itself only ever
+// returns "pending" (0) or an immediate local failure — the real connection
+// always completes later via a callback, exactly what a Promise resolving
+// in a later turn already gives us.
 
 import { isIPv4, isIPv6, parseIPv6 } from "./ip";
 import { errname, getErrorMap, UV_CODES } from "./uvErrors";

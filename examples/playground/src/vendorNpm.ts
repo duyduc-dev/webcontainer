@@ -6,11 +6,10 @@ const NPM_VFS_ROOT = "/usr/lib/node_modules/npm";
 // which for a native package is `node-gyp rebuild` - a non-zero exit there
 // aborts the whole `npm install`). Native addons can't run in a browser
 // sandbox at all, so this makes the build a non-fatal no-op instead - the
-// package's JS/wasm fallback is what actually loads at runtime. Ported
-// directly from vivari's own node-gyp-stub.js (github.com/maitrungduc1410/vivari,
-// MIT): npm resolves the `node-gyp` command to a shell shim it puts on PATH,
-// which this runtime can't execute (no POSIX shell interpreter for that file),
-// so the shim and the bundled node-gyp entry point are overwritten in place
+// package's JS/wasm fallback is what actually loads at runtime. npm
+// resolves the `node-gyp` command to a shell shim it puts on PATH, which
+// this runtime can't execute (no POSIX shell interpreter for that file), so
+// the shim and the bundled node-gyp entry point are overwritten in place
 // with this plain Node program instead.
 const NODE_GYP_STUB = `const argv = process.argv.slice(2);
 const verb = argv.find((a) => a && a[0] !== '-') || '';

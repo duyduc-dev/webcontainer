@@ -17,7 +17,6 @@
 //
 // Resolved values are memoized so identities stay stable. Unknown names throw
 // loudly, which surfaces the exact intrinsic a newly-vendored module needs.
-// Ported from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/primordials.js.
 
 type AnyFn = (...args: any[]) => any;
 

@@ -1,6 +1,6 @@
 // previewRelay — lets the KERNEL itself act as an HTTP client into a guest
 // process's http.createServer(), on the host page's behalf. This is Phase 2
-// of dev-server-preview support (StackBlitz/vivari-style "run npm run dev
+// of dev-server-preview support (StackBlitz-style "run npm run dev
 // and see it live"): Phase 1 (runtime/node/lib/http.js) made
 // http.createServer() work at all, reachable from another guest process
 // over the kernel's existing cross-process net relay (workers/kernel/

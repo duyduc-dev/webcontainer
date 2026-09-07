@@ -7,7 +7,6 @@
 // A factory (not a static object) because 'net' needs per-process context
 // (the event loop's close phase / liveness ref-unref, and later the kernel's
 // cross-process relay) that a module-load-time singleton can't carry.
-// Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/internal-binding.js.
 
 import { createBufferBinding } from "./bindings/buffer";
 import { createChildProcessBindings } from "./bindings/childProcess";

@@ -6,7 +6,6 @@
 // fill, byte swaps, atob/btoa. We map each to browser primitives
 // (TextEncoder/TextDecoder, typed-array loops). The read/write numeric methods
 // (readUInt32LE, ...) are NOT here: internal/buffer.js implements those in pure JS.
-// Ported from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/bindings/buffer.js.
 
 type ByteLike = ArrayBuffer | ArrayBufferView;
 

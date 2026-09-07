@@ -1,10 +1,10 @@
 // internal/timers — minimal shim (Phase 2 #7).
 //
 // NOT verbatim: Node's internal/timers.js (~700 lines) is a native-timer-driven
-// linked-list of timeout lists. Vivari already has a real event loop
-// (packages/runtime/loop.js) exposed via globalThis timers, so we map the small
-// surface the vendored modules use (internal/stream_base_commons, net.js) onto
-// it. Socket timeouts therefore work via our loop's setTimeout.
+// linked-list of timeout lists. This runtime already has a real event loop
+// exposed via globalThis timers, so we map the small surface the vendored
+// modules use (internal/stream_base_commons, net.js) onto it. Socket
+// timeouts therefore work via our loop's setTimeout.
 export default function (exports, require, module, process, internalBinding, primordials) {
   "use strict";
 

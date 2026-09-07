@@ -1,7 +1,7 @@
 // internal/async_hooks — minimal shim (Phase 2 #6/#7).
 //
 // NOT verbatim: Node's async_hooks is built on native async-context tracking.
-// Vivari has none, so we provide the surface the vendored lib/ uses:
+// This runtime has none, so we provide the surface the vendored lib/ uses:
 //   - AsyncResource (runInAsyncScope/bind) for internal/streams/end-of-stream
 //   - symbols {owner_symbol, async_id_symbol, trigger_async_id_symbol} + the
 //     newAsyncId / getNewAsyncId / defaultTriggerAsyncIdScope helpers for net.js

@@ -7,7 +7,6 @@
 //
 // `resolve*` return loopback for localhost/IPs and ENOTFOUND otherwise (we
 // have no way to answer real queries). Both callback and promise APIs exist.
-// Ported from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/lib/dns.js.
 export default function (exports, require, module, process, internalBinding, primordials) {
   const isIPv4 = (s) =>
     /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(s) && s.split(".").every((o) => +o <= 255);

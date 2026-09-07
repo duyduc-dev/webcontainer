@@ -3,9 +3,8 @@
 A WebContainer-style Node.js sandbox that runs entirely in the browser — a
 virtual filesystem, a shell, real `node`/`npm` execution, and live preview of
 servers started inside it, all inside Web Workers, no backend required.
-Inspired by [StackBlitz WebContainers](https://webcontainers.io/) and
-[vivari](https://github.com/maitrungduc1410/vivari), built as its own
-kernel/worker architecture.
+Inspired by [StackBlitz WebContainers](https://webcontainers.io/), built as
+its own kernel/worker architecture.
 
 This repo is a pnpm monorepo. The thing you actually install and use in your
 own app is the **`@dwc/core`** package under `packages/core`. This guide

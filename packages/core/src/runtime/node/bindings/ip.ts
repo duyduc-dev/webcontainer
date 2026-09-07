@@ -1,6 +1,5 @@
 // IP literal parsing and formatting, shared by the bindings that need addresses
 // as bytes rather than strings: `cares_wrap` (bindings/net.ts).
-// Ported from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/bindings/ip.js.
 
 const isIPv4 = (s: unknown): s is string =>
   typeof s === "string" &&

@@ -7,12 +7,10 @@
  * deliberately absent: a subprocess cannot change its parent shell's cwd, so
  * it stays a true (async) shell builtin instead.
  *
- * Adapted from vivari's own hand-written packages/kernel-host/coreutils.js
- * (github.com/maitrungduc1410/vivari, MIT) — these are vivari's own shim
- * programs, not upstream GNU coreutils source, since Node has no coreutils of
- * its own to vendor. Dropped from the vivari originals: --color/TTY detection
- * in `ls` and the stdin fallback in `cat`, since this runtime has no TTY or
- * stdin concept yet.
+ * Hand-written shim programs, not upstream GNU coreutils source, since Node
+ * has no coreutils of its own to vendor. Deliberately minimal: no
+ * --color/TTY detection in `ls` and no stdin fallback in `cat`, since this
+ * runtime has no TTY or stdin concept yet.
  */
 const COREUTILS: Record<string, string> = {
   echo: `process.stdout.write(process.argv.slice(2).join(' ') + '\\n');

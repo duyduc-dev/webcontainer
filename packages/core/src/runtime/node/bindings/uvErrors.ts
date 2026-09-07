@@ -1,7 +1,6 @@
 // libuv's error numbers and descriptions, needed by `uv` (bindings/net.ts).
 // Values are Linux's errno, negated — what libuv reports and what Node's
 // `err.errno` carries. NOT the same numbers as `internalBinding('constants').os.errno`.
-// Ported from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/bindings/uv-errors.js.
 
 const UV_MESSAGES: Record<number, [string, string]> = {
   [-4095]: ["EOF", "end of file"],

@@ -12,7 +12,6 @@
 // caches instances, and tolerates require cycles (returns the partial exports).
 //
 // Adding a real Node module later = drop the vendored file in and register it.
-// Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/loader.js.
 
 import { createInternalBinding } from "./internalBinding";
 import { primordials } from "./primordials";

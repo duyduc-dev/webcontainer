@@ -1,13 +1,12 @@
 // crypto — a minimal, pure-JS subset (hash/hmac/random only).
 //
 // Real Node's crypto module is a C++ wrapper around OpenSSL; there is no
-// native crypto backend here (no Rust/Wasm codec, unlike vivari's design this
-// was adapted from). Node's crypto API is synchronous
-// (hash.update().digest() has no async variant), and WebCrypto's
-// `crypto.subtle.digest()` is async-only, so it can't back that contract —
-// hashing is done with pure-JS digest cores instead (md5/sha1/sha256/sha512,
-// sha256/md5/sha1 ported from vivari's codec-less fallback path; sha512
-// added separately below, using BigInt for its 64-bit word arithmetic).
+// native crypto backend here (no Rust/Wasm codec). Node's crypto API is
+// synchronous (hash.update().digest() has no async variant), and
+// WebCrypto's `crypto.subtle.digest()` is async-only, so it can't back that
+// contract — hashing is done with pure-JS digest cores instead
+// (md5/sha1/sha256/sha512; sha512 uses BigInt for its 64-bit word
+// arithmetic).
 // `randomBytes`/`randomUUID` DO use the real, synchronous
 // `crypto.getRandomValues`/`crypto.randomUUID`.
 //
@@ -22,7 +21,6 @@
 // createDecipheriv), sign/verify, DH/ECDH, KeyObject/JWK — all need either a
 // real crypto backend or substantially more code than this phase's scope
 // (network egress for a package-manager-style client) calls for.
-// Adapted from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/bindings/crypto.js (pure-JS fallback cores).
 export default function (exports, require, module, process, internalBinding, primordials) {
   "use strict";
   const { Buffer } = require("buffer");

@@ -8,7 +8,6 @@
 // only operations that truly need the missing backend (connect / listen / a
 // real secure server) throw. This lets http-only tooling that transitively
 // pulls `tls` load and run over plain http.
-// Ported from vivari (github.com/maitrungduc1410/vivari, MIT), packages/runtime/node/lib/tls.js.
 export default function (exports, require, module) {
   "use strict";
   const net = require("net");
