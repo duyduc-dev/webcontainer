@@ -7,6 +7,7 @@ import { createHttp2Module } from "./http2";
 import { createOsModule } from "./os";
 import { createV8Module } from "./v8";
 import { createQuerystringModule } from "./querystring";
+import { createReadlineModule } from "./readline";
 import { createTimersPromisesModule } from "./timersPromises";
 import { createStringDecoderModule } from "./string_decoder";
 import { createTtyModule } from "./tty";
@@ -54,6 +55,7 @@ const BUILTIN_NAMES = new Set([
   "tls",
   "child_process",
   "vm",
+  "readline",
 ]);
 
 const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(specifier);
@@ -76,6 +78,7 @@ const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(spe
  */
 const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesContext): Record<string, unknown> => {
   const nodeModules = createNodeModules(process, netContext);
+  const EventEmitter = nodeModules.require("events") as new () => { emit(event: string, ...args: unknown[]): boolean };
   return {
     path: pathModule,
     util: utilModule,
@@ -97,7 +100,7 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     // passes the real, EventEmitter-mixed-in processGlobal) - not a second,
     // divergent instance.
     process,
-    events: nodeModules.require("events"),
+    events: EventEmitter,
     stream: nodeModules.require("stream"),
     buffer: nodeModules.require("buffer"),
     http: nodeModules.require("http"),
@@ -112,6 +115,7 @@ const createBuiltinModules = (process: ProcessLike, netContext?: NodeModulesCont
     tls: nodeModules.require("tls"),
     child_process: nodeModules.require("child_process"),
     vm: createVmModule(),
+    readline: createReadlineModule(EventEmitter),
   };
 };
 
