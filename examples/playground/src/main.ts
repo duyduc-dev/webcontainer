@@ -53,24 +53,85 @@ function waitForMarker(
   return found;
 }
 
-// A real, separately-vendored program (npm) can print an arbitrarily long
-// stack trace on failure - streaming that raw into xterm has been observed
-// to hang the tab's main thread, so npm's own output is always buffered +
-// truncated rather than piped straight through like the other demos.
-async function readAllTruncated(
-  stream: ReadableStream<Uint8Array>,
-  limit = 4000,
-): Promise<string> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) return text;
-    text += decoder.decode(value);
-    if (text.length > limit) return `${text.slice(0, limit)}\n...[truncated]`;
-  }
-}
+// The real, npm-installed React server-rendering the page on every request -
+// require('react') + require('react-dom/server') exactly as a real Node app
+// would, executed by this project's own real vendored `http` on top of the
+// sandboxed fs/process runtime. No bundler/dev-server involved (that's the
+// still-open next step - see PROGRESS.md: `npm create vite` and Vite's own
+// dev server both hit missing-builtin gaps this session found but hasn't
+// closed yet, `vm` and `perf_hooks` respectively) - this demo deliberately
+// takes the path that's actually fully working today.
+const REACT_SERVER_SOURCE = [
+  "const http = require('http');",
+  "const React = require('react');",
+  "const { renderToString } = require('react-dom/server');",
+  "",
+  "const FEATURES = [",
+  "  'Real npm install (real registry fetch, real gzip, real tar, real sha512)',",
+  "  'Real CommonJS require() resolution through real node_modules',",
+  "  'Real ES modules - live bindings, dynamic import(), top-level await',",
+  "  'Real http.createServer(), previewed live through a Service Worker relay',",
+  "];",
+  "",
+  "function App() {",
+  "  return React.createElement(",
+  "    'div',",
+  "    { className: 'app' },",
+  "    React.createElement('h1', null, 'React, running inside a WebContainer sandbox'),",
+  "    React.createElement(",
+  "      'p',",
+  "      { className: 'subtitle' },",
+  "      'This page was rendered by real, npm-installed React ' + React.version + ' - require(\\'react\\') + require(\\'react-dom/server\\') executing inside a spawned guest process, not on your machine.',",
+  "    ),",
+  "    React.createElement(",
+  "      'ul',",
+  "      null,",
+  "      FEATURES.map((feature, i) => React.createElement('li', { key: i }, feature)),",
+  "    ),",
+  "    React.createElement(",
+  "      'div',",
+  "      { className: 'counter' },",
+  "      React.createElement('span', { id: 'count' }, '0'),",
+  "      React.createElement('button', { id: 'bump' }, '+1 (plain client-side JS, not React - no bundler here yet)'),",
+  "    ),",
+  "  );",
+  "}",
+  "",
+  "const PAGE = (body) => `<!doctype html>",
+  "<html>",
+  "<head>",
+  "<meta charset=\"utf-8\">",
+  "<title>React in a WebContainer</title>",
+  "<style>",
+  "  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }",
+  "  h1 { font-size: 1.5rem; }",
+  "  .subtitle { color: #555; line-height: 1.5; }",
+  "  ul { line-height: 1.8; }",
+  "  .counter { margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 8px; display: flex; align-items: center; gap: 1rem; }",
+  "  #count { font-size: 1.5rem; font-weight: 600; min-width: 2ch; }",
+  "  button { cursor: pointer; padding: 0.5rem 1rem; }",
+  "</style>",
+  "</head>",
+  "<body>",
+  "<div id=\"root\">${body}</div>",
+  "<script>",
+  "  var n = 0;",
+  "  document.getElementById('bump').addEventListener('click', function () {",
+  "    n += 1;",
+  "    document.getElementById('count').textContent = String(n);",
+  "  });",
+  "</script>",
+  "</body>",
+  "</html>`;",
+  "",
+  "const server = http.createServer((req, res) => {",
+  "  const html = PAGE(renderToString(React.createElement(App)));",
+  "  res.writeHead(200, { 'Content-Type': 'text/html' });",
+  "  res.end(html);",
+  "});",
+  "server.listen(4321, () => console.log('[react-server] listening on 4321'));",
+  "",
+].join("\n");
 
 async function main() {
   // rows is generous on purpose: xterm's DOM only reflects the visible
@@ -86,162 +147,52 @@ async function main() {
     });
 
     // 1) Vendor + boot real npm (see scripts/vendor-npm.mjs + src/vendorNpm.ts).
-    // This fetches the pre-packed real npm@10.9.2 asset and mounts it into
-    // the guest VFS at /usr/lib/node_modules/npm, stubs node-gyp (native
-    // addon builds can't run in-browser), and wires /bin/npm.js + /bin/npx.js
-    // as thin require() shims onto the real bin/npm-cli.js / bin/npx-cli.js.
     const { version: vendoredVersion, fileCount } = await loadVendoredNpm(dwc);
-    console.log(
-      "[dwc] loaded vendored npm",
-      vendoredVersion,
-      `(${fileCount} files)`,
-    );
-    terminal.writeln(
-      `[vendor] loaded real npm ${vendoredVersion} (${fileCount} files)`,
-    );
+    console.log("[dwc] loaded vendored npm", vendoredVersion, `(${fileCount} files)`);
+    terminal.writeln(`[vendor] loaded real npm ${vendoredVersion} (${fileCount} files)`);
 
-    // 2) `npm --version` - the cheapest possible smoke test that the real
-    // CLI boots at all (engine validation + top-level Npm construction,
-    // nothing touching the registry or installers yet).
-    const versionProc = await dwc.process.spawn("/bin/npm.js", {
-      argv: ["--version"],
-    });
-    const [versionStdout, versionStderr] = await Promise.all([
-      readAllTruncated(versionProc.stdout),
-      readAllTruncated(versionProc.stderr),
-    ]);
-    const versionExit = await versionProc.exit;
-    console.log("[dwc] npm --version exit", versionExit, versionStdout);
-    terminal.writeln(
-      `[npm --version] exit=${versionExit} stdout=${JSON.stringify(versionStdout)}`,
-    );
-    if (versionStderr) {
-      terminal.writeln(`[npm --version] stderr=${JSON.stringify(versionStderr)}`);
-    }
-
-    // 3) A real `npm install <pkg>` end-to-end: real registry fetch, real
-    // gzip decompression, real tar extraction, real sha512 integrity checks
-    // (see PROGRESS.md, section 1). Run in its own project directory so the
-    // resulting package.json/package-lock.json/node_modules are easy to
-    // inspect afterwards. npm creates package.json itself if none exists.
+    // 2) Real `npm install react react-dom` against the live registry -
+    // same real fetch/gzip/tar/sha512 pipeline as every other npm demo in
+    // this project, just with a much bigger, real-world dependency tree
+    // (react-dom alone pulls in scheduler and friends).
     await dwc.fs.mkdir("/project", { recursive: true });
-
     const installProc = await dwc.process.spawn("/bin/npm.js", {
-      // --no-audit/--no-fund: without these, npm makes extra post-install
-      // network calls (registry audit endpoint, funding-info lookup) after
-      // printing its install summary - vendor-npm.mjs's own known-good
-      // `npm install npm@...` call already disables both for exactly this
-      // reason. Omitting them here was observed to hang the guest process
-      // indefinitely right after "added 1 package in Ns" (never exits),
-      // presumably because one of those extra requests never settles.
-      argv: ["install", "left-pad", "--no-audit", "--no-fund", "--loglevel=warn"],
+      // Pinned to React 18, not @latest (19.x): react-dom/server's newer
+      // internals pull in node:async_hooks's AsyncLocalStorage, which needs
+      // real V8 async-context propagation this runtime deliberately doesn't
+      // fake (see async_hooks.ts) - React 18's synchronous renderToString()
+      // predates that dependency.
+      argv: ["install", "react@18", "react-dom@18", "--no-audit", "--no-fund", "--loglevel=warn"],
       cwd: "/project",
     });
     pipeToTerminal(installProc.stdout, terminal);
     pipeToTerminal(installProc.stderr, terminal);
     const installExit = await installProc.exit;
-    console.log("[dwc] npm install left-pad exited with code", installExit);
-    terminal.writeln(`\r\n[npm install left-pad] exit=${installExit}`);
+    console.log("[dwc] npm install react react-dom exited with code", installExit);
+    terminal.writeln(`\r\n[npm install react react-dom] exit=${installExit}`);
+    if (installExit !== 0) return;
 
-    // 4) Verify what landed on disk: package.json, package-lock.json, and
-    // the installed package's own files, all written by the REAL npm CLI
-    // running on top of this project's own fs/net/http runtime.
-    const packageJson = await dwc.fs.readFile("/project/package.json");
-    console.log(
-      "[dwc] /project/package.json ->",
-      new TextDecoder().decode(packageJson),
-    );
+    const reactPkg = JSON.parse(
+      new TextDecoder().decode(await dwc.fs.readFile("/project/node_modules/react/package.json")),
+    ) as { version: string };
+    terminal.writeln(`[verify] installed react@${reactPkg.version}`);
 
-    const hasLockfile = await dwc.fs.exists("/project/package-lock.json");
-    console.log("[dwc] /project/package-lock.json exists ->", hasLockfile);
-    terminal.writeln(`[verify] package-lock.json exists -> ${hasLockfile}`);
+    // 3) A real guest http.createServer() that require()s the real,
+    // just-installed React and server-renders a page with it on every
+    // request - the actual "React app" part of this demo.
+    await dwc.fs.writeFile("/project/server.js", REACT_SERVER_SOURCE);
+    const serverProc = await dwc.process.spawn("/project/server.js", { cwd: "/project" });
+    pipeToTerminal(serverProc.stderr, terminal);
+    await waitForMarker(serverProc.stdout, terminal, "listening on");
 
-    const nodeModulesEntries = await dwc.fs.readdir("/project/node_modules");
-    console.log("[dwc] /project/node_modules ->", nodeModulesEntries);
-    terminal.writeln(`[verify] node_modules -> ${nodeModulesEntries.join(", ")}`);
-
-    const leftPadPackageJson = await dwc.fs.readFile(
-      "/project/node_modules/left-pad/package.json",
-    );
-    console.log(
-      "[dwc] node_modules/left-pad/package.json ->",
-      new TextDecoder().decode(leftPadPackageJson),
-    );
-
-    // 5) Prove the installed package is not just bytes on disk, but actually
-    // *runnable*: a script in the project requiring it by bare specifier,
-    // resolved through real node_modules/package.json "main" lookup, spawned
-    // with cwd: "/project" so resolution starts from the right place.
-    await dwc.fs.writeFile(
-      "/project/use-left-pad.js",
-      [
-        "const leftPad = require('left-pad');",
-        "console.log('[left-pad] leftPad(\"5\", 3, \"0\") ->', leftPad('5', 3, '0'));",
-        "",
-      ].join("\n"),
-    );
-    const useProc = await dwc.process.spawn("/project/use-left-pad.js", {
-      cwd: "/project",
-    });
-    pipeToTerminal(useProc.stdout, terminal);
-    pipeToTerminal(useProc.stderr, terminal);
-    const useExit = await useProc.exit;
-    console.log("[dwc] use-left-pad.js exited with code", useExit);
-    terminal.writeln(`[use-left-pad] exit=${useExit}`);
-
-    // 6) `npm run <script>` through the real CLI too, not just require().
-    const pkg = JSON.parse(new TextDecoder().decode(packageJson));
-    pkg.scripts = { greet: "node use-left-pad.js" };
-    await dwc.fs.writeFile(
-      "/project/package.json",
-      JSON.stringify(pkg, null, 2),
-    );
-
-    const runProc = await dwc.process.spawn("/bin/npm.js", {
-      argv: ["run", "greet"],
-      cwd: "/project",
-    });
-    pipeToTerminal(runProc.stdout, terminal);
-    pipeToTerminal(runProc.stderr, terminal);
-    const runExit = await runProc.exit;
-    console.log("[dwc] npm run greet exited with code", runExit);
-    terminal.writeln(`[npm run greet] exit=${runExit}`);
-
-    // 7) Dev-server preview (Phases 1-3): a real guest http.createServer(),
-    // rendered live in the host page's <iframe id="preview">. Phase 3's
-    // Service Worker relay is the still-unconfirmed part (see PROGRESS.md) -
-    // this is the real end-to-end exercise for it, not just an ad-hoc test
-    // script.
-    const PREVIEW_PORT = 4321;
-    await dwc.fs.writeFile(
-      "/preview-server.js",
-      [
-        "const http = require('http');",
-        "const server = http.createServer((req, res) => {",
-        "  res.writeHead(200, { 'Content-Type': 'text/html' });",
-        "  res.end(",
-        "    '<!doctype html><html><body>' +",
-        "    '<h1>Hello from the guest http server</h1>' +",
-        "    '<p>path: ' + req.url + '</p>' +",
-        "    '</body></html>',",
-        "  );",
-        "});",
-        `server.listen(${PREVIEW_PORT}, () => console.log('[preview-server] listening on ${PREVIEW_PORT}'));`,
-        "",
-      ].join("\n"),
-    );
-    const previewServerProc = await dwc.process.spawn("/preview-server.js");
-    pipeToTerminal(previewServerProc.stderr, terminal);
-    await waitForMarker(previewServerProc.stdout, terminal, "listening on");
-
+    // 4) Preview it live: Service Worker relay + <iframe id="preview">.
     try {
       await dwc.preview.enable({ swUrl: "/dwc-preview-sw.js" });
-      console.log("[dwc] preview service worker enabled");
       terminal.writeln("[preview] service worker enabled");
 
       const previewFrame = document.getElementById("preview") as HTMLIFrameElement | null;
       if (previewFrame) {
-        previewFrame.src = dwc.preview.url(PREVIEW_PORT, "/hello");
+        previewFrame.src = dwc.preview.url(4321, "/");
         terminal.writeln(`[preview] iframe.src -> ${previewFrame.src}`);
       } else {
         terminal.writeln("[preview] no #preview iframe found in the page");
