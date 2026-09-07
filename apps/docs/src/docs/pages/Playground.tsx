@@ -98,11 +98,8 @@ function Playground() {
 
     const dwc = bootDWC();
     dwcRef.current = dwc;
-    (window as any).__dwc = dwc;
-    dwc.diagnostics.onEvent((e) => console.log('[dwc]', e.timestamp, e.type, JSON.stringify(e.payload)));
 
     dwc.addEventListener('listen', (payload) => {
-      console.log('[dwc-host]', Date.now(), 'listen event received, port', (payload as { port: number }).port);
       setPreviewSrc(dwc.preview.url((payload as { port: number }).port));
     });
 
