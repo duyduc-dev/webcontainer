@@ -273,28 +273,100 @@ unverified steps together.
      npm's own dependency tree actually calls, not the full
      `fs.promises.FileHandle` surface.
 
-   **Next blocker, found immediately after**: running the installed
-   `node_modules/vite/bin/vite.js` fails with `Error: Cannot use import
-   statement outside a module` - real Vite ships as **ESM** (`import`/
-   `export` at the top level), and this project's module loader is
-   CommonJS-only (`require`/`module.exports`). This is a genuine
-   architecture decision, not a quick patch - comparable in scope to the
-   hand-written HTTP wire parser or the pure-JS gzip decoder, not to any of
-   the three fixes above. Don't start it without deciding deliberately
-   first (same standing instruction as the HMR item below): does the
-   loader need real ESM semantics (live bindings, static
-   import/export analysis, top-level await, dynamic `import()`,
-   `package.json` `"type": "module"`/`"exports"` resolution), or is a
-   transpile-to-CJS shim (e.g. running import specifiers through a
-   lightweight rewrite before the existing CJS loader) sufficient for what
-   Vite's own entry point and dependency tree actually need? Investigate
-   what Vite's `bin/vite.js` and its immediate `import`s actually require
-   before picking an approach.
+   **The ESM blocker — DONE.** Running the installed
+   `node_modules/vite/bin/vite.js` used to fail immediately with `Error:
+   Cannot use import statement outside a module` - real Vite ships as
+   **ESM** (`import`/`export` at the top level), and this project's module
+   loader was CommonJS-only. Real ESM semantics (not a transpile shim) were
+   deliberately chosen - see the plan this shipped under
+   (`.claude/plans/quirky-dazzling-umbrella.md` at the time, since
+   archived) for the full design discussion, including consulting a peer
+   session on the reference architecture (vivari) about how it solved the
+   same problem (it went transpile-to-CJS, for the same
+   synchronous-require-via-Atomics.wait reason this project has - several
+   of its concrete lessons were folded in anyway, see below).
 
-   Also still expected once ESM is unblocked (not yet reached): gaps in
-   areas Vite specifically touches that npm's own install flow never
-   exercised - file-watching (`fs.watch`/chokidar - not implemented at all
-   yet), possibly `worker_threads` or other unimplemented builtins, and
+   New `runtime/esmLoader.ts`: a file positively identified as ESM ahead of
+   time (`.mjs` extension, or the nearest `package.json` has `"type":
+   "module"`) is evaluated via the browser's/Node's own real, native
+   `import()` - each module is built as a `data:text/javascript;base64,...`
+   URL with its import specifiers rewritten to point at its dependencies'
+   own data: URLs; the engine does the real parsing/linking/evaluation
+   (true live bindings, real `import.meta`, real top-level await), not a
+   hand-rolled approximation. `data:` (not `blob:`) specifically because
+   `blob:` URLs are browser-only - Node's own loader rejects the scheme,
+   so `data:` URLs keep this fully unit-testable under vitest's plain
+   `node` environment.
+
+   A specifier that resolves to a CJS/builtin target is routed through the
+   *existing* `require()` machinery instead, wrapped as a small synthesized
+   ESM shim built from the REAL, already-evaluated exports object (this is
+   an interpreter, not a bundler - the actual result is already known once
+   required, no static guessing needed). A genuine ESM import *cycle* can't
+   be represented as a pure data: URL (the URL IS a hash of the fully-
+   resolved content - no way to forward-reference not-yet-finalized
+   content the way a real engine's parse-then-link-then-evaluate algorithm
+   can) - the back-edge that completes a cycle falls back to the same
+   CJS-shim mechanism, exactly mirroring how this loader's existing
+   circular-CJS-require handling already works elsewhere. `require()` of a
+   genuine ESM-only target (the opposite direction) is unchanged - still
+   the existing best-effort `transformEsmToCjs` retry from before this
+   work, since `require()` must stay synchronous.
+
+   `worker.ts`'s `boot()` became `async` to support this (a shallow
+   change - it already fire-and-forgot `moduleLoader.run()`'s result, so
+   nothing above it needed to change); the CJS fast path is otherwise
+   completely unchanged and un-slowed.
+
+   Four real bugs found and fixed building this (three genuine, one a
+   pre-existing latent bug newly exposed):
+   - A root-path-joining bug (`` `${dir}/package.json` `` produces
+     `"//package.json"` when `dir === "/"`, never matching the real
+     `"/package.json"` key) broke ESM detection for any root-level file -
+     present in *two* places, including a pre-existing latent copy in
+     `moduleLoader.ts`'s `findPackageRoot` (used for `#imports` resolution)
+     that had simply never been exercised with a root-level `package.json`
+     before.
+   - The specifier-rewrite matcher's "is this real code, not text sitting
+     inside an unrelated string/comment?" check compared the ENTIRE regex
+     match (including the quoted specifier itself) against the masked
+     text - but the quoted specifier is *always* blanked by masking (that's
+     what makes it a string literal), so every legitimate import was a
+     guaranteed false negative. Fixed to check only the match's first
+     (keyword) character.
+   - The CJS-interop shim generator checked `typeof exported === "object"`
+     to decide whether to enumerate named exports - excluding the common
+     real shape `module.exports = someFunction` with extra properties
+     attached (real npm's own `left-pad`, among many others), silently
+     dropping every named export from a function-shaped CJS module.
+   - An `"exports"` map value of `null` (real Node's way of explicitly
+     hiding an internal subpath) returned `null` from the resolver, which
+     the caller treated identically to "not found here, fall through to
+     the lenient old CJS resolver" - letting a deliberately-hidden file
+     leak through via the fallback path instead of being blocked. Fixed to
+     throw (matching real Node's `ERR_PACKAGE_PATH_NOT_EXPORTED`) instead
+     of silently falling through.
+   - (Unrelated to ESM, found by the same end-to-end verification run:
+     `console.debug` was never implemented as a guest builtin at all - real
+     npm's own early bootstrap calls it before config resolution even
+     starts, on a code path this session's testing hadn't hit until now.
+     Real Node's `console.debug` is a literal alias for `console.log`;
+     fixed the same way.)
+
+   **Verified end-to-end**: real `npm install vite` (exit 0) followed by
+   spawning the real, installed `node_modules/vite/bin/vite.js` directly -
+   the `Cannot use import statement` error is completely gone; the entry
+   point's own top-level `import`s (`node:perf_hooks`, `node:module`, ...)
+   resolve and execute. It now fails on `Cannot find module 'perf_hooks'` -
+   a missing Node builtin, an entirely different and expected class of gap
+   (not an ESM problem at all - `perf_hooks` was simply never in
+   `createBuiltinModules()`'s registry, unrelated to this work).
+
+   **Next, still expected** (not yet reached - this is what "run it, find
+   the next break" surfaces from here): missing Node builtins Vite's own
+   entry point and dependency tree reach for (`perf_hooks` confirmed
+   missing already; `module`, possibly `worker_threads`, others likely),
+   file-watching (`fs.watch`/chokidar - not implemented at all yet), and
    real static-asset serving through `http.ServerResponse` (streaming large
    files - Phase 1's whole-response-buffering simplification may need
    revisiting if a real Vite bundle turns out too large to buffer
