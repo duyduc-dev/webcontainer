@@ -1,8 +1,10 @@
 # @dwc/core
 
 A WebContainer-style sandbox that runs in the browser: a virtual filesystem, a
-shell, `node`/`npm` execution, and live preview of servers started inside it —
-all in a Web Worker, no backend required.
+shell, real `node`/`npm` execution against the live npm registry, and live
+preview of servers started inside it — all in Web Workers, no backend
+required. Inspired by [StackBlitz WebContainers](https://webcontainers.io/)
+and [vivari](https://github.com/maitrungduc1410/vivari).
 
 ## Install
 
@@ -13,50 +15,128 @@ npm install @dwc/core
 ## Quick start
 
 ```ts
-import { DuckWebContainer } from "@dwc/core";
+import { bootDWC } from "@dwc/core";
 
-const dwc = DuckWebContainer.initialize();
+// No `await` needed — bootDWC() returns real, immediately usable handles.
+// Every call queues behind the kernel worker's boot handshake internally.
+const dwc = bootDWC();
 
 await dwc.fs.mkdir("/project", { recursive: true });
 await dwc.fs.writeFile("/project/hello.txt", "hello world");
-await dwc.fs.readFile("/project/hello.txt", "utf8"); // "hello world"
+await dwc.fs.readFile("/project/hello.txt"); // Uint8Array
 
-await dwc.shell.exec("cd /project");
-const result = await dwc.shell.exec("pwd"); // { stdout: "/project", stderr: "", exitCode: 0, cwd: "/project" }
+const result = await dwc.shell.exec("cd /project && pwd");
+// { output: "/project\n", cwd: "/project" }
 ```
+
+`await bootDWC()` still works too — `await` on a plain object that isn't a
+Promise just resolves to it on the next microtask, so nothing breaks if you
+were relying on the old call shape. Use `await dwc.ready` if you want to know
+boot succeeded (or catch why it didn't) without making an actual call.
 
 ## Filesystem — `dwc.fs`
 
-`mkdir(path, { recursive? })`, `writeFile(path, data)`, `readFile(path, "utf8" | undefined)`,
-`readdir(path)`, `stat(path)`, `rm(path, { recursive? })`, `rename(from, to)`.
+```ts
+mkdir(path, { recursive? })
+writeFile(path, contents: string | Uint8Array)
+readFile(path): Promise<Uint8Array>
+readdir(path): Promise<string[]>
+stat(path) / lstat(path): Promise<StatResult>   // isFile()/isDirectory()/isSymbolicLink()/size/mode/mtimeMs
+chmod(path, mode)
+symlink(target, path) / readlink(path) / realpath(path)
+rm(path, { recursive? })
+rename(from, to)
+exists(path): Promise<boolean>
+mount(tree: FileSystemTree, basePath?)   // seed a directory tree in one call
+```
 
-All calls are promise-based and throw `FSError` (with `.code` — `ENOENT`,
-`EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY`, `EINVAL` — and `.path`) on failure.
+All calls are promise-based and throw `FSError` (`.code` — `ENOENT`,
+`EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY`, `EINVAL` — and `.path`) on
+failure.
+
+## Processes — `dwc.process`
+
+```ts
+const proc = await dwc.process.spawn("/project/server.js", {
+  argv: [],
+  env: {},
+  cwd: "/project",
+});
+
+proc.stdout; // ReadableStream<Uint8Array>
+proc.stderr; // ReadableStream<Uint8Array>
+proc.stdin; // WritableStream<Uint8Array>
+const exitCode = await proc.exit; // Promise<number>
+```
+
+Runs a script (a real file path already on the virtual filesystem) as its
+own guest process — a fresh CommonJS/ESM module graph, event loop, and
+`require()` with real Node builtins (see below). Use this for anything
+long-running (a server); for a one-shot command, `dwc.shell.exec()` is
+simpler.
 
 ## Shell — `dwc.shell`
 
 ```ts
 const result = await dwc.shell.exec("mkdir -p /project && cd /project");
+// { output: string, cwd: string }
 ```
 
-- `exec(line)` runs to completion and resolves with `{ stdout, stderr, exitCode, cwd }`.
-  Supports `&&` chaining (stops on the first non-zero exit code) and `>`/`>>`
-  redirection.
-- `spawn(line)` starts a process without waiting for it to exit and resolves
-  immediately with a `Process` (`.onData((stream, chunk) => ...)`,
-  `.onExit((exitCode, cwd) => ...)`). Use this instead of `exec` for anything
-  long-running, like a server started with `node` — `exec` would otherwise
-  never resolve.
+`exec(line, { cwd? })` runs to completion and resolves with the combined
+stdout+stderr text and the shell's final working directory. Supports `&&`
+chaining (stops at the first non-zero exit) and `>`/`>>` redirection. The
+underlying exit code isn't exposed through this call — inspect `output` if a
+command might fail, or use `dwc.process.spawn()` for anything where you need
+the real exit code back.
 
-Built-in commands: `pwd`, `cd`, `ls`, `cat`, `mkdir [-p]`, `touch`, `echo`,
-`rm [-r]`, `mv`, `kill <port>`.
+Built-in commands: `pwd`, `cd`, `ls`, `cat`, `mkdir [-p]`, `echo`, `rm [-r]`,
+`mv`, `true`, `false`. `node <script>` runs a script the same way
+`dwc.process.spawn()` does; any other command resolves against `/bin/<name>.js`
+on the virtual filesystem (which is how `npm`/`npx` become runnable — see
+below).
 
-`node <script>` runs a script in its own guest Worker. Inside guest scripts,
-`require()` resolves Node's `path`, `events`, `util`, `fs`, and a minimal
-`http` (`http.createServer(...).listen(port, cb)` — see [Preview](#preview)
-below), plus anything installed via `npm install`/`npm install <pkg>`, which
-resolves real packages from `registry.npmjs.org` (semver ranges included) into
-`node_modules` on the virtual filesystem.
+**Needs [cross-origin isolation](#cross-origin-isolation)** — the shell runs
+as a real guest process internally and depends on the same synchronous
+bridges `fs.*Sync`/`child_process.execFileSync` do.
+
+## `require()` inside guest scripts
+
+Guest code (anything run via `dwc.process.spawn()`, `node <script>` in the
+shell, or `npm install`'s own dependency tree) gets a real CommonJS loader
+*and* real native ES module support (genuine `import()`/live bindings/
+top-level await for a `.mjs` file or a package with `"type": "module"`), with
+`require()`/`import` resolving:
+
+- **Real vendored Node source**: `stream`, `buffer`, `events`, `http`,
+  `https`, `http2`, `crypto`, `zlib`, `net`, `dns`, `tls`, `async_hooks`
+- **Hand-written, spec-accurate**: `fs` / `fs/promises`, `path`, `util`
+  (including `promisify`, `styleText`, `parseEnv`), `os`, `url`,
+  `querystring`, `string_decoder`, `timers/promises`, `module`
+  (`createRequire`, `builtinModules`), `assert`, `readline`, `perf_hooks`
+  (`performance.now()`), `constants`, `v8`, `tty`
+- **`child_process`**: `spawn`/`exec`/`execFile` (async) and a genuinely
+  synchronous `execFileSync` (a `SharedArrayBuffer`/`Atomics` bridge, needs
+  [cross-origin isolation](#cross-origin-isolation)); `spawnSync`/`execSync`
+  are not implemented
+- **`vm`**: only `runInThisContext()` (real Node semantics: shares the
+  caller's own global scope) — `runInNewContext`/`createContext`/`Script`
+  are not implemented (no way to fake real V8 context isolation in
+  userland JS)
+- **`worker_threads`**: real `MessageChannel`/`MessagePort` (native Web
+  API, with Node's `.ref()`/`.unref()` added as no-ops) — `new Worker(...)`
+  throws a clear "not implemented" error rather than faking in-VM
+  thread execution
+- **Not implemented**: `cluster`, `dgram`, `wasi`
+
+`npm install`/`npm install <pkg>` inside a guest process resolves real
+packages from `registry.npmjs.org` (full semver ranges, real tarball
+extraction, real integrity checks) into `node_modules` on the virtual
+filesystem — this is genuinely how a real, unmodified npm CLI itself runs
+inside the sandbox (see `examples/playground` for vendoring one). See
+[`PROGRESS.md`](../../PROGRESS.md) at the repo root for exactly what's been
+verified working against real npm packages, and what the current known gaps
+are (real Vite's own bundler currently needs a native binary this sandbox
+can't load — in progress).
 
 ## Preview
 
@@ -65,7 +145,7 @@ TCP socket — the kernel just remembers which guest Worker owns that port and
 emits a `listen` event:
 
 ```ts
-dwc.on("listen", ({ port }) => {
+dwc.addEventListener("listen", ({ port }) => {
   console.log(`server listening on ${port}`);
 });
 ```
@@ -122,17 +202,75 @@ working. If you need genuine isolation, that requires owning a domain with
 wildcard DNS and an edge worker to serve each preview from its own origin —
 out of scope for a client-only library like this one.
 
+## Cross-origin isolation
+
+The synchronous bridges (`fs.*Sync`, `dwc.shell.exec()`,
+`child_process.execFileSync`) need `SharedArrayBuffer`, which browsers only
+expose on a page served with:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Without these headers the library still works — `fs`/`process`/`preview`
+fall back to a slower static-preload path — just without the sync bridges.
+
 ## Events
 
-`dwc.on(type, handler)` / `dwc.off(type, handler)`. Currently emits:
+`dwc.addEventListener(type, handler)` returns an unsubscribe function.
+Currently emits:
 
 - `"listen"` — `{ port }`, when a guest process starts listening on a port.
+
+## Diagnostics
+
+`dwc.diagnostics.onEvent(handler)` subscribes to every request/reply/event
+crossing the kernel bridge (useful for debugging) — it replays recent
+history to a late subscriber, so you won't miss anything that happened
+before you attached.
 
 ## Known limitations
 
 - Guest `http` responses are fully buffered and text-only (no streaming, no
   binary bodies).
 - `dwc.preview.enable()` assumes a single top-level host page relaying for a
-  single `DuckWebContainer` instance.
+  single sandbox instance.
 - `npm install` fetches directly from `registry.npmjs.org` over the network —
   no offline mode or local cache.
+- No native-binary execution of any kind (no `esbuild`/`node-gyp`-built
+  addons, no WASI yet) — real Vite's own bundler currently hits exactly
+  this wall; see `PROGRESS.md` for the current state of working around it.
+
+See [`PROGRESS.md`](../../PROGRESS.md) at the repo root for the full,
+up-to-date build log.
+
+## Development of this repo
+
+The steps above are for *using* the published `@dwc/core` package in your
+own app. If you're working on this library itself (or its demo playground):
+
+```bash
+git clone <this repository>
+cd duck-webcontainer-api
+pnpm install         # requires Node 22+ and pnpm (packageManager-pinned - corepack enable)
+
+cd examples/playground
+pnpm dev              # vendors a real npm CLI into the sandbox on first run, then starts Vite
+```
+
+Then, from `packages/core`:
+
+```bash
+pnpm build            # tsup
+pnpm dev               # tsup --watch
+pnpm test               # vitest run
+npx tsc --noEmit -p tsconfig.json
+```
+
+`examples/playground`'s own `vite.config.ts` already sets the
+cross-origin-isolation headers described above for its dev/preview server,
+and its `predev`/`prebuild` scripts vendor a real npm CLI + copy the built
+preview Service Worker automatically - see
+`examples/playground/scripts/vendor-npm.mjs` and
+`examples/playground/scripts/copy-preview-sw.mjs`.
