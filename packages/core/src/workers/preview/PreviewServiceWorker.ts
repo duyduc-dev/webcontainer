@@ -34,6 +34,19 @@ import type { PreviewRelayRequest, PreviewRelayResponse } from "../../apis/previ
 
 type RelayResult = Extract<PreviewRelayResponse, { ok: true }>["result"];
 
+// Cross-Origin-Resource-Policy alone covers cross-origin SUBRESOURCES under
+// COEP; a nested browsing context's own DOCUMENT is a separate rule - when
+// the embedding page has Cross-Origin-Embedder-Policy: require-corp, every
+// framed document (same-origin or not) must carry a compatible COEP header
+// on its own response too, or Chromium blocks the navigation outright with
+// net::ERR_BLOCKED_BY_RESPONSE (confirmed via a real, hand-driven-equivalent
+// Playwright run - not the CORP-only gap the earlier fetch()-only test had
+// already covered, which never exercised a navigation response at all).
+const NAVIGATION_ISOLATION_HEADERS: Record<string, string> = {
+  "Cross-Origin-Resource-Policy": "cross-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+};
+
 const clientPorts = new Map<string, number>();
 const pending = new Map<string, { resolve: (result: RelayResult) => void; reject: (error: unknown) => void }>();
 
@@ -96,29 +109,35 @@ self.addEventListener("fetch", (event) => {
   const target = resolvePreviewTarget(url, event);
   if (!target) return; // not a tracked preview request — let the browser handle it normally
 
-  event.respondWith(
-    (async () => {
-      const method = event.request.method;
-      const headers = Object.fromEntries(event.request.headers.entries());
-      const body = method === "GET" || method === "HEAD" ? undefined : new Uint8Array(await event.request.arrayBuffer());
+  const responsePromise = (async () => {
+    const method = event.request.method;
+    const headers = Object.fromEntries(event.request.headers.entries());
+    const body = method === "GET" || method === "HEAD" ? undefined : new Uint8Array(await event.request.arrayBuffer());
 
-      try {
-        const result = await relay({ port: target.port, path: target.path, method, headers, body });
-        // The real Headers constructor doesn't accept an array value for one
-        // key (used above for a repeated response header) - folded into a
-        // single comma-separated value, same as how HTTP itself represents
-        // a repeated header when there's no structured way to keep it split.
-        const responseHeaders: Record<string, string> = { "Cross-Origin-Resource-Policy": "cross-origin" };
-        for (const [name, value] of Object.entries(result.headers)) {
-          responseHeaders[name] = Array.isArray(value) ? value.join(", ") : value;
-        }
-        return new Response(result.body as BodyInit, { status: result.status, statusText: result.statusMessage, headers: responseHeaders });
-      } catch (error) {
-        return new Response(`dwc preview relay error: ${String(error)}`, {
-          status: 502,
-          headers: { "Cross-Origin-Resource-Policy": "cross-origin" },
-        });
+    try {
+      const result = await relay({ port: target.port, path: target.path, method, headers, body });
+      // The real Headers constructor doesn't accept an array value for one
+      // key (used above for a repeated response header) - folded into a
+      // single comma-separated value, same as how HTTP itself represents
+      // a repeated header when there's no structured way to keep it split.
+      const responseHeaders: Record<string, string> = { ...NAVIGATION_ISOLATION_HEADERS };
+      for (const [name, value] of Object.entries(result.headers)) {
+        responseHeaders[name] = Array.isArray(value) ? value.join(", ") : value;
       }
-    })(),
-  );
+      return new Response(result.body as BodyInit, { status: result.status, statusText: result.statusMessage, headers: responseHeaders });
+    } catch (error) {
+      return new Response(`dwc preview relay error: ${String(error)}`, {
+        status: 502,
+        headers: NAVIGATION_ISOLATION_HEADERS,
+      });
+    }
+  })();
+
+  // event.waitUntil() alongside respondWith(): a navigation's extended-
+  // lifetime guarantee is otherwise tied only to respondWith's own promise -
+  // this is candidate (a) from PROGRESS.md's async-iframe-navigation
+  // investigation, added defensively regardless of root cause since it
+  // costs nothing and is standard practice for async SW responses.
+  event.respondWith(responsePromise);
+  event.waitUntil(responsePromise);
 });
