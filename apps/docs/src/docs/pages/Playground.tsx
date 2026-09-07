@@ -8,8 +8,15 @@ import DocPage from '../components/DocPage';
 const RESTART_DEBOUNCE_MS = 600;
 const STORAGE_KEY = 'dwc-playground-files';
 const ENTRY_FILE = 'server.js';
-const MAX_PREVIEW_RETRIES = 3;
-const PREVIEW_RETRY_DELAY_MS = 400;
+// Not a moment-later blip - confirmed live that three respawns 400ms apart
+// all failed identically, while a manual re-run several real seconds later
+// always succeeded. Whatever the Service Worker is still settling after a
+// brand new registration takes real wall-clock time under real network
+// conditions (never reproduces on localhost's near-zero latency), so the
+// retry has to wait long enough to actually clear that window, not just
+// long enough to look like it's trying.
+const PREVIEW_RETRY_DELAY_MS = [2000, 4000, 8000];
+const MAX_PREVIEW_RETRIES = PREVIEW_RETRY_DELAY_MS.length;
 
 const DEFAULT_FILES: Record<string, string> = {
   [ENTRY_FILE]: `const http = require("http");
@@ -372,14 +379,14 @@ function Playground() {
                 key={`${previewSrc}#${previewNonce}`}
                 onLoad={(event) => {
                   // A fresh page's very first preview occasionally comes up
-                  // against a dead process id - re-navigating the same URL
-                  // never recovers from this (confirmed live: it's not a
-                  // moment-later timing blip, something about that specific
-                  // process/port pairing is actually gone), but a full
-                  // respawn always does, exactly like clicking "Run now"
-                  // does today. Bounded, same as any dev-tool
+                  // against a dead process id, and needs real wall-clock
+                  // time (not just a retry attempt) to clear - see
+                  // PREVIEW_RETRY_DELAY_MS. A full respawn is what actually
+                  // recovers it once that time has passed, same as clicking
+                  // "Run now" does today. Bounded, same as any dev-tool
                   // reconnect-on-first-connect retry.
-                  if (previewRetriesRef.current >= MAX_PREVIEW_RETRIES) return;
+                  const attempt = previewRetriesRef.current;
+                  if (attempt >= MAX_PREVIEW_RETRIES) return;
                   let text = '';
                   try {
                     text = event.currentTarget.contentDocument?.body?.innerText ?? '';
@@ -388,7 +395,7 @@ function Playground() {
                   }
                   if (!text.includes('dwc preview relay error')) return;
                   previewRetriesRef.current += 1;
-                  window.setTimeout(() => run(), PREVIEW_RETRY_DELAY_MS);
+                  window.setTimeout(() => run(), PREVIEW_RETRY_DELAY_MS[attempt]);
                 }}
                 src={previewSrc}
                 title="Live preview"
