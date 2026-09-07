@@ -1,5 +1,7 @@
 import { createFileSystemAPI } from "./apis/FileSystem";
 import type { FileSystemAPI } from "./apis/FileSystem";
+import { createPreviewAPI } from "./apis/Preview";
+import type { PreviewAPI } from "./apis/Preview";
 import { createProcessAPI } from "./apis/Process";
 import type { ProcessAPI } from "./apis/Process";
 import { createShellAPI } from "./apis/Shell";
@@ -18,6 +20,7 @@ interface BootDWCReturn {
   fs: FileSystemAPI;
   process: ProcessAPI;
   shell: ShellAPI;
+  preview: PreviewAPI;
   addEventListener(type: string, handler: Handler): Unsubscribe;
 }
 
@@ -29,6 +32,7 @@ const bootDWC = async (options: BootDWCOptions = {}): Promise<BootDWCReturn> => 
     fs: createFileSystemAPI(kernelBridge.request),
     process: createProcessAPI(kernelBridge.request, kernelBridge.on),
     shell: createShellAPI(kernelBridge.request),
+    preview: createPreviewAPI(kernelBridge.request),
     addEventListener: kernelBridge.on,
   };
 };

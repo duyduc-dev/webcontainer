@@ -101,6 +101,77 @@ describe("createNetRelay", () => {
     expect(client.postMessage).not.toHaveBeenCalled();
   });
 
+  // Traced need: the dev-server preview feature has the KERNEL itself dial
+  // into a guest's listening port on the host page's behalf - it isn't a
+  // real Process Worker, so it can't be `registerWorker()`'d the normal way.
+  describe("virtual clients (a non-Worker relay participant, e.g. the kernel itself)", () => {
+    it("pipeConnect() from a virtual client delivers pipe-open to the real server worker", () => {
+      const relay = createNetRelay();
+      const server = fakeWorker();
+      relay.registerWorker("server-1", server);
+      relay.pipeListen("server-1", "key");
+
+      const received: unknown[] = [];
+      relay.registerVirtualClient("preview-1", (message) => received.push(message));
+      const connId = relay.pipeConnect("preview-1", "key");
+
+      expect(connId).toBeGreaterThan(0);
+      expect(server.postMessage).toHaveBeenCalledWith({
+        type: "net-pipe-message",
+        payload: { type: "pipe-open", connId, path: "key" },
+      });
+    });
+
+    it("relays data back to the virtual client's callback instead of postMessage", () => {
+      const relay = createNetRelay();
+      const server = fakeWorker();
+      relay.registerWorker("server-1", server);
+      relay.pipeListen("server-1", "key");
+
+      const received: unknown[] = [];
+      relay.registerVirtualClient("preview-1", (message) => received.push(message));
+      const connId = relay.pipeConnect("preview-1", "key");
+      server.postMessage.mockClear();
+
+      const chunk = new Uint8Array([1, 2, 3]);
+      relay.relay("server-1", { type: "pipe-data", connId, chunk });
+
+      expect(received).toEqual([{ type: "pipe-data", connId, chunk }]);
+      expect(server.postMessage).not.toHaveBeenCalled();
+    });
+
+    it("a virtual client can also send data (relay() from the virtual client's own id)", () => {
+      const relay = createNetRelay();
+      const server = fakeWorker();
+      relay.registerWorker("server-1", server);
+      relay.pipeListen("server-1", "key");
+
+      relay.registerVirtualClient("preview-1", () => {});
+      const connId = relay.pipeConnect("preview-1", "key");
+      server.postMessage.mockClear();
+
+      const chunk = new Uint8Array([9, 9]);
+      relay.relay("preview-1", { type: "pipe-data", connId, chunk });
+
+      expect(server.postMessage).toHaveBeenCalledWith({ type: "net-pipe-message", payload: { type: "pipe-data", connId, chunk } });
+    });
+
+    it("unregisterVirtualClient cleans up its connections", () => {
+      const relay = createNetRelay();
+      const server = fakeWorker();
+      relay.registerWorker("server-1", server);
+      relay.pipeListen("server-1", "key");
+      relay.registerVirtualClient("preview-1", () => {});
+      const connId = relay.pipeConnect("preview-1", "key");
+
+      relay.unregisterVirtualClient("preview-1");
+      server.postMessage.mockClear();
+
+      relay.relay("server-1", { type: "pipe-data", connId, chunk: new Uint8Array() });
+      expect(server.postMessage).not.toHaveBeenCalled();
+    });
+  });
+
   it("listen()/closeServer() and pipeListen()/pipeCloseServer() are plain registries", () => {
     const relay = createNetRelay();
     const client = fakeWorker();

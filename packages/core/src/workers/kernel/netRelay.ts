@@ -17,6 +17,13 @@ import type { PipeRelayMessage } from "../../runtime/node/bindings/net";
 interface NetRelay {
   registerWorker(processId: string, worker: Worker): void;
   unregisterWorker(processId: string): void;
+  /** Registers a "virtual client" - a pipe-relay participant that isn't a
+   * real Process Worker, e.g. the kernel itself dialing into a guest's
+   * listening port on the host page's behalf (traced need: the dev-server
+   * preview feature - see workers/kernel/previewRelay.ts). `onMessage` is
+   * called in place of `postMessage` whenever this id is the relay target. */
+  registerVirtualClient(clientId: string, onMessage: (message: PipeRelayMessage) => void): void;
+  unregisterVirtualClient(clientId: string): void;
   /** Fire-and-forget port/path registration — see bindings/net.ts's file
    * header for why this can't be a synchronous, retryable kernel round-trip
    * the way vivari's Atomics.wait-backed bridge allows. */
@@ -33,12 +40,18 @@ interface NetRelay {
 
 const createNetRelay = (): NetRelay => {
   const workers = new Map<string, Worker>();
+  const virtualClients = new Map<string, (message: PipeRelayMessage) => void>();
   const listeners = new Map<number, string>(); // port -> processId
   const pipeListeners = new Map<string, string>(); // path/key -> processId
   const pipeConns = new Map<number, { clientProcessId: string; serverProcessId: string }>();
   let nextConnId = 1;
 
   const send = (processId: string, message: { type: string; payload: unknown }): void => {
+    const virtual = virtualClients.get(processId);
+    if (virtual) {
+      virtual(message.payload as PipeRelayMessage);
+      return;
+    }
     workers.get(processId)?.postMessage(message);
   };
 
@@ -52,6 +65,17 @@ const createNetRelay = (): NetRelay => {
     for (const [key, owner] of pipeListeners) if (owner === processId) pipeListeners.delete(key);
     for (const [connId, conn] of pipeConns) {
       if (conn.clientProcessId === processId || conn.serverProcessId === processId) pipeConns.delete(connId);
+    }
+  };
+
+  const registerVirtualClient = (clientId: string, onMessage: (message: PipeRelayMessage) => void): void => {
+    virtualClients.set(clientId, onMessage);
+  };
+
+  const unregisterVirtualClient = (clientId: string): void => {
+    virtualClients.delete(clientId);
+    for (const [connId, conn] of pipeConns) {
+      if (conn.clientProcessId === clientId || conn.serverProcessId === clientId) pipeConns.delete(connId);
     }
   };
 
@@ -89,7 +113,18 @@ const createNetRelay = (): NetRelay => {
     if (message.type === "pipe-close") pipeConns.delete(message.connId);
   };
 
-  return { registerWorker, unregisterWorker, listen, closeServer, pipeListen, pipeCloseServer, pipeConnect, relay };
+  return {
+    registerWorker,
+    unregisterWorker,
+    registerVirtualClient,
+    unregisterVirtualClient,
+    listen,
+    closeServer,
+    pipeListen,
+    pipeCloseServer,
+    pipeConnect,
+    relay,
+  };
 };
 
 export { createNetRelay };
