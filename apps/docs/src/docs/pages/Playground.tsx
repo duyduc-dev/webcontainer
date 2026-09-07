@@ -228,16 +228,20 @@ function Playground() {
     if (previewCheckTimerRef.current !== undefined) window.clearTimeout(previewCheckTimerRef.current);
     const attempt = previewRetriesRef.current;
     if (attempt >= MAX_PREVIEW_RETRIES) return;
+    console.log('[dwc-debug] scheduling preview check, attempt', attempt, 'delay', PREVIEW_RETRY_DELAY_MS[attempt]);
     previewCheckTimerRef.current = window.setTimeout(() => {
       previewCheckTimerRef.current = undefined;
       let text = '';
       try {
         text = previewIframeRef.current?.contentDocument?.body?.innerText ?? '';
-      } catch {
+      } catch (err) {
+        console.log('[dwc-debug] check threw', String(err));
         return;
       }
+      console.log('[dwc-debug] check ran, text=', JSON.stringify(text));
       if (!text.includes('dwc preview relay error')) return;
       previewRetriesRef.current += 1;
+      console.log('[dwc-debug] retrying, attempt now', previewRetriesRef.current);
       run();
     }, PREVIEW_RETRY_DELAY_MS[attempt]);
   };
