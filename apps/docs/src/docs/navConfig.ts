@@ -14,6 +14,7 @@ export const DOCS_NAV: DocSection[] = [
     links: [
       { label: 'Introduction', to: '/docs' },
       { label: 'Installation', to: '/docs/installation' },
+      { label: 'Playground', to: '/docs/playground' },
     ],
   },
   {
