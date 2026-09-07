@@ -11,6 +11,11 @@ interface ProcessHandle {
   stderr: ReadableStream<Uint8Array>;
   stdin: WritableStream<Uint8Array>;
   exit: Promise<number>;
+  /** Terminates the process immediately, resolving `exit` with 143 (same
+   * convention a killed child_process child gets). Fire-and-forget, same
+   * shape as writing to `.stdin` - a caller restarting a dev server on file
+   * change has no earlier response to wait on anyway. */
+  kill(): void;
 }
 
 interface ProcessAPI {
@@ -57,7 +62,11 @@ const createProcessAPI = (request: Requester, on: Subscriber): ProcessAPI => {
         request("PROCESS_STDIN", { processId, chunk }).catch(() => {});
       });
 
-      return { stdout: stdoutSink.stream, stderr: stderrSink.stream, stdin, exit };
+      const kill = (): void => {
+        request("PROCESS_KILL", { processId }).catch(() => {});
+      };
+
+      return { stdout: stdoutSink.stream, stderr: stderrSink.stream, stdin, exit, kill };
     },
   };
 };

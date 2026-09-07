@@ -1,8 +1,11 @@
 import { javascript } from '@codemirror/lang-javascript';
 import CodeMirror from '@uiw/react-codemirror';
 import { bootDWC } from '@dwc/core';
+import type { ProcessHandle } from '@dwc/core';
 import { useEffect, useRef, useState } from 'react';
 import DocPage from '../components/DocPage';
+
+const RESTART_DEBOUNCE_MS = 600;
 
 const DEFAULT_CODE = `const http = require("http");
 let hits = 0;
@@ -40,6 +43,9 @@ function Playground() {
   const dwcRef = useRef<ReturnType<typeof bootDWC> | null>(null);
   const bootedRef = useRef(false);
   const runIdRef = useRef(0);
+  const codeRef = useRef(DEFAULT_CODE);
+  const procRef = useRef<ProcessHandle | null>(null);
+  const restartTimerRef = useRef<number | undefined>(undefined);
   const theme = useSystemTheme();
 
   const [code, setCode] = useState(DEFAULT_CODE);
@@ -82,14 +88,31 @@ function Playground() {
     const dwc = dwcRef.current;
     if (!dwc) return;
 
+    if (restartTimerRef.current !== undefined) {
+      window.clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = undefined;
+    }
+
+    // Dev-server-style restart: stop whatever's still listening from the
+    // previous run before starting the new one, same as `vite dev` killing
+    // and re-spawning on a file change rather than leaking the old server.
+    procRef.current?.kill();
+    procRef.current = null;
+    setPreviewSrc(null);
+
     const thisRun = ++runIdRef.current;
     setStatus('running');
     setOutput('');
 
     try {
       await dwc.fs.mkdir('/project', { recursive: true });
-      await dwc.fs.writeFile('/project/server.js', code);
+      await dwc.fs.writeFile('/project/server.js', codeRef.current);
       const proc = await dwc.process.spawn('/project/server.js', { cwd: '/project' });
+      if (runIdRef.current !== thisRun) {
+        proc.kill();
+        return;
+      }
+      procRef.current = proc;
 
       const pipe = async (stream: ReadableStream<Uint8Array>) => {
         const reader = stream.getReader();
@@ -105,6 +128,7 @@ function Playground() {
 
       const exitCode = await proc.exit;
       if (runIdRef.current === thisRun) {
+        procRef.current = null;
         setOutput((prev) => `${prev}\n[process exited with code ${exitCode}]\n`);
         setStatus('idle');
       }
@@ -116,10 +140,28 @@ function Playground() {
     }
   };
 
+  useEffect(
+    () => () => {
+      if (restartTimerRef.current !== undefined) window.clearTimeout(restartTimerRef.current);
+      procRef.current?.kill();
+    },
+    [],
+  );
+
+  const handleChange = (value: string) => {
+    setCode(value);
+    codeRef.current = value;
+    if (restartTimerRef.current !== undefined) window.clearTimeout(restartTimerRef.current);
+    restartTimerRef.current = window.setTimeout(() => {
+      restartTimerRef.current = undefined;
+      run();
+    }, RESTART_DEBOUNCE_MS);
+  };
+
   return (
     <DocPage
       title="Playground"
-      lede="A real @dwc/core sandbox, booted on this page. Edit the script and hit Run — it's the same require('http') your own app would use, running in a Web Worker, previewed live on the right."
+      lede="A real @dwc/core sandbox, booted on this page. Edit the script and it restarts automatically, like a dev server — it's the same require('http') your own app would use, running in a Web Worker, previewed live on the right."
       wide
     >
       <div className="-mx-4 grid grid-cols-1 gap-4 sm:mx-0 lg:grid-cols-2">
@@ -134,14 +176,14 @@ function Playground() {
               onClick={run}
               type="button"
             >
-              {status === 'booting' ? 'booting…' : status === 'running' ? 'running' : 'Run'}
+              {status === 'booting' ? 'booting…' : status === 'running' ? 'running' : 'Run now'}
             </button>
           </div>
           <CodeMirror
             basicSetup={{ foldGutter: false }}
             extensions={[javascript()]}
             height="360px"
-            onChange={(value) => setCode(value)}
+            onChange={handleChange}
             style={{ fontSize: 13 }}
             theme={theme}
             value={code}

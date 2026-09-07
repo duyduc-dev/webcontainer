@@ -36,6 +36,10 @@ interface StdinPayload {
   chunk: Uint8Array;
 }
 
+interface KillPayload {
+  processId: string;
+}
+
 interface ProcessClient {
   spawn(payload: SpawnPayload): Promise<{ processId: string }>;
   runShell(payload: ShellExecPayload): Promise<{ output: string; cwd: string }>;
@@ -47,6 +51,12 @@ interface ProcessClient {
    * than a hard error - the host side already treats this call as
    * fire-and-forget (`.catch(() => {})`). */
   stdin(payload: StdinPayload): void;
+  /** Terminates an already-running process's Worker immediately and reports
+   * a normal-shaped exit (code 143, matching cp-kill's own convention for a
+   * killed child) - the host-facing counterpart to a real Node child's
+   * `.kill()`. Silently a no-op for an unknown/already-exited processId,
+   * same fire-and-forget shape as `stdin` above. */
+  kill(payload: KillPayload): void;
 }
 
 interface BootProcessPayload {
@@ -528,8 +538,17 @@ const createProcessClient = (
     processTable.getWorker(payload.processId)?.postMessage({ type: "stdin", payload: { chunk: payload.chunk } });
   };
 
-  return { spawn, runShell, stdin };
+  const kill = (payload: KillPayload): void => {
+    const worker = processTable.getWorker(payload.processId);
+    if (!worker) return;
+    processTable.remove(payload.processId);
+    netRelay.unregisterWorker(payload.processId);
+    worker.terminate();
+    postEvent("process:exit", { processId: payload.processId, code: 143 });
+  };
+
+  return { spawn, runShell, stdin, kill };
 };
 
 export { createProcessClient };
-export type { ProcessClient, ShellExecPayload, SpawnPayload, StdinPayload };
+export type { KillPayload, ProcessClient, ShellExecPayload, SpawnPayload, StdinPayload };

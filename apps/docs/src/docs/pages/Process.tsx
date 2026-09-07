@@ -17,13 +17,15 @@ function Process() {
 proc.stdout; // ReadableStream<Uint8Array>
 proc.stderr; // ReadableStream<Uint8Array>
 proc.stdin;  // WritableStream<Uint8Array>
-const exitCode = await proc.exit; // Promise<number>`}
+const exitCode = await proc.exit; // Promise<number>
+proc.kill();                       // resolves exit with 143`}
       </CodeBlock>
       <p>
         Use this for anything long-running (a server); for a one-shot command,{' '}
         <code>dwc.shell.exec()</code> is simpler. A script that never exits (a server) never resolves{' '}
         <code>proc.exit</code> — that's expected, watch <code>"listen"</code> events instead (see{' '}
-        <code>Preview</code>).
+        <code>Preview</code>). Call <code>proc.kill()</code> to stop it early — the same pattern a dev
+        server uses to restart on a file change: kill the previous process, then spawn a new one.
       </p>
       <h2>Reading output</h2>
       <CodeBlock>

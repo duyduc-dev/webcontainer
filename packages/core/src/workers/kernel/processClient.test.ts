@@ -9,12 +9,15 @@ class FakeWorker {
   onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: ((event: ErrorEvent) => void) | null = null;
   posted: unknown[] = [];
+  terminated = false;
 
   postMessage(message: unknown) {
     this.posted.push(message);
   }
 
-  terminate() {}
+  terminate() {
+    this.terminated = true;
+  }
 }
 
 const fakeFsClient = (): FsClient =>
@@ -149,6 +152,27 @@ describe("createProcessClient — net-request forwarding", () => {
     await client.spawn({ entryPath: "/index.js" });
 
     expect(() => client.stdin({ processId: "no-such-process", chunk: new Uint8Array() })).not.toThrow();
+  });
+
+  it("kill() terminates the process Worker and reports a code-143 exit, mirroring child_process.kill()'s own convention", async () => {
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    const client = setup(fetcherClient);
+    const { processId } = await client.spawn({ entryPath: "/index.js" });
+
+    client.kill({ processId });
+
+    expect(spawned!.terminated).toBe(true);
+    const postMessage = (globalThis as unknown as { self: { postMessage: ReturnType<typeof vi.fn> } }).self
+      .postMessage;
+    expect(postMessage).toHaveBeenCalledWith({ type: "process:exit", payload: { processId, code: 143 } });
+  });
+
+  it("kill() for an unknown/already-exited processId is a silent no-op, not a throw", async () => {
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    const client = setup(fetcherClient);
+    await client.spawn({ entryPath: "/index.js" });
+
+    expect(() => client.kill({ processId: "no-such-process" })).not.toThrow();
   });
 });
 

@@ -66,6 +66,7 @@ proc.stdout; // ReadableStream<Uint8Array>
 proc.stderr; // ReadableStream<Uint8Array>
 proc.stdin; // WritableStream<Uint8Array>
 const exitCode = await proc.exit; // Promise<number>
+proc.kill(); // resolves exit with 143, same as a killed child_process child
 ```
 
 Runs a script (a real file path already on the virtual filesystem) as its
