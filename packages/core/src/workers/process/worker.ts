@@ -260,10 +260,20 @@ const write = (stream: "stdout" | "stderr", chunk: string | Uint8Array): void =>
  * `process.stdout.write(...)` idiom (real Node's own convention, which every
  * demo/script so far has avoided in favor of console.log). Reference-equality
  * checks against these in vendored lib code (net.js, streams/readable.js)
- * stay correct either way; nothing there calls .write() on them. */
-const createWritableStream = (stream: "stdout" | "stderr") => ({
-  write: (chunk: string | Uint8Array): boolean => {
+ * stay correct either way; nothing there calls .write() on them.
+ *
+ * `write()`'s optional callback matters more than it looks: real npm's own
+ * exit-handler.js flushes with `stderr.write('', () => stdout.write('', () =>
+ * process.exit(...)))` specifically so it "doesn't hang on things like the
+ * update notifier" instead of waiting for the event loop to drain on its
+ * own — if that callback is silently dropped, process.exit() is never
+ * reached and the guest process hangs forever right after its last output,
+ * regardless of anything actually still pending. */
+const createWritableStream = (stream: "stdout" | "stderr", nextTick: (callback: () => void) => void) => ({
+  write: (chunk: string | Uint8Array, encodingOrCallback?: string | (() => void), callback?: () => void): boolean => {
     write(stream, chunk);
+    const cb = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+    if (cb) nextTick(cb);
     return true;
   },
   isTTY: false,
@@ -322,8 +332,8 @@ const boot = (payload: BootPayload): void => {
       exitProcess(exitCode);
     },
     nextTick: eventLoop.nextTick,
-    stdout: createWritableStream("stdout"),
-    stderr: createWritableStream("stderr"),
+    stdout: createWritableStream("stdout", eventLoop.nextTick),
+    stderr: createWritableStream("stderr", eventLoop.nextTick),
     title: "node",
     // Matches the pinned version the vendored lib/*.js sources actually come
     // from (see e.g. lib/net.js's own "VENDORED VERBATIM from Node.js
