@@ -8,15 +8,6 @@ import DocPage from '../components/DocPage';
 const RESTART_DEBOUNCE_MS = 600;
 const STORAGE_KEY = 'dwc-playground-files';
 const ENTRY_FILE = 'server.js';
-// Not a moment-later blip - confirmed live that three respawns 400ms apart
-// all failed identically, while a manual re-run several real seconds later
-// always succeeded. Whatever the Service Worker is still settling after a
-// brand new registration takes real wall-clock time under real network
-// conditions (never reproduces on localhost's near-zero latency), so the
-// retry has to wait long enough to actually clear that window, not just
-// long enough to look like it's trying.
-const PREVIEW_RETRY_DELAY_MS = [2000, 4000, 8000];
-const MAX_PREVIEW_RETRIES = PREVIEW_RETRY_DELAY_MS.length;
 
 const DEFAULT_FILES: Record<string, string> = {
   [ENTRY_FILE]: `const http = require("http");
@@ -87,9 +78,6 @@ function Playground() {
   const filesRef = useRef<Record<string, string>>(DEFAULT_FILES);
   const procRef = useRef<ProcessHandle | null>(null);
   const restartTimerRef = useRef<number | undefined>(undefined);
-  const previewRetriesRef = useRef(0);
-  const previewIframeRef = useRef<HTMLIFrameElement | null>(null);
-  const previewCheckTimerRef = useRef<number | undefined>(undefined);
   const theme = useSystemTheme();
 
   const [files, setFiles] = useState<Record<string, string>>(() => {
@@ -102,7 +90,6 @@ function Playground() {
   const [newFileName, setNewFileName] = useState('');
   const [output, setOutput] = useState('');
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
-  const [previewNonce, setPreviewNonce] = useState(0);
   const [status, setStatus] = useState<'booting' | 'idle' | 'running' | 'error'>('booting');
 
   useEffect(() => {
@@ -111,17 +98,9 @@ function Playground() {
 
     const dwc = bootDWC();
     dwcRef.current = dwc;
-    (window as any).__dwc = dwc;
 
     dwc.addEventListener('listen', (payload) => {
-      // Bump unconditionally (not reset to a fixed value) - a respawn can
-      // land on the exact same port, producing the exact same URL string,
-      // and the iframe still needs to remount against the new process
-      // behind it rather than keep whatever it already loaded.
-      previewRetriesRef.current = 0;
-      setPreviewNonce((n) => n + 1);
       setPreviewSrc(dwc.preview.url((payload as { port: number }).port));
-      schedulePreviewCheck();
     });
 
     (async () => {
@@ -151,10 +130,6 @@ function Playground() {
     if (restartTimerRef.current !== undefined) {
       window.clearTimeout(restartTimerRef.current);
       restartTimerRef.current = undefined;
-    }
-    if (previewCheckTimerRef.current !== undefined) {
-      window.clearTimeout(previewCheckTimerRef.current);
-      previewCheckTimerRef.current = undefined;
     }
 
     // Dev-server-style restart: stop whatever's still listening from the
@@ -213,39 +188,10 @@ function Playground() {
   useEffect(
     () => () => {
       if (restartTimerRef.current !== undefined) window.clearTimeout(restartTimerRef.current);
-      if (previewCheckTimerRef.current !== undefined) window.clearTimeout(previewCheckTimerRef.current);
       procRef.current?.kill();
     },
     [],
   );
-
-  // Polls the iframe's own document rather than relying on its onLoad event -
-  // confirmed live that onLoad does not reliably fire for a navigation the
-  // Service Worker intercepted and answered itself (a fresh page's very
-  // first preview can go a good 10+ seconds with zero onLoad firing despite
-  // the iframe visibly showing a loaded error page), so this is the only
-  // signal that's actually observed to work for detecting it.
-  const schedulePreviewCheck = () => {
-    if (previewCheckTimerRef.current !== undefined) window.clearTimeout(previewCheckTimerRef.current);
-    const attempt = previewRetriesRef.current;
-    if (attempt >= MAX_PREVIEW_RETRIES) return;
-    console.log('[dwc-debug] scheduling preview check, attempt', attempt, 'delay', PREVIEW_RETRY_DELAY_MS[attempt]);
-    previewCheckTimerRef.current = window.setTimeout(() => {
-      previewCheckTimerRef.current = undefined;
-      let text = '';
-      try {
-        text = previewIframeRef.current?.contentDocument?.body?.innerText ?? '';
-      } catch (err) {
-        console.log('[dwc-debug] check threw', String(err));
-        return;
-      }
-      console.log('[dwc-debug] check ran, text=', JSON.stringify(text));
-      if (!text.includes('dwc preview relay error')) return;
-      previewRetriesRef.current += 1;
-      console.log('[dwc-debug] retrying, attempt now', previewRetriesRef.current);
-      run();
-    }, PREVIEW_RETRY_DELAY_MS[attempt]);
-  };
 
   const scheduleRestart = () => {
     if (restartTimerRef.current !== undefined) window.clearTimeout(restartTimerRef.current);
@@ -411,13 +357,7 @@ function Playground() {
               </span>
             </div>
             {previewSrc ? (
-              <iframe
-                className="flex-1 bg-white"
-                key={`${previewSrc}#${previewNonce}`}
-                ref={previewIframeRef}
-                src={previewSrc}
-                title="Live preview"
-              />
+              <iframe className="flex-1 bg-white" key={previewSrc} src={previewSrc} title="Live preview" />
             ) : (
               <div className="flex flex-1 items-center justify-center font-mono text-[12px] text-[var(--color-text-faint)]">
                 waiting for the server to listen…
