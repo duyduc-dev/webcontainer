@@ -380,7 +380,16 @@ const createModuleLoader = (options: ModuleLoaderOptions): ModuleLoader => {
       dwcInteropDefault: unknown,
     ) => void;
     const WRAPPER_PARAMS = ["module", "exports", "require", "__filename", "__dirname", "__dwcImport", "__dwcInteropDefault"];
-    const compiled = rewriteDynamicImportCalls(stripShebang(source));
+    // A `//# sourceURL=` comment is the one thing `new Function`-compiled code
+    // can do to stop being anonymous in DevTools/stack traces - without it,
+    // every frame this module ever produces prints as "eval at loadModule
+    // (...), <anonymous>:N:M" with no hint which of npm's (or any other
+    // guest package's) hundreds of files N actually belongs to. Traced need:
+    // diagnosing a live `npm run dev` -> vite -> process.exit(0) call chain
+    // was only possible once this pointed the frame at the real
+    // node_modules/npm/lib/cli/exit-handler.js path instead of a bare line
+    // number.
+    const compiled = `${rewriteDynamicImportCalls(stripShebang(source))}\n//# sourceURL=dwc://module${path}`;
 
     let wrapper: Wrapper;
     try {
