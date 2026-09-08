@@ -81,9 +81,22 @@ export default function (exports, require, module, process, internalBinding, pri
         if (errorMessage != null) {
           const err = new Error(errorMessage);
           err.code = "ENOENT";
-          process.nextTick(() => child.emit("error", err));
-          child.emit("exit", null, null);
-          child.emit("close", null, null);
+          // Real Node emits 'error' before 'exit'/'close' for a failed spawn -
+          // callers that race a promise on both (e.g. real npm's own
+          // @npmcli/promise-spawn: `.on('error', reject)` and `.on('close',
+          // (code, signal) => code || signal ? reject() : resolve())`) rely on
+          // that order, since a Promise's first settlement wins and 'close'
+          // fires with code=null/signal=null here (both falsy - there is no
+          // real exit code for a command that never ran), which reads as
+          // success unless 'error' gets there first. All three deferred into
+          // the same nextTick (not just 'error' alone) keeps that order while
+          // still giving a caller who attaches its own 'error' listener
+          // asynchronously time to do so before any of these fire.
+          process.nextTick(() => {
+            child.emit("error", err);
+            child.emit("exit", null, null);
+            child.emit("close", null, null);
+          });
           return;
         }
         child.exitCode = code;

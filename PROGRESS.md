@@ -1295,6 +1295,76 @@ session's own decision, still true.
    candidate for whoever picks this up, separate from the Vite-dev-server
    gaps in item 3.
 
+   **Follow-up, next session: found and fixed the actual silent-failure bug,
+   then traced the real remaining gap two layers deep.**
+
+   The "clean exit, nothing happened" symptom was a real bug in this
+   runtime's own `child_process.js`, not npm doing anything unusual. `spawn()`'s
+   `onExit` handler, on a resolution failure (command not found), deferred only
+   the `'error'` event via `process.nextTick(() => child.emit("error", err))`
+   but emitted `'exit'`/`'close'` *synchronously* right after, in the same
+   call - so `'close'` (with `code=null, signal=null`, both falsy) always fired
+   before the deferred `'error'`. Real npm's own `@npmcli/promise-spawn`
+   (`spawn()`'s actual caller here) does exactly `proc.on('error', reject)` and
+   `proc.on('close', (code, signal) => code || signal ? reject() : resolve())`
+   - a Promise's first settlement wins, so `'close'` firing first with two
+   falsy values silently *resolved* the promise as if the command had
+   succeeded, before `'error'` ever got a chance to reject it. This wasn't
+   `npm exec`-specific - it silently swallowed EVERY `spawn()` resolution
+   failure system-wide, for any caller shaped like `promise-spawn`. Fixed by
+   deferring all three events (`error`, `exit`, `close`) into the same
+   `process.nextTick`, preserving their relative order (matching real Node,
+   which emits `'error'` before `'exit'`/`'close'` for a failed spawn) while
+   still giving a caller time to attach its own `'error'` listener
+   asynchronously.
+
+   Re-verified live (`npm create vite@latest my-app -- --template vanilla`,
+   same harness as above): the silent no-op is now a real, honestly-reported
+   failure - `npm error code ENOENT` / `npm error enoent sh: command not
+   found`, exit code 1 - instead of a misleading clean exit 0 with an empty
+   directory. That's the actual root cause surfacing for the first time,
+   traced further:
+
+   Real npm's own `@npmcli/run-script` (`lib/make-spawn-args.js`) always
+   builds its script-running spawn with `shell: scriptShell` (default `true`
+   unless a caller overrides it), which `@npmcli/promise-spawn`'s own
+   `spawnWithShell()` turns into a literal `child_process.spawn('sh', ['-c',
+   '<command line>'], {...})` - confirmed exactly this shape live via the
+   error above. Two things are needed to make that actually run something,
+   neither of which exists in this runtime yet:
+   1. **No dispatch for `sh -c "<line>"` in `spawn()` at all.** `resolveEntryPoint()`
+      (`workers/kernel/processClient.ts`) only ever resolves a literal `/bin/
+      <command>.js` or a `node <script>` invocation - there is no `sh`/`bash`
+      program, vendored or otherwise (`kernel/fs/coreutils.ts`'s own list:
+      `echo`, `pwd`, `true`, `false`, `cat`, `ls`, `mkdir`, `rm`, `mv` - no
+      shell). This project already has a working, if deliberately minimal,
+      shell-line interpreter (`shell/tokenize.ts`'s `&&`/`>`-only tokenizer,
+      currently only wired up for `child_process.exec()`/`dwc.shell.exec()`
+      via `runShellInternal()`) that could plausibly back a `sh -c` dispatch
+      for `spawn()` too - but that path is buffered (accumulates one `output`
+      string, returns only at the end), not streamed the way `cp-spawn`'s
+      protocol otherwise delivers stdout/stderr progressively; reusing it
+      as-is would mean `spawn()`'s streaming contract silently degrades to
+      "all output arrives at once, at exit" for anything shell-dispatched.
+   2. **No PATH-based executable resolution anywhere in this runtime.**
+      Real npm's own `setPATH()` (`@npmcli/run-script/lib/set-path.js`) is
+      what's supposed to make `create-vite` (fetched into some real npm cache
+      directory, never `/bin/`) resolvable by name inside that `sh -c` line -
+      it works by prepending the fetched package's own bin directory onto
+      `env.PATH`, then relying on `sh` to search `PATH` for `create-vite` when
+      resolving the command word. `resolveEntryPoint()` has no notion of
+      `PATH` at all - it is hardcoded to exactly `/bin/<command>.js`, nothing
+      else, ever. Even with (1) fixed, `create-vite` would still resolve to
+      "command not found" without this.
+
+   Not yet attempted - a real, scoped follow-on (extend `resolveEntryPoint`
+   to search `env.PATH.split(':')` before falling back to `/bin/`, and give
+   `spawn()` a `sh -c` dispatch path, streamed or not) for whoever picks this
+   up next, separate from the Vite build/HMR gaps above. The
+   silent-failure-swallowing fix above is real and shipped regardless of
+   whether this is ever built - every `spawn()` caller now gets an honest
+   `'error'`/non-zero exit instead of a misleading clean success.
+
 ## Reminder: no AI attribution in commits
 
 Per standing preference, commit messages for this project should not
