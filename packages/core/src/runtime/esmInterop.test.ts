@@ -37,6 +37,7 @@ describe("transformEsmToCjs", () => {
     const fakeRequire = (specifier: string): unknown => {
       if (specifier === "./dep.js") return { a: 1, b: 2, modifierNames: 1, colorNames: 2 };
       if (specifier === "./esm-dep.js") return { __esModule: true, default: "esm-default" };
+      if (specifier === "./reexport-dep.js") return { __esModule: true, default: "should-not-reexport", named: "should-reexport" };
       throw new Error(`unexpected require('${specifier}')`);
     };
     wrapper(moduleObj, moduleObj.exports, fakeRequire, interopDefault);
@@ -75,6 +76,19 @@ describe("transformEsmToCjs", () => {
     const exports = run("const stdoutColor = 1;\nconst stderrColor = 2;\nexport { stdoutColor as supportsColor, stderrColor };");
     expect(exports.supportsColor).toBe(1);
     expect(exports.stderrColor).toBe(2);
+  });
+
+  it("does not rewrite import/export-looking text sitting inside a string literal (real @emnapi/core's own shape: an error message advising real import syntax as plain text)", () => {
+    const source =
+      'function warn() { throw new TypeError("Invalid `options.context`. Use `import { getDefaultContext } from \'@emnapi/runtime\'`"); }\nexport const x = 1;';
+    const exports = run(source);
+    expect(exports.x).toBe(1);
+  });
+
+  it("handles \"export * from 'specifier'\" (real @emnapi/core's own shape, a rolldown-vite dependency), re-exporting every named export but not 'default'", () => {
+    const exports = run("export * from './reexport-dep.js';");
+    expect(exports.named).toBe("should-reexport");
+    expect(exports.default).toBeUndefined();
   });
 
   it("handles a multi-line export list with a comment and 'from' (chalk's own real shape)", () => {

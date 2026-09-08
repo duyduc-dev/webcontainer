@@ -4,7 +4,7 @@ import type { ProcessLike } from "./builtins";
 import { createEsmLoader } from "./esmLoader";
 import { interopDefault, toNamespace, transformEsmToCjs } from "./esmInterop";
 import type { NodeModulesContext } from "./node/loader";
-import { fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, splitBareSpecifier } from "./resolveSpecifier";
+import { CJS_EXPORT_CONDITIONS, fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, resolveExportsMap, splitBareSpecifier } from "./resolveSpecifier";
 
 /** Marks an error as already tagged with the module path that actually threw
  * it - see loadModule()'s own catch for why this must only happen once, at
@@ -114,22 +114,39 @@ const resolveBareSync = (fromPath: string, specifier: string, readSource: Source
   for (const nodeModulesDir of nodeModulesDirsFrom(fromPath)) {
     const pkgDir = `${nodeModulesDir}/${packageName}`;
 
+    let pkgJson: { main?: string; exports?: unknown } | undefined;
+    const pkgJsonSource = readSource(`${pkgDir}/package.json`);
+    if (pkgJsonSource !== undefined) {
+      try {
+        pkgJson = JSON.parse(pkgJsonSource) as { main?: string; exports?: unknown };
+      } catch {
+        // Malformed package.json - fall through to the legacy guesses below.
+      }
+    }
+
+    // Real Node: an "exports" field takes over resolution ENTIRELY for this
+    // package - "main" and plain subpath file-guessing are not consulted as
+    // a fallback when it's present, even if it doesn't resolve this
+    // particular subpath (that's a real ERR_PACKAGE_PATH_NOT_EXPORTED case,
+    // not "try the old way instead"). Traced need: real @napi-rs/wasm-runtime
+    // (see resolveSpecifier.ts's own doc comment on CJS_EXPORT_CONDITIONS)
+    // ships no "main" field at all, only `{".": {"import": "...", "require":
+    // "...cjs"}}` - the legacy guess below would only ever find its README.
+    if (pkgJson?.exports !== undefined) {
+      const target = resolveExportsMap(pkgJson.exports, subpath ? `./${subpath}` : ".", CJS_EXPORT_CONDITIONS);
+      if (target === null) continue;
+      const match = fileCandidates(normalize(`${pkgDir}/${target}`)).find((candidate) => readSource(candidate) !== undefined);
+      if (match) return match;
+      continue;
+    }
+
     if (subpath) {
       const match = fileCandidates(`${pkgDir}/${subpath}`).find((candidate) => readSource(candidate) !== undefined);
       if (match) return match;
       continue;
     }
 
-    let main = "index.js";
-    const pkgJsonSource = readSource(`${pkgDir}/package.json`);
-    if (pkgJsonSource !== undefined) {
-      try {
-        main = (JSON.parse(pkgJsonSource) as { main?: string }).main ?? "index.js";
-      } catch {
-        // Malformed package.json - fall through to the plain index.js guess.
-      }
-    }
-
+    const main = pkgJson?.main ?? "index.js";
     const match = fileCandidates(normalize(`${pkgDir}/${main}`)).find((candidate) => readSource(candidate) !== undefined);
     if (match) return match;
   }

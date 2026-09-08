@@ -157,6 +157,43 @@ describe("moduleLoader", () => {
     expect(await loader.run("/index.js")).toBe("padded");
   });
 
+  it("resolves a bare specifier with no \"main\" field via its package.json \"exports\" map, preferring \"require\" over \"import\" (real @napi-rs/wasm-runtime's own shape - a rolldown-vite dependency reached via its WebContainer WASM fallback)", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('dual-pkg');",
+        "/node_modules/dual-pkg/package.json": '{"exports":{".":{"import":"./esm.mjs","require":"./cjs.js"}}}',
+        "/node_modules/dual-pkg/cjs.js": "module.exports = 'cjs-build';",
+        "/node_modules/dual-pkg/esm.mjs": "export default 'wrong-build';",
+      },
+    });
+
+    expect(await loader.run("/index.js")).toBe("cjs-build");
+  });
+
+  it("resolves a bare specifier's subpath through an \"exports\" subpath map", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('dual-pkg/fs');",
+        "/node_modules/dual-pkg/package.json": '{"exports":{".":{"require":"./cjs.js"},"./fs":{"require":"./fs.js"}}}',
+        "/node_modules/dual-pkg/fs.js": "module.exports = 'fs-subpath';",
+      },
+    });
+
+    expect(await loader.run("/index.js")).toBe("fs-subpath");
+  });
+
+  it("does not fall back to a package's own \"main\" field or plain file guessing once \"exports\" is present (real Node: \"exports\" replaces legacy resolution entirely, not just adds to it)", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/index.js": "module.exports = require('exports-only-pkg');",
+        "/node_modules/exports-only-pkg/package.json": '{"main":"legacy.js","exports":{".":{"browser":"./browser.js"}}}',
+        "/node_modules/exports-only-pkg/legacy.js": "module.exports = 'legacy';",
+      },
+    });
+
+    await expect(loader.run("/index.js")).rejects.toThrow(/Cannot find module/);
+  });
+
   it("resolves a bare specifier's subpath directly, bypassing \"main\"", async () => {
     const loader = createModuleLoader({
       sources: {

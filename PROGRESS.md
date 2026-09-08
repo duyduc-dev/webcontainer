@@ -860,16 +860,128 @@ session's own decision, still true.
    passes through intact (`{"hello":"world"}` observed byte-for-byte on
    the other side).
 
-   **Not yet attempted**: wiring this into the real, full rolldown/
-   `@napi-rs/wasm-runtime` chain (real `npm install vite`, real
-   `execFileSync`-driven WASM binding download, real `wasi-worker.mjs`
-   actually spawned by `@napi-rs/wasm-runtime`'s own internal code) - the
-   underlying mechanism (`node:wasi` + `worker_threads.Worker`) is now
-   real and independently verified, but the full integration hasn't been
-   re-run end-to-end since these two pieces landed. That's the next
-   concrete step for whoever picks this up: rerun the `npm install vite`
-   → real `vite.js` trace from where item 3 left off before this session,
-   see what (if anything) breaks next.
+   **Follow-up session, same day: re-ran the real `npm install vite` →
+   real `vite.js` trace from here, live.** Real, substantial further
+   progress - found and fixed four more real bugs, in order, each
+   confirmed via the same "rerun the real thing, read the real error"
+   method as everywhere else in this project, live against
+   `examples/playground`'s dev server (`npm install vite`, real registry,
+   ~1-2 min; then spawning the real installed `node_modules/vite/bin/
+   vite.js --version`):
+
+   1. **moduleLoader.ts's CJS `require()` had NO "exports" map support at
+      all - main-field + plain subpath only** (already known and
+      explicitly documented as out of scope in the loader's own doc
+      comment, from before this session). Real `@napi-rs/wasm-runtime`
+      (rolldown's own WebContainer-fallback dependency) ships NO "main"
+      field, only `{".": {"import": "./runtime.js", "require":
+      "./runtime.cjs"}}` - every `require('@napi-rs/wasm-runtime')`
+      failed with "Cannot find module", despite the real files sitting
+      right there on disk (confirmed via `dwc.fs.readdir()`). Fixed by
+      wiring the ALREADY-EXISTING (but never-called) `resolveExportsMap()`
+      helper (in `resolveSpecifier.ts`, originally built for the ESM
+      loader) into `resolveBareSync()`, parameterized with a new
+      `CJS_EXPORT_CONDITIONS = ["node", "require", "default"]` (the
+      opposite preference order from `ESM_EXPORT_CONDITIONS`'s
+      `"import"` - a require() call site must get the CJS build of a
+      dual-published package, not the ESM one it can't evaluate). Real
+      Node semantics: an "exports" field replaces main-field/subpath
+      guessing ENTIRELY for that package, not just adds to it - matched
+      exactly, including for the miss case (verified via three new
+      `moduleLoader.test.ts` cases).
+   2. **`export * from '...'` (a wildcard re-export-all statement) was
+      entirely unhandled by `esmInterop.ts`'s ESM→CJS retry transform.**
+      Real `@emnapi/core` (an `@napi-rs/wasm-runtime` dependency, `"type":
+      "module"`, no CJS build) does exactly `export * from
+      '@emnapi/wasi-threads';` at its top level - the retry compile
+      failed the same way the original compile did, surfacing the same
+      unhelpful "Cannot use import statement outside a module" either
+      way. Fixed with a new `EXPORT_STAR_RE` pattern, rewritten to
+      `Object.keys(require(specifier)).forEach(...)`, re-exporting every
+      named key except `default` (real ESM re-export-all semantics).
+   3. **A real, more serious latent bug this surfaced: `esmInterop.ts`'s
+      regex-based rewriter had NO string/comment/template-literal masking
+      at all - unlike `esmLoader.ts`'s own specifier scanner, which
+      already solved exactly this problem.** Real `@emnapi/core` throws
+      `new TypeError("Invalid \`options.context\`. Use \`import {
+      getDefaultContext } from '@emnapi/runtime'\`")` - a plain
+      human-readable error-message STRING that happens to contain real
+      `import` syntax as advice text. The old `IMPORT_NAMED_RE` matched
+      it unconditionally (regex has no notion of "inside a string") and
+      rewrote the STRING LITERAL ITSELF into broken code, producing a
+      much more confusing failure one level removed from the original
+      problem (`new Function()` throwing "missing ) after argument
+      list" - confirmed live via `node --check` on the transformed
+      output, pinpointing the exact corrupted line). Fixed by exporting
+      `esmLoader.ts`'s existing `maskNonCode()`/`isRealCode()` (previously
+      module-private) and rewriting `transformEsmToCjs()` from sequential
+      `.replace()` calls into the same "scan the real source, keep only
+      matches whose position is real code per the masked text, collect
+      edits by absolute offset, apply once at the end" pattern
+      `esmLoader.ts` already used - every regex now independent of every
+      other's output too (a real, if minor, correctness improvement on
+      its own), not just fixed for this one string. Verified against the
+      real, complete `@emnapi/core` source file directly (a temporary
+      test compiling the real downloaded file end-to-end), plus a new
+      regression test using the exact real string.
+   4. **`process.execArgv` didn't exist on the guest `process` global at
+      all.** Real `rolldown-binding.wasi.cjs`'s own generated
+      `__getWasiWorkerExecArgv()` - reached via WASI's `thread-spawn`
+      import calling into `worker_threads.Worker` for the very first
+      time with a REAL wasm binary - does `process.execArgv.length`
+      unconditionally, crashing every single `thread-spawn` call with
+      "Cannot read properties of undefined (reading 'length')". Fixed
+      with an honest `execArgv: []` (a guest process has no real `node`
+      CLI invocation to have parsed flags from) on both `workers/
+      process/worker.ts`'s and `workers/workerThreads/worker.ts`'s own
+      `processGlobal`.
+
+      **This fourth fix alone resolved something that looked, before it,
+      like a much scarier problem**: with `execArgv` undefined, the
+      `thread-spawn` failure cascaded into a genuine Rust-side panic one
+      level up - `thread '<unnamed>' panicked ... OS can't spawn worker
+      thread: Resource temporarily unavailable (os error 6)` from
+      rolldown's own tokio runtime, which read at first like a real
+      resource exhaustion or a deeper architectural problem with nested
+      Worker spawning. It was neither - fixing the one real JS-level
+      TypeError that preceded it made the panic disappear entirely on
+      the very next run. Worth remembering if a future session hits a
+      scary-looking low-level panic here again: check for a mundane JS
+      exception one level up before assuming the worse explanation.
+
+   **Verified live, in order, after all four fixes**: real `npm install
+   vite` (exit 0, ~1-2 min) → real `node_modules/vite/bin/vite.js
+   --version` → real `rolldown` (vite's own bundler) loads → real
+   WebContainer WASM fallback triggers → real `@rolldown/binding-
+   wasm32-wasi` downloads via the sync-exec/pnpm-shim bridge → real
+   `node:wasi` services the wasm module's file I/O → real
+   `wasi.thread-spawn` fires → real `worker_threads.Worker` spawns a
+   genuine nested browser Worker running the real `wasi-worker.mjs` →
+   the wasm module's own async work pool actually starts. This is
+   the ENTIRE chain items 3's original WASI/worker_threads blocker was
+   about, now confirmed working end-to-end with the real artifact, not
+   a synthetic test.
+
+   **Where it stops now**: `Error: internalBinding('block_list') is not
+   implemented yet`, from `net.js`'s own lazy `get BlockList()` accessor
+   (something in vite/rolldown's real dependency chain touches
+   `net.BlockList`, not yet identified exactly what or why). Unlike
+   every fix in this list, `net.BlockList`'s native half
+   (`internalBinding('block_list')`) has no vendor-and-adapt path
+   available - real Node's own implementation is a genuine native
+   binding doing real IP/CIDR range matching, not pure JS callable
+   through some existing bridge (`internal/blocklist.js` is already
+   vendored verbatim, sitting ready, exactly like `internal/
+   socketaddress.js` - both are waiting on this same native half).
+   Comparable in size to the zlib decoder or HTTP wire-format work
+   earlier in this project - a real, separate undertaking, not a quick
+   stub, and not yet started. Not yet determined whether `vite --version`
+   specifically needs real BlockList *behavior* or just needs the
+   property access itself to not throw (worth checking with a minimal
+   stub FIRST - a `BlockList` class whose methods all honestly no-op/
+   return "not blocked" - before committing to real IP-matching logic
+   nothing has confirmed is actually exercised yet). The next concrete
+   step for whoever picks this up.
 
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over

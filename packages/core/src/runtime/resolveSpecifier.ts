@@ -54,6 +54,19 @@ const nodeModulesDirsFrom = (fromPath: string): string[] => {
  * "exports" map support at all (main-field + subpath only). */
 const ESM_EXPORT_CONDITIONS = ["node", "import", "default"];
 
+/** Condition order for resolving a package.json "exports" map entry from a
+ * CommonJS require() - "require" before "default" (the OPPOSITE of
+ * ESM_EXPORT_CONDITIONS's "import" preference), matching real Node: a dual-
+ * published package's "exports" map exists specifically to route require()
+ * and import() to different files ({".": {"import": "...esm.js", "require":
+ * "...cjs.js"}}) - picking "import" from a require() call site would hand
+ * CJS code a real ESM file it can't evaluate. Traced need: real
+ * @napi-rs/wasm-runtime (a rolldown-vite dependency, reached via its own
+ * WebContainer WASM fallback - see module.ts's doc comment on
+ * process.versions.webcontainer) ships NO "main" field at all, only this
+ * exact exports shape - moduleLoader.ts's require() had no way to find it. */
+const CJS_EXPORT_CONDITIONS = ["node", "require", "default"];
+
 /**
  * Resolves one subpath ("." for the package root, "./foo" for a subpath)
  * against a package.json "exports" field value under ESM_EXPORT_CONDITIONS.
@@ -71,7 +84,7 @@ const ESM_EXPORT_CONDITIONS = ["node", "import", "default"];
  * self-referencing the owning package's own name from within itself - are
  * out of scope (see the plan this shipped under).
  */
-const resolveExportsMap = (exportsField: unknown, subpath: string): string | null => {
+const resolveExportsMap = (exportsField: unknown, subpath: string, conditions: readonly string[] = ESM_EXPORT_CONDITIONS): string | null => {
   if (typeof exportsField === "string") {
     return subpath === "." ? exportsField : null;
   }
@@ -81,9 +94,9 @@ const resolveExportsMap = (exportsField: unknown, subpath: string): string | nul
     if (typeof value === "string") return value;
     if (value === null) return null;
     if (value && typeof value === "object" && !Array.isArray(value)) {
-      const conditions = value as Record<string, unknown>;
-      for (const condition of ESM_EXPORT_CONDITIONS) {
-        if (condition in conditions) return pickCondition(conditions[condition]);
+      const conditionMap = value as Record<string, unknown>;
+      for (const condition of conditions) {
+        if (condition in conditionMap) return pickCondition(conditionMap[condition]);
       }
     }
     return null;
@@ -119,4 +132,4 @@ const resolveExportsMap = (exportsField: unknown, subpath: string): string | nul
   return best?.target ?? null;
 };
 
-export { fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, resolveExportsMap, splitBareSpecifier };
+export { CJS_EXPORT_CONDITIONS, fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, resolveExportsMap, splitBareSpecifier };

@@ -427,6 +427,18 @@ const boot = async (payload: BootPayload): Promise<void> => {
 
   const processGlobal: { nextTick: typeof eventLoop.nextTick; env: Record<string, string>; [key: string]: unknown } = {
     argv: ["node", payload.entryPath, ...payload.argv],
+    // Real Node-specific CLI flags the process was started with (distinct
+    // from argv's own script arguments) - empty is the honest, real answer
+    // for a guest process nothing ever starts with any (there's no real
+    // `node` CLI invocation to have parsed flags from). Traced need: real
+    // @rolldown/binding-wasm32-wasi's own generated wasi-worker bootstrap
+    // (rolldown-binding.wasi.cjs's __getWasiWorkerExecArgv(), reached via
+    // WASI's own thread-spawn -> worker_threads.Worker path) does
+    // `process.execArgv.length` unconditionally while building the execArgv
+    // to hand its own spawned Worker - undefined here crashed with "Cannot
+    // read properties of undefined (reading 'length')" on every single
+    // thread-spawn call.
+    execArgv: [],
     env: payload.env,
     cwd: () => payload.cwd,
     exitCode: 0,
@@ -658,6 +670,27 @@ const boot = async (payload: BootPayload): Promise<void> => {
   // forever. Once we're already handling one fatal exception, any further
   // error just goes straight to the write+exit fallback with no user
   // listener involved - same as real Node.
+  // Real Node's own uncaught-exception printer walks `.cause` (and, for an
+  // AggregateError, `.errors`) recursively - a bare `.stack` string doesn't
+  // include either, it's purely V8's own per-error formatting. Traced need:
+  // real rolldown's own WebContainer-fallback loader (dist/shared/binding-
+  // *.mjs) deliberately throws a generic "Cannot find native binding..."
+  // message with the REAL failure attached only via `.cause` (exactly this
+  // project's own vendored WASI code's AggregateError precedent, for the
+  // same "don't lose the actual cause" reason) - without unwinding it here,
+  // every such failure looks identical and undiagnosable from guest stderr
+  // alone, real Node's own console would show the real cause immediately.
+  const formatErrorWithCause = (error: unknown, seen = new Set<unknown>()): string => {
+    if (!(error instanceof Error) || seen.has(error)) return String(error);
+    seen.add(error);
+    let text = error.stack ?? error.message;
+    if (error instanceof AggregateError && Array.isArray(error.errors)) {
+      for (const inner of error.errors) text += `\n[cause]: ${formatErrorWithCause(inner, seen)}`;
+    }
+    if (error.cause !== undefined) text += `\n[cause]: ${formatErrorWithCause(error.cause, seen)}`;
+    return text;
+  };
+
   let handlingFatalException = false;
   const reportUncaught = (error: unknown): void => {
     let errorObj = error instanceof Error ? error : new Error(String(error));
@@ -672,7 +705,7 @@ const boot = async (payload: BootPayload): Promise<void> => {
         errorObj = nestedError instanceof Error ? nestedError : new Error(String(nestedError));
       }
     }
-    write("stderr", `${errorObj.stack ?? errorObj.message}\n`);
+    write("stderr", `${formatErrorWithCause(errorObj)}\n`);
     exitProcess(1);
   };
 

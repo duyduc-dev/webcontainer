@@ -557,5 +557,5 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
   };
 };
 
-export { createEsmLoader };
+export { createEsmLoader, isRealCode, maskNonCode };
 export type { EsmLoader, EsmLoaderOptions };

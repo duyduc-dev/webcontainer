@@ -96,6 +96,8 @@ const boot = async (payload: WorkerThreadsBootPayload): Promise<void> => {
 
   const processGlobal: { nextTick: typeof eventLoop.nextTick; env: Record<string, string>; [key: string]: unknown } = {
     argv: ["node", payload.entryPath],
+    // See workers/process/worker.ts's own doc comment on this same field.
+    execArgv: [],
     env: payload.env,
     cwd: () => payload.cwd,
     nextTick: eventLoop.nextTick,
