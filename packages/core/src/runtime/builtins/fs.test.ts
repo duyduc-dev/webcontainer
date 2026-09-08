@@ -33,6 +33,29 @@ describe("createFsBuiltin", () => {
     expect(fs.readdirSync("/src")).toEqual(["a.js"]);
   });
 
+  // Traced need: real Vite's own dev-server startup calls readdir(path, {
+  // withFileTypes: true }) while walking the filesystem, then calls
+  // dirent.isSymbolicLink() on each entry - readdirSync previously ignored
+  // the options argument entirely and always returned bare strings, so this
+  // crashed with "dirent.isSymbolicLink is not a function" (confirmed live,
+  // real vite dev server never got past startup).
+  it("readdirSync(path, { withFileTypes: true }) returns Dirent-like entries", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.mkdirSync("/src/nested", { recursive: true });
+    fs.writeFileSync("/src/a.js", "a");
+    fs.symlinkSync("/src/a.js", "/src/link.js");
+
+    const entries = fs.readdirSync("/src", { withFileTypes: true });
+    const byName = Object.fromEntries(entries.map((e) => [e.name, e]));
+
+    expect(Object.keys(byName).sort()).toEqual(["a.js", "link.js", "nested"]);
+    expect(byName["a.js"].isFile()).toBe(true);
+    expect(byName["a.js"].isDirectory()).toBe(false);
+    expect(byName["a.js"].isSymbolicLink()).toBe(false);
+    expect(byName["nested"].isDirectory()).toBe(true);
+    expect(byName["link.js"].isSymbolicLink()).toBe(true);
+  });
+
   it("statSync reports file kind and size", () => {
     const fs = createFsBuiltin(makeIO());
     fs.writeFileSync("/a.txt", "hello");
@@ -154,6 +177,22 @@ describe("createFsBuiltin", () => {
 
     expect(typeof fs.realpathSync.native).toBe("function");
     expect(fs.realpathSync.native("/link.txt")).toBe("/real.txt");
+  });
+
+  // Traced need: real Vite's own dev-server startup calls fs.watch()
+  // directly (chokidar's fallback createFsWatchInstance) - crashed with
+  // "fs.watch is not a function" before this existed at all. Deliberately
+  // doesn't detect real changes (see fs.ts's own doc comment on watch()) -
+  // this only asserts it's callable and returns a real, well-behaved
+  // watcher handle, not that it observes anything.
+  it("watch() returns a closeable handle and accepts a listener without throwing", () => {
+    const fs = createFsBuiltin(makeIO());
+    const seen: unknown[] = [];
+    const watcher = fs.watch("/src", (eventType, filename) => seen.push([eventType, filename]));
+
+    expect(typeof watcher.close).toBe("function");
+    expect(() => watcher.on("change", () => {})).not.toThrow();
+    expect(() => watcher.close()).not.toThrow();
   });
 });
 

@@ -16,6 +16,32 @@ interface StatResult {
   mtimeMs: number;
 }
 
+// Real Node's fs.Dirent (returned by readdir(path, { withFileTypes: true }))
+// - traced need: real Vite's own dev-server startup does exactly this to
+// list a directory while walking the filesystem for config/dependency
+// discovery, then calls `dirent.isSymbolicLink()` on each entry. Confirmed
+// live: without this, every entry comes back as a bare string (readdirSync
+// never looked at `withFileTypes` at all), and calling a method on a string
+// throws "dirent.isSymbolicLink is not a function" - not a rare edge case,
+// this crashed real `vite`'s dev server on startup before it ever got to
+// serve anything.
+interface DirentResult {
+  name: string;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+const joinPath = (dir: string, name: string): string => (dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`);
+
+type FSWatchListener = (eventType: "rename" | "change", filename: string | null) => void;
+
+interface FSWatcher {
+  close(): void;
+  on(event: "change" | "error", listener: (...args: unknown[]) => void): FSWatcher;
+  off(event: "change" | "error", listener: (...args: unknown[]) => void): FSWatcher;
+}
+
 /** Real Node callback convention: `(error, result)` - `result` is omitted
  * (not just `undefined`) on the error branch, hence optional here. */
 type NodeCallback<T> = (error: unknown, result?: T) => void;
@@ -45,6 +71,7 @@ interface FsBuiltinCore {
   appendFileSync(path: string, contents: string | Uint8Array): void;
   mkdirSync(path: string, options?: { recursive?: boolean }): void;
   readdirSync(path: string): string[];
+  readdirSync(path: string, options: { withFileTypes: true }): DirentResult[];
   statSync(path: string): StatResult;
   lstatSync(path: string): StatResult;
   chmodSync(path: string, mode: number): void;
@@ -84,6 +111,7 @@ interface FsBuiltin extends FsBuiltinCore {
   // counterpart to readdirSync above, same as readFile/stat/lstat already
   // are for their own *Sync forms.
   readdir(path: string, callback: NodeCallback<string[]>): void;
+  readdir(path: string, options: { withFileTypes: true }, callback: NodeCallback<DirentResult[]>): void;
   // Same top-level import, same pattern, for realpathSync's own callback
   // counterpart - real Vite's own package-resolution code calls this to
   // follow a symlinked dependency (e.g. a pnpm/workspace-linked package) to
@@ -134,6 +162,19 @@ interface FsBuiltin extends FsBuiltinCore {
   writev(fd: number, buffers: Uint8Array[], position: number | null, callback: NodeCallback<number>): void;
   close(fd: number, callback: NodeCallback<void>): void;
   closeSync(fd: number): void;
+  // Real Node's fs.watch(path[, options][, listener]) - traced need: real
+  // Vite's own dependency-optimizer/config watcher (chokidar's fallback
+  // createFsWatchInstance) calls this directly at dev-server *startup*, not
+  // only for live-reload - crashed immediately without it existing at all.
+  // This VFS has no underlying push-based change-notification mechanism
+  // (every fs op here is a synchronous request/response round-trip - see
+  // syncWireFormat.ts), so this deliberately does NOT detect real changes,
+  // same "exists and is callable, doesn't fake the part that needs real
+  // infrastructure" precedent as vm.runInNewContext/worker_threads.Worker
+  // elsewhere in this runtime. Real hot-reload-on-file-change is the
+  // still-open, separately-tracked design question (see PROGRESS.md).
+  watch(path: string, listener?: FSWatchListener): FSWatcher;
+  watch(path: string, options: { persistent?: boolean; recursive?: boolean } | string, listener?: FSWatchListener): FSWatcher;
 }
 
 const requireSyncChannel = (io: FsBuiltinIO): NonNullable<FsBuiltinIO["callSync"]> => {
@@ -228,6 +269,25 @@ const createFsBuiltin = (
     return (wrapBuffer(response.contents) as unknown as { toString(encoding: string): string }).toString(encoding);
   }
 
+  function readdirSync(path: string): string[];
+  function readdirSync(path: string, options: { withFileTypes: true }): DirentResult[];
+  function readdirSync(path: string, options?: { withFileTypes?: boolean }): string[] | DirentResult[] {
+    const response = call({ op: FsOp.READDIR, path }) as Extract<FsResponseOk, { op: FsOp.READDIR }>;
+    if (!options?.withFileTypes) return response.entries;
+    // Same type-check semantics as lstat (not stat) - a symlink entry
+    // reports isSymbolicLink() true regardless of what it points to,
+    // matching real Node's own readdir(withFileTypes) behavior.
+    return response.entries.map((name) => {
+      const entryStat = core.lstatSync(joinPath(path, name));
+      return {
+        name,
+        isFile: () => entryStat.isFile(),
+        isDirectory: () => entryStat.isDirectory(),
+        isSymbolicLink: () => entryStat.isSymbolicLink(),
+      };
+    });
+  }
+
   const core: FsBuiltinCore = {
     constants: createConstantsModule(),
     realpathSync: realpathSync as FsBuiltinCore["realpathSync"],
@@ -247,10 +307,7 @@ const createFsBuiltin = (
     mkdirSync(path, options = {}) {
       call({ op: FsOp.MKDIR, path, recursive: options.recursive ?? false });
     },
-    readdirSync(path) {
-      const response = call({ op: FsOp.READDIR, path }) as Extract<FsResponseOk, { op: FsOp.READDIR }>;
-      return response.entries;
-    },
+    readdirSync: readdirSync as FsBuiltinCore["readdirSync"],
     statSync(path) {
       const response = call({ op: FsOp.STAT, path }) as Extract<FsResponseOk, { op: FsOp.STAT | FsOp.LSTAT }>;
       return {
@@ -344,15 +401,18 @@ const createFsBuiltin = (
     });
   };
 
-  const readdir: FsBuiltin["readdir"] = (path, callback) => {
+  const readdir = ((path: string, optionsOrCallback: unknown, maybeCallback?: NodeCallback<unknown>) => {
+    const hasOptions = typeof optionsOrCallback !== "function";
+    const options = hasOptions ? (optionsOrCallback as { withFileTypes?: boolean }) : undefined;
+    const callback = (hasOptions ? maybeCallback! : (optionsOrCallback as NodeCallback<unknown>));
     nextTick(() => {
       try {
-        callback(null, core.readdirSync(path));
+        callback(null, options?.withFileTypes ? core.readdirSync(path, options as { withFileTypes: true }) : core.readdirSync(path));
       } catch (error) {
         callback(error);
       }
     });
-  };
+  }) as FsBuiltin["readdir"];
 
   const realpath: FsBuiltin["realpath"] = (path, callback) => {
     nextTick(() => {
@@ -569,6 +629,30 @@ const createFsBuiltin = (
     });
   };
 
+  const watch: FsBuiltin["watch"] = (
+    _path: string,
+    optionsOrListener?: unknown,
+    maybeListener?: FSWatchListener,
+  ): FSWatcher => {
+    const listener = typeof optionsOrListener === "function" ? (optionsOrListener as FSWatchListener) : maybeListener;
+    const changeListeners = new Set<(...args: unknown[]) => void>();
+    if (listener) changeListeners.add(listener as (...args: unknown[]) => void);
+    const watcher: FSWatcher = {
+      close() {
+        changeListeners.clear();
+      },
+      on(event, fn) {
+        if (event === "change") changeListeners.add(fn);
+        return watcher;
+      },
+      off(event, fn) {
+        if (event === "change") changeListeners.delete(fn);
+        return watcher;
+      },
+    };
+    return watcher;
+  };
+
   return {
     ...core,
     readFile,
@@ -594,6 +678,7 @@ const createFsBuiltin = (
     writev,
     closeSync,
     close,
+    watch,
   };
 };
 
@@ -676,7 +761,8 @@ const createFsPromisesBuiltin = (fs: FsBuiltin, nextTick: (callback: () => void)
     writeFile: (path: string, contents: string | Uint8Array) => toPromise(() => fs.writeFileSync(path, contents)),
     appendFile: (path: string, contents: string | Uint8Array) => toPromise(() => fs.appendFileSync(path, contents)),
     mkdir: (path: string, options?: { recursive?: boolean }) => toPromise(() => fs.mkdirSync(path, options)),
-    readdir: (path: string) => toPromise(() => fs.readdirSync(path)),
+    readdir: (path: string, options?: { withFileTypes?: boolean }) =>
+      toPromise(() => (options?.withFileTypes ? fs.readdirSync(path, options as { withFileTypes: true }) : fs.readdirSync(path))),
     stat: (path: string) => toPromise(() => fs.statSync(path)),
     lstat: (path: string) => toPromise(() => fs.lstatSync(path)),
     chmod: (path: string, mode: number) => toPromise(() => fs.chmodSync(path, mode)),
