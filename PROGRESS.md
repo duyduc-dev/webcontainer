@@ -1148,6 +1148,60 @@ session's own decision, still true.
    this regression is specific to real build-time WASM async work,
    `--version`'s own code path never reaches it.)
 
+   **Follow-up, next session: implemented the debounced-`unref()` compromise
+   listed as option (b) above, verified it's mechanically correct, then found
+   the REAL blocker is a different, deeper bug it can't fix.**
+   `worker_threads.ts`'s `DwcWorker.unref()` now debounces instead of
+   releasing the liveness ref immediately: the ref is only actually dropped
+   after `UNREF_DEBOUNCE_MS` (3000ms) of no message traffic (sent OR
+   received) on that worker, extended by `#extendDebounce()` on every
+   `postMessage()` call and every incoming `"message"` event. Unit-tested in
+   isolation with `vi.useFakeTimers()` (`worker_threads.test.ts`) - 6 cases
+   covering the debounce window, extension-on-traffic, `ref()` cancelling it,
+   `terminate()` during a pending window, and the no-double-schedule guard.
+
+   Re-verified live against a real `vite build`, instrumented down to
+   individual `eventLoop.setTimeout`/`clearTimeout` calls and the literal
+   content of every message sent/received on the pool worker (temporary
+   diagnostics, since removed). Two things were conclusively established:
+   - **The debounce mechanism itself is correct.** It inserts and holds a
+     real pending timer in `eventLoop`'s own `timers` map; `#extendDebounce()`
+     correctly clears and re-schedules it on real outgoing traffic - confirmed
+     via two genuine extensions, one for `@napi-rs/wasm-runtime`'s own `"load"`
+     message (handing the pool worker the wasm module + shared memory) and one
+     for its `"start"` message (kicking off WASI thread id 43). Along the way,
+     also found and fixed a real latent bug in `eventLoop.ts` itself: its own
+     internal `runOnce()` used a bare, unqualified `setTimeout` in its
+     timer-wait fallback branch, which - since `eventLoop.ts` is bundled into
+     the same worker script as `workers/process/worker.ts`'s own
+     `Object.assign(self, {setTimeout: ...})` override - resolved through the
+     scope chain to that SAME guest-facing override once boot() had run,
+     recursively feeding the event loop's own internal wait back into itself
+     instead of using a real host timer. Fixed by capturing
+     `globalThis.setTimeout` by reference at module load time (before any
+     override can exist) and using that native reference internally. Real,
+     worth keeping regardless of the outcome below - but built-and-verified
+     (rebuilt, full 581/581 suite still green), it turned out NOT to be what
+     was breaking the build either.
+   - **The debounce is not what's blocking `vite build` - a different, deeper
+     bug is.** Widened `UNREF_DEBOUNCE_MS` live to 20s and then 60s (temporary,
+     reverted back to 3000 after): identical result both times. After
+     `"start"` is sent to the pool worker, it never sends anything back - no
+     ack, no error, nothing - for the entire widened window; the debounce
+     timer simply runs out with zero further traffic and releases the ref
+     right on schedule, exactly as designed. A longer debounce cannot fix
+     this: the real bug is a silent stall somewhere in WASI thread-spawn
+     execution itself, after the "start" message is delivered - inside
+     `wasi-worker.mjs`'s own message handling, this project's `parentPort`
+     relay in `workers/workerThreads/worker.ts`, or the actual wasm thread
+     entry point never returning or replying. Confirmed via Playwright-level
+     `page.on("worker")`/`worker.on("close")` listeners too: the nested WASI
+     worker is still alive (never closes) when the test's own 5-minute
+     deadline is reached - not a crash, a genuine indefinite stall. Not yet
+     diagnosed further - the actual next concrete step for whoever picks this
+     up, separate from (and downstream of) the ref/unref question this entry
+     was originally about.
+
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over
    a `ws://` WebSocket the client page opens back to the dev server.

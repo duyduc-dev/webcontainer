@@ -59,6 +59,20 @@ interface EventLoop {
   queueClose(fn: Task, ...args: unknown[]): void;
 }
 
+// Captured at module load time, before worker.ts's own boot() ever runs -
+// worker.ts overrides the guest-visible global `setTimeout` (Object.assign(self,
+// {setTimeout: ...}) - see its own doc comment) to return Node-shaped handles,
+// and since this module is bundled into that SAME worker script, a bare,
+// unqualified `setTimeout` reference below would otherwise resolve through the
+// scope chain to THAT override once boot() has run, not the real native timer.
+// That recursively fed this eventLoop's own internal wait back into itself
+// (wrapTimerHandle(eventLoop.setTimeout(...)) instead of an actual host timer),
+// corrupting its own `timers` bookkeeping - confirmed live via a real `vite
+// build` hang investigation, see PROGRESS.md. Binding the real one by reference
+// here, before any override can exist, keeps this internal usage correct
+// regardless of what the guest-facing global is later reassigned to.
+const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+
 interface CreateEventLoopOptions {
   now?: () => number;
 }
@@ -194,7 +208,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
         const delay = Math.max(0, earliestPending.dueAt - now());
         await Promise.race([
           waitForWake(),
-          new Promise<void>((resolve) => setTimeout(resolve, delay)),
+          new Promise<void>((resolve) => nativeSetTimeout(resolve, delay)),
         ]);
       } else {
         await waitForWake();

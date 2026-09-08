@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { createWorkerThreadsModule } from "./worker_threads";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createWorkerThreadsModule, UNREF_DEBOUNCE_MS } from "./worker_threads";
 
 /** Minimal real EventEmitter test double - DwcWorker only ever calls
  * .emit(event, ...args) on its own instance and expects real Node
@@ -85,25 +85,93 @@ describe("createWorkerThreadsModule", () => {
     expect(unref).toHaveBeenCalledTimes(1);
   });
 
-  // Real Node semantics, kept despite a known real gap this causes - see
-  // this Worker's own unref() doc comment in worker_threads.ts (and
+  // A heuristic, not a considered-correct implementation - see this
+  // Worker's own unref() doc comment in worker_threads.ts (and
   // PROGRESS.md) for the full "real vite build hangs vs. exits early"
-  // investigation: neither honoring unref() nor making it a permanent
-  // no-op is fully correct with what this runtime can currently observe,
-  // and a fast, clean failure (this behavior) was judged better than a
-  // silent infinite hang (the no-op alternative, tried and reverted).
-  it("Worker.unref() releases the spawnWorker liveness ref immediately, same as .terminate()", async () => {
-    const target = new EventTarget();
-    const fakeWorker = Object.assign(target, { postMessage: vi.fn(), terminate: vi.fn() }) as unknown as globalThis.Worker;
-    const unref = vi.fn();
-    const spawnWorker = vi.fn().mockReturnValue({ worker: fakeWorker, ready: Promise.resolve(), unref });
+  // investigation this debounce exists to balance: neither honoring
+  // unref() immediately nor making it a permanent no-op was fully correct
+  // with what this runtime can currently observe (the real N-API-level
+  // "is async work still in flight" signal real Node's own unref() safely
+  // relies on) - a debounce, extended by real message traffic, is the
+  // pragmatic middle ground.
+  describe("Worker.unref() debounce", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
 
-    const { Worker } = createWorkerThreadsModule(TestEventEmitter, { spawnWorker });
-    const worker = new (Worker as unknown as new (path: string) => { unref(): void; terminate(): Promise<number> })("/x.mjs");
+    const makeWorker = () => {
+      const target = new EventTarget();
+      const fakeWorker = Object.assign(target, { postMessage: vi.fn(), terminate: vi.fn() }) as unknown as globalThis.Worker;
+      const unref = vi.fn();
+      const spawnWorker = vi.fn().mockReturnValue({ worker: fakeWorker, ready: Promise.resolve(), unref });
+      const { Worker } = createWorkerThreadsModule(TestEventEmitter, { spawnWorker });
+      const worker = new (Worker as unknown as new (
+        path: string,
+      ) => { unref(): void; ref(): void; postMessage(v: unknown): void; terminate(): Promise<number> })("/x.mjs");
+      return { worker, fakeWorker, target, unref };
+    };
 
-    worker.unref();
-    worker.unref();
-    expect(unref).toHaveBeenCalledTimes(1);
+    it("does not release the ref immediately - only after UNREF_DEBOUNCE_MS of silence", () => {
+      const { worker, unref } = makeWorker();
+      worker.unref();
+      expect(unref).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(UNREF_DEBOUNCE_MS - 1);
+      expect(unref).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(1);
+      expect(unref).toHaveBeenCalledTimes(1);
+    });
+
+    it("a received message extends the debounce window instead of letting it fire", () => {
+      const { worker, target, unref } = makeWorker();
+      worker.unref();
+
+      vi.advanceTimersByTime(UNREF_DEBOUNCE_MS - 1);
+      target.dispatchEvent(new MessageEvent("message", { data: "still going" }));
+      vi.advanceTimersByTime(UNREF_DEBOUNCE_MS - 1);
+      expect(unref).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(1);
+      expect(unref).toHaveBeenCalledTimes(1);
+    });
+
+    it("a sent message (postMessage) also extends the debounce window", async () => {
+      const { worker, unref } = makeWorker();
+      worker.unref();
+
+      vi.advanceTimersByTime(UNREF_DEBOUNCE_MS - 1);
+      worker.postMessage("keep-alive");
+      vi.advanceTimersByTime(UNREF_DEBOUNCE_MS - 1);
+      expect(unref).not.toHaveBeenCalled();
+    });
+
+    it("ref() cancels a running debounce window outright", () => {
+      const { worker, unref } = makeWorker();
+      worker.unref();
+      worker.ref();
+      vi.advanceTimersByTime(UNREF_DEBOUNCE_MS * 2);
+      expect(unref).not.toHaveBeenCalled();
+    });
+
+    it("terminate() during a pending debounce clears the timer and releases the ref immediately, without double-releasing later", async () => {
+      const { worker, fakeWorker, unref } = makeWorker();
+      worker.unref();
+      await worker.terminate();
+      expect(unref).toHaveBeenCalledTimes(1);
+      expect(fakeWorker.terminate).toHaveBeenCalled();
+
+      vi.advanceTimersByTime(UNREF_DEBOUNCE_MS * 2);
+      expect(unref).toHaveBeenCalledTimes(1);
+    });
+
+    it("calling unref() again while already debouncing does not restart or double-schedule the window", () => {
+      const { worker, unref } = makeWorker();
+      worker.unref();
+      vi.advanceTimersByTime(UNREF_DEBOUNCE_MS - 1);
+      worker.unref();
+      vi.advanceTimersByTime(1);
+      expect(unref).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("exposes the other commonly-destructured top-level members with plausible values", () => {
