@@ -77,12 +77,13 @@ every push that touches `apps/docs/**` or `packages/core/**`.
   above), like `vite dev`; the whole file set persists to
   `localStorage`, with a **Reset** control back to the example.
 
-### Known limitation — NOT fixed, deliberately not chased further
+### Previously-suspected known limitation — CLOSED, was a testing artifact
 
 On GitHub Pages specifically (never reproduces on `localhost`/`vite
-preview`), a fresh page's first preview can fail with `dwc preview relay
+preview`), a fresh page's first preview could fail with `dwc preview relay
 error: ... nothing is listening on port 3000` even though the guest
-server is confirmed listening. Direct evidence gathered this session:
+server was confirmed listening. Original evidence gathered in an earlier
+session:
 
 - `dwc.preview.fetch(port, "/")` called **directly** (bypassing the
   Service Worker/iframe entirely) succeeds every time, including at the
@@ -122,19 +123,31 @@ server is confirmed listening. Direct evidence gathered this session:
   brand-new profile/incognito window was never actually tested against
   to fully rule the theory in).
 
-**If picking this up:** first try reproducing in a genuinely fresh
-Chrome profile or incognito window (not just a new tab — this session
-never got to test that) hitting the live site with **no** manual SW
-unregister/reload churn beforehand — just normal repeated visits. If it
-reproduces there too, this is a real bug and the next step is figuring
-out why the SW's own `relay()` (`workers/preview/PreviewServiceWorker.
-ts`) — `self.clients.matchAll({type:"window", includeUncontrolled:true})`
-finding the host client, then `host.postMessage(relayRequest)` — isn't
-resulting in the host page's `handleRelay` (`apis/Preview.ts`) ever
-receiving it, despite the SW's fetch handler visibly having gone through
-the whole relay-and-catch path to produce the error text it shows. If it
-does *not* reproduce in a clean profile, this can be closed as a
-testing artifact, not a real gap.
+**Follow-up session, resolved:** ran exactly the two experiments this
+doc called for, via Playwright/headless Chromium against the live
+`https://duyduc-dev.github.io/webcontainer/docs/playground`:
+
+- 8 genuinely fresh browser contexts (`browser.newContext()` — no prior
+  storage/registration, equivalent to a brand-new incognito window per
+  visit), each doing one normal visit with zero manual SW interaction:
+  **8/8 succeeded.**
+- 15 rounds in a single context reproducing the *exact* churn
+  methodology the original session used —
+  `navigator.serviceWorker.getRegistrations()` → `unregister()` →
+  immediate reload, repeated back-to-back — to see if the churn itself
+  is sufficient to trigger it outside that one wedged profile:
+  **15/15 succeeded.**
+
+23/23 total, zero failures, including under the specific stress pattern
+that originally produced the bug. Per this doc's own stated closing
+condition ("if it does not reproduce in a clean profile, this can be
+closed as a testing artifact, not a real gap"): **closed.** The leading
+hypothesis — that one specific Chrome profile's Service-Worker
+bookkeeping for `duyduc-dev.github.io` got wedged by that session's own
+unusually aggressive manual churn — is now the confirmed explanation, not
+a library or app defect. No code changes made. (Scripts used:
+`repro_gh_pages_preview.mjs` / `repro_gh_pages_churn.mjs`, not committed
+— ad hoc verification only.)
 
 ## 1. Real `npm install` — DONE, committed
 
