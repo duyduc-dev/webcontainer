@@ -13,7 +13,11 @@ function pipeToTerminal(
     for (;;) {
       const { done, value } = await reader.read();
       if (done) return;
-      terminal.write(decoder.decode(value));
+      const text = decoder.decode(value, { stream: true });
+      terminal.write(text);
+      // Also mirrored to console.log - xterm renders to canvas, not plain
+      // DOM text, so this is what a headless/automated check actually reads.
+      console.log("[out]", text);
     }
   })();
 }
@@ -41,8 +45,9 @@ function waitForMarker(
         if (!seen) resolveFound();
         return;
       }
-      const text = decoder.decode(value);
+      const text = decoder.decode(value, { stream: true });
       terminal.write(text);
+      console.log("[out]", text);
       if (!seen && text.includes(marker)) {
         seen = true;
         resolveFound();
@@ -52,123 +57,6 @@ function waitForMarker(
 
   return found;
 }
-
-// The App component's source, shared verbatim between the server (evaluated
-// via `new Function`, given the real require()d React as an argument) and
-// the client (embedded directly in a <script> tag, running against React
-// loaded from the real npm-installed UMD build below) - ONE definition, so
-// server-render and client-hydrate can never drift out of sync with each
-// other. Plain React.createElement calls, no JSX (no bundler/transform
-// exists to compile it yet - see PROGRESS.md's still-open Vite dev-server
-// item). Real React.useState: renderToString() runs it once for the
-// initial value same as any single-pass SSR render; hydrateRoot() on the
-// client then makes the SAME component live/interactive - clicking the
-// button re-renders through React's own reconciler, not a manual DOM write.
-const APP_COMPONENT_SOURCE = [
-  "var FEATURES = [",
-  "  'Real npm install (real registry fetch, real gzip, real tar, real sha512)',",
-  "  'Real CommonJS require() resolution through real node_modules',",
-  "  'Real ES modules - live bindings, dynamic import(), top-level await',",
-  "  'Real http.createServer(), previewed live through a Service Worker relay',",
-  "];",
-  "",
-  "function App() {",
-  "  var state = React.useState(0);",
-  "  var count = state[0];",
-  "  var setCount = state[1];",
-  "",
-  "  return React.createElement(",
-  "    'div',",
-  "    { className: 'app' },",
-  "    React.createElement('h1', null, 'React, running inside a WebContainer sandbox'),",
-  "    React.createElement(",
-  "      'p',",
-  "      { className: 'subtitle' },",
-  "      'Server-rendered by real, npm-installed React via react-dom/server, then hydrated client-side by the SAME component - this button uses real React.useState, not a manual DOM write.',",
-  "    ),",
-  "    React.createElement(",
-  "      'ul',",
-  "      null,",
-  "      FEATURES.map(function (feature, i) { return React.createElement('li', { key: i }, feature); }),",
-  "    ),",
-  "    React.createElement(",
-  "      'div',",
-  "      { className: 'counter' },",
-  "      React.createElement('span', { id: 'count' }, String(count)),",
-  "      React.createElement(",
-  "        'button',",
-  "        { onClick: function () { setCount(count + 1); } },",
-  "        'useState count: ' + count + ' (click me)',",
-  "      ),",
-  "    ),",
-  "  );",
-  "}",
-].join("\n");
-
-// The real, npm-installed React server-rendering the page on every request -
-// require('react') + require('react-dom/server') exactly as a real Node app
-// would, executed by this project's own real vendored `http` on top of the
-// sandboxed fs/process runtime. Also serves React's own real UMD builds
-// (node_modules/react/umd/react.development.js,
-// node_modules/react-dom/umd/react-dom.development.js - both real files
-// inside the npm-installed packages, not a CDN) so the SAME component can
-// hydrate client-side too. No bundler/dev-server involved (that's the
-// still-open next step - see PROGRESS.md: `npm create vite` and Vite's own
-// dev server both hit missing-builtin gaps this session found but hasn't
-// fully closed yet) - this demo deliberately takes the path that's actually
-// fully working today.
-const REACT_SERVER_SOURCE = [
-  "const http = require('http');",
-  "const fs = require('fs');",
-  "const React = require('react');",
-  "const { renderToString } = require('react-dom/server');",
-  "",
-  APP_COMPONENT_SOURCE,
-  "",
-  "const PAGE = (body) => `<!doctype html>",
-  "<html>",
-  "<head>",
-  "<meta charset=\"utf-8\">",
-  "<title>React in a WebContainer</title>",
-  "<style>",
-  "  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }",
-  "  h1 { font-size: 1.5rem; }",
-  "  .subtitle { color: #555; line-height: 1.5; }",
-  "  ul { line-height: 1.8; }",
-  "  .counter { margin-top: 2rem; padding: 1rem; border: 1px solid #ddd; border-radius: 8px; display: flex; align-items: center; gap: 1rem; }",
-  "  #count { font-size: 1.5rem; font-weight: 600; min-width: 2ch; }",
-  "  button { cursor: pointer; padding: 0.5rem 1rem; }",
-  "</style>",
-  "</head>",
-  "<body>",
-  "<div id=\"root\">${body}</div>",
-  "<script src=\"/react.js\"></script>",
-  "<script src=\"/react-dom.js\"></script>",
-  "<script>",
-  APP_COMPONENT_SOURCE.replace(/`/g, "\\`"),
-  "ReactDOM.hydrateRoot(document.getElementById('root'), React.createElement(App));",
-  "</script>",
-  "</body>",
-  "</html>`;",
-  "",
-  "const server = http.createServer((req, res) => {",
-  "  if (req.url === '/react.js') {",
-  "    res.writeHead(200, { 'Content-Type': 'application/javascript' });",
-  "    res.end(fs.readFileSync(require.resolve('react/umd/react.development.js')));",
-  "    return;",
-  "  }",
-  "  if (req.url === '/react-dom.js') {",
-  "    res.writeHead(200, { 'Content-Type': 'application/javascript' });",
-  "    res.end(fs.readFileSync(require.resolve('react-dom/umd/react-dom.development.js')));",
-  "    return;",
-  "  }",
-  "  const html = PAGE(renderToString(React.createElement(App)));",
-  "  res.writeHead(200, { 'Content-Type': 'text/html' });",
-  "  res.end(html);",
-  "});",
-  "server.listen(4321, () => console.log('[react-server] listening on 4321'));",
-  "",
-].join("\n");
 
 async function main() {
   // rows is generous on purpose: xterm's DOM only reflects the visible
@@ -188,48 +76,62 @@ async function main() {
     console.log("[dwc] loaded vendored npm", vendoredVersion, `(${fileCount} files)`);
     terminal.writeln(`[vendor] loaded real npm ${vendoredVersion} (${fileCount} files)`);
 
-    // 2) Real `npm install react react-dom` against the live registry -
-    // same real fetch/gzip/tar/sha512 pipeline as every other npm demo in
-    // this project, just with a much bigger, real-world dependency tree
-    // (react-dom alone pulls in scheduler and friends).
-    await dwc.fs.mkdir("/project", { recursive: true });
+    // 2) Real `npm create vite@latest` - scaffolds a real project by
+    // fetching+running create-vite through npm's own exec machinery (sh -c
+    // dispatch + PATH resolution + stdio:inherit, all added this session -
+    // see PROGRESS.md). Auto-answers whatever confirmation prompt npm's own
+    // exec flow shows, same as every other npm-create test in this project.
+    const createProc = await dwc.process.spawn("/bin/npm.js", {
+      argv: ["create", "vite@latest", "my-app", "--", "--template", "vanilla"],
+      cwd: "/",
+    });
+    pipeToTerminal(createProc.stdout, terminal);
+    pipeToTerminal(createProc.stderr, terminal);
+    setTimeout(() => {
+      const writer = createProc.stdin.getWriter();
+      writer.write(new TextEncoder().encode("y\n"));
+      writer.releaseLock();
+    }, 3000);
+    const createExit = await createProc.exit;
+    console.log("[dwc] npm create vite exited with code", createExit);
+    terminal.writeln(`\r\n[npm create vite] exit=${createExit}`);
+    if (createExit !== 0) return;
+
+    // 3) Real `npm install` inside the scaffolded project - installs vite
+    // itself plus every real dependency the vanilla template's own
+    // package.json lists.
     const installProc = await dwc.process.spawn("/bin/npm.js", {
-      // Pinned to React 18, not @latest (19.x): react-dom/server's newer
-      // internals pull in node:async_hooks's AsyncLocalStorage, which needs
-      // real V8 async-context propagation this runtime deliberately doesn't
-      // fake (see async_hooks.ts) - React 18's synchronous renderToString()
-      // predates that dependency.
-      argv: ["install", "react@18", "react-dom@18", "--no-audit", "--no-fund", "--loglevel=warn"],
-      cwd: "/project",
+      argv: ["install", "--no-audit", "--no-fund", "--loglevel=warn"],
+      cwd: "/my-app",
     });
     pipeToTerminal(installProc.stdout, terminal);
     pipeToTerminal(installProc.stderr, terminal);
     const installExit = await installProc.exit;
-    console.log("[dwc] npm install react react-dom exited with code", installExit);
-    terminal.writeln(`\r\n[npm install react react-dom] exit=${installExit}`);
+    console.log("[dwc] npm install (in /my-app) exited with code", installExit);
+    terminal.writeln(`\r\n[npm install] exit=${installExit}`);
     if (installExit !== 0) return;
 
-    const reactPkg = JSON.parse(
-      new TextDecoder().decode(await dwc.fs.readFile("/project/node_modules/react/package.json")),
-    ) as { version: string };
-    terminal.writeln(`[verify] installed react@${reactPkg.version}`);
+    // 4) Real `npm run dev` - runs the scaffolded package.json's own "dev"
+    // script (`vite`) through the SAME sh -c dispatch npm's own
+    // @npmcli/run-script always uses for package.json scripts, not just
+    // npm exec/npx. This is the actual end-to-end test: does the real vite
+    // dev server (via real rolldown/WASM under the hood) come up at all.
+    const devProc = await dwc.process.spawn("/bin/npm.js", {
+      argv: ["run", "dev"],
+      cwd: "/my-app",
+    });
+    pipeToTerminal(devProc.stderr, terminal);
+    await waitForMarker(devProc.stdout, terminal, "Local:");
 
-    // 3) A real guest http.createServer() that require()s the real,
-    // just-installed React and server-renders a page with it on every
-    // request - the actual "React app" part of this demo.
-    await dwc.fs.writeFile("/project/server.js", REACT_SERVER_SOURCE);
-    const serverProc = await dwc.process.spawn("/project/server.js", { cwd: "/project" });
-    pipeToTerminal(serverProc.stderr, terminal);
-    await waitForMarker(serverProc.stdout, terminal, "listening on");
-
-    // 4) Preview it live: Service Worker relay + <iframe id="preview">.
+    // 5) Preview it live: Service Worker relay + <iframe id="preview">.
+    // Vite's own default dev-server port.
     try {
       await dwc.preview.enable({ swUrl: "/dwc-preview-sw.js" });
       terminal.writeln("[preview] service worker enabled");
 
       const previewFrame = document.getElementById("preview") as HTMLIFrameElement | null;
       if (previewFrame) {
-        previewFrame.src = dwc.preview.url(4321, "/");
+        previewFrame.src = dwc.preview.url(5173, "/");
         terminal.writeln(`[preview] iframe.src -> ${previewFrame.src}`);
       } else {
         terminal.writeln("[preview] no #preview iframe found in the page");
