@@ -455,12 +455,27 @@ const boot = async (payload: BootPayload): Promise<void> => {
   // early (require('module') isn't even reachable until a module body
   // starts running), so the cell is always populated before real use.
   let moduleLoaderCreateRequire: ((fromPath: string) => ((specifier: string) => unknown) & { resolve(specifier: string): string }) | undefined;
-  const vendoredBuiltins = createBuiltinModules(processGlobal, netContext, (fromPath) => {
-    if (!moduleLoaderCreateRequire) {
-      throw new Error("module.createRequire()'s returned require() was called before this process's module loader finished booting");
-    }
-    return moduleLoaderCreateRequire(fromPath);
-  });
+  // Same reasoning as moduleLoaderCreateRequire above: the real FsBuiltin is
+  // constructed below (it needs vendoredBuiltins.buffer first) - guest code
+  // can't reach `require('wasi')` until a module body actually runs, well
+  // after this cell is filled in.
+  let fsBuiltinForWasi: FsBuiltin | undefined;
+  const vendoredBuiltins = createBuiltinModules(
+    processGlobal,
+    netContext,
+    (fromPath) => {
+      if (!moduleLoaderCreateRequire) {
+        throw new Error("module.createRequire()'s returned require() was called before this process's module loader finished booting");
+      }
+      return moduleLoaderCreateRequire(fromPath);
+    },
+    () => {
+      if (!fsBuiltinForWasi) {
+        throw new Error("require('wasi')'s WASI class was constructed before this process's fs builtin finished booting");
+      }
+      return fsBuiltinForWasi;
+    },
+  );
 
   // process.stdin - a real vendored Readable (the same class require('stream')
   // hands guest code, not a hand-rolled stand-in), pushed into from the
@@ -544,6 +559,7 @@ const boot = async (payload: BootPayload): Promise<void> => {
   const syncFsChannel = createSyncFsChannel(payload.syncFs);
   const BufferCtor = (vendoredBuiltins.buffer as { Buffer: { from(bytes: Uint8Array): Uint8Array } }).Buffer;
   const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel, eventLoop.nextTick, (bytes) => BufferCtor.from(bytes));
+  fsBuiltinForWasi = fsBuiltin;
   // Real Node's `fs` module also carries a `.promises` namespace, the same
   // object `require('fs/promises')` returns directly - both point at the
   // one fsBuiltin instance so a `fs.promises.readFile()` and a

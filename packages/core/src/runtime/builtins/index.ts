@@ -14,9 +14,11 @@ import { createStringDecoderModule } from "./string_decoder";
 import { createTtyModule } from "./tty";
 import { createUrlModule } from "./url";
 import { createVmModule } from "./vm";
+import { createWasiModule } from "./wasi";
 import { createWorkerThreadsModule } from "./worker_threads";
 import pathModule from "./path";
 import utilModule from "./util";
+import type { FsBuiltin } from "./fs";
 
 interface ProcessLike {
   nextTick(callback: (...args: unknown[]) => void, ...args: unknown[]): void;
@@ -60,6 +62,7 @@ const BUILTIN_NAMES = new Set([
   "readline",
   "perf_hooks",
   "worker_threads",
+  "wasi",
 ]);
 
 const isBuiltinSpecifier = (specifier: string): boolean => BUILTIN_NAMES.has(specifier);
@@ -96,6 +99,14 @@ const createBuiltinModules = (
   netContext?: NodeModulesContext,
   createRequireForPath: (fromPath: string) => ((specifier: string) => unknown) & { resolve(specifier: string): string } = () => {
     throw new Error("module.createRequire()'s returned require() was called with no require() wired up");
+  },
+  // Same deferred-cell reasoning as createRequireForPath above: worker.ts
+  // constructs the real FsBuiltin AFTER this function returns (it needs
+  // vendoredBuiltins.buffer first, to wrap readFileSync's result in a real
+  // Buffer) - guest code can only reach `require('wasi')` once boot() has
+  // fully run, by which point the real thing is always wired up.
+  getFsBuiltin: () => FsBuiltin = () => {
+    throw new Error("require('wasi')'s WASI class was constructed with no fs builtin wired up");
   },
 ): Record<string, unknown> => {
   const nodeModules = createNodeModules(process, netContext);
@@ -139,6 +150,7 @@ const createBuiltinModules = (
     readline: createReadlineModule(EventEmitter),
     perf_hooks: createPerfHooksModule(),
     worker_threads: createWorkerThreadsModule(),
+    wasi: createWasiModule(getFsBuiltin),
   };
 };
 

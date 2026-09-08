@@ -2,13 +2,20 @@
 
 Written to hand off work-in-progress across devices.
 
-**Two separate threads live in this file now, on different branches:**
-- **Docs site + Playground demo** (section 0 below) — branch `main`,
-  everything in it already pushed to `origin/main` and live at
-  `https://duyduc-dev.github.io/webcontainer/`.
+**Two threads live in this file, both now on `main`:**
+- **Docs site + Playground demo** (section 0 below), already pushed to
+  `origin/main` and live at `https://duyduc-dev.github.io/webcontainer/`.
 - **Real npm install / dev-server preview** (sections 1–6 below, the
-  original content of this file) — branch `feature/new-core`, not yet
-  merged to `main`.
+  original content of this file). Correction (this session): this was
+  previously described here as living on a separate `feature/new-core`
+  branch "not yet merged to `main`" — that was stale. `feature/new-core`
+  is fully contained in `main`'s history (0 commits ahead) and `main` is
+  36 commits ahead of it; every file this section references
+  (`vm.ts`, `readline.ts`, `worker_threads.ts`, the `execFileSync` sync
+  bridge, etc.) exists only on `main`. All of sections 1–6 is committed
+  directly on `main`, not on a separate branch. `feature/new-core` is
+  stale and can be deleted once someone confirms nothing else still
+  points at it.
 
 ## 0. Docs site (GitHub Pages) + Playground demo — `main` branch
 
@@ -691,22 +698,108 @@ session's own decision, still true.
    install completed entirely through the new sync bridge + pnpm shim + the
    `.resolve` fix, exactly as designed.
 
-   **Where it stops now, deliberately** (this session's own explicit
-   choice, not a forced stop): loading the downloaded binding itself needs
-   `require('node:wasi')` (Node's WASI preview1 `WASI` class, for real
-   WebAssembly instantiation) - `Error: Cannot find module 'wasi'`,
-   confirmed via a direct `require()` of
-   `rolldown-binding.wasi.cjs`. That same auto-generated NAPI-RS glue file
-   also imports `worker_threads`'s real `Worker` (for `asyncWorkPoolSize`/
-   `reuseWorker`-driven async NAPI work, not obviously avoidable) - and
-   `Worker` is this project's own deliberately-throwing stub (see above).
-   Implementing a real `node:wasi` (traced against exactly what THIS
-   `.wasm` module imports, via `WebAssembly.Module.imports()`, not a
-   speculative full preview1 surface) plus making `Worker` genuinely work
-   is comparable in size to the sync-exec bridge just built, or larger,
-   with no guarantee the WASI binding doesn't surface further gaps once it
-   actually loads. Explicitly scoped out of this session; the next
-   concrete step for whoever picks this up.
+   **`node:wasi` — DONE, committed.** Traced exactly what the real
+   downloaded `.wasm` binary needs via `WebAssembly.Module.imports()`
+   (not a speculative full preview1 surface, per this doc's own earlier
+   note): only 21 `wasi_snapshot_preview1` functions (file I/O -
+   `fd_read`/`fd_write`/`fd_readdir`/`path_open`/etc. - plus
+   `environ_get`, `clock_time_get`, `random_get`, `proc_exit`,
+   `poll_oneoff`, `sched_yield`; no networking, no rename/symlink-heavy
+   surface) and exactly one import from module `"wasi"`:
+   **`thread-spawn`** (the WASI-threads proposal - this is the actual,
+   narrow reason a `Worker` is needed at all, not generic multi-threading
+   - see the `worker_threads.Worker` note below).
+
+   Rather than hand-write that 21-function ABI (real, fiddly
+   memory-layout code - iovecs, dirent structs, filestat structs - with
+   no live wasm module to verify against line-by-line until the very end),
+   vendored **@tybys/wasm-util v0.10.1's real, complete preview1
+   implementation** (MIT licensed, ~2700 lines across
+   `runtime/node/vendor/wasi/*.mjs` + 3 sibling files) instead - it
+   already implements real Node's exact `WASI` class shape
+   (`.wasiImport`/`.initialize()`/`.start()`) and error-code-to-WASI-errno
+   mapping, and accepts a **pluggable Node-fs-shaped `options.fs`**
+   parameter by design. The only new code
+   (`runtime/builtins/wasi.ts`'s `createWasiFsAdapter`) translates that
+   package's `fs.*Sync` calls onto this project's EXISTING `FsBuiltin`
+   (the same sync-fs-bridge primitives `fs.ts` already exposes to guest
+   code) - openSync/readSync/writeSync/closeSync forward directly;
+   numeric POSIX open flags translate to FsBuiltin's own string-flag
+   convention; `{bigint:true}` Stats and `withFileTypes` Dirents are
+   synthesized from FsBuiltin's plainer StatResult (no real inode/device/
+   per-field-timestamp model exists in this VFS, so dev/ino/nlink are
+   honest fixed stand-ins and atime/ctime reuse mtime, matching the
+   chown/utimes precedent elsewhere in this project); hardlink is a
+   one-time content copy (no real shared-inode aliasing exists to back
+   real hardlink semantics).
+
+   Two real bugs found and fixed getting a live wasm module through this,
+   both via the same "run it, find the real cause" method as everywhere
+   else in this project - a hand-rolled minimal 692-byte wasm module
+   (compiled from WAT via the `wabt` npm package, not committed as a
+   build step) doing a real `path_open`/`fd_write`/`fd_read`/`fd_close`
+   round-trip against this project's own VFS caught both, live, via
+   `wasi.test.ts`:
+   - **FsBuiltin.openSync('/', 'r') threw EISDIR.** Real Node allows
+     opening a directory fd (just not reading bytes from it) - needed for
+     preopens (`WASI.createSync()`'s own preopen setup does exactly
+     `fs.openSync(preopenPath, 'r', mode)`, and every real preopen is a
+     directory). Fixed in the adapter: a directory path gets a synthetic
+     fd tracked entirely in the adapter's own map (a negative-numbered
+     range FsBuiltin's own fd table never allocates into), never routed
+     into FsBuiltin's real file-only fd table at all.
+   - **FsBuiltin.openSync('w', ...) only snapshots an empty in-memory
+     buffer - the real VFS isn't touched until closeSync() writes it
+     back.** Real Node's `open('w')` creates/truncates the file on disk
+     immediately, and WASI's own `path_open` relies on exactly that: it
+     calls `fstatSync()` on the fd right after opening it (to learn the
+     new file's type/size), which - before this fix - saw a
+     not-yet-existent file and failed with a spurious ENOENT on every
+     single file creation. Fixed by having the adapter eagerly persist an
+     empty file via `fs.writeFileSync` before deferring to FsBuiltin's
+     own (unchanged) lazy-write-on-close behavior.
+
+   **Verified live** (not yet against the real rolldown binding - see
+   below): the compiled test wasm module's real `path_open`/`fd_write`/
+   `fd_read`/`fd_close` round-trip succeeds with zero errno across every
+   call (file content read back byte-correct from this project's actual
+   VFS, independent of the wasm module's own fd table), `fd_write` to
+   stdout (fd 1) reaches a real `print` callback, and
+   `environ_sizes_get`/`random_get`/`clock_time_get`/`sched_yield` all
+   return successfully without trapping.
+
+   **`worker_threads.Worker` — traced, not yet implemented.** The real
+   reason a `Worker` is needed turns out to be much narrower than "make
+   worker_threads work in general": `@napi-rs/wasm-runtime`'s own
+   `wasi-worker.mjs` (a FIXED file the library itself ships, not
+   arbitrary guest code) uses `new Worker(filename)` purely to implement
+   WASI's `thread-spawn` import - spawn a new thread that
+   re-instantiates the SAME wasm module with SHARED memory and runs a
+   fixed bootstrap. That bootstrap needs only: a working `require()`
+   (this project's existing moduleLoader against the real VFS), a `wasi`
+   builtin (now done, above), and `require('worker_threads').parentPort`
+   wired to whatever spawned it. The rest (message-passing protocol,
+   actual wasm re-instantiation with shared memory) is entirely handled
+   by `@napi-rs/wasm-runtime`'s own already-correct JS, once npm-installed
+   - nothing new to write there.
+
+   The concrete shape of the remaining work: (1) a new kernel message
+   granting a *second* sync-fs channel to an already-running process
+   worker (`createSyncFsChannelFor(fsClient)` in `processClient.ts` is
+   already a standalone, repeatable helper - not coupled 1:1 to the
+   process table - so this is a small addition, not a redesign); (2) a
+   new bundled worker entry point (mirroring how `workers/process/
+   worker.ts` itself is loaded via `new URL(..., import.meta.url)` from
+   the kernel) that boots a minimal guest environment - require/fs/
+   process, reusing existing moduleLoader/createBuiltinModules/
+   createFsBuiltin machinery, NOT a new nested Node-sandbox
+   implementation - and wires `parentPort`; (3) `worker_threads.ts`'s
+   `Worker` class spawning that entry as a REAL nested browser Worker
+   directly from the calling guest process's own Worker context (no
+   kernel relay needed for the parentPort<->Worker message channel itself
+   - only for the one-time sync-fs-channel grant), matching real Node's
+   own direct (non-kernel-mediated) worker_threads semantics. Not yet
+   built - the next concrete step for whoever picks this up.
 
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over
