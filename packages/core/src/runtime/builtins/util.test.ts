@@ -16,6 +16,25 @@ describe("util.TextEncoder/TextDecoder", () => {
   });
 });
 
+describe("util.types", () => {
+  // Traced need: real npm-installed code commonly does
+  // `require('util').types.isUint8Array(...)` as one property access off
+  // the main util module, not a separate `require('util/types')` import -
+  // that top-level specifier was already vendored (node/internal/util/
+  // types.js, registered in node/loader.ts) but never exposed as a
+  // property of this hand-written util builtin, so `util.types` was
+  // undefined and any such call crashed with "Cannot read properties of
+  // undefined (reading 'isUint8Array')" - found running a real installed
+  // vite.js, deep in its own dependency tree.
+  it("exposes the same real type predicates as util/types, as a property of the main util module", () => {
+    expect(utilModule.types.isUint8Array(new Uint8Array(1))).toBe(true);
+    expect(utilModule.types.isUint8Array([1, 2, 3])).toBe(false);
+    expect(utilModule.types.isDate(new Date())).toBe(true);
+    expect(utilModule.types.isRegExp(/x/)).toBe(true);
+    expect(utilModule.types.isPromise(Promise.resolve())).toBe(true);
+  });
+});
+
 describe("util.deprecate", () => {
   let errorSpy: ReturnType<typeof vi.spyOn>;
 

@@ -54,6 +54,7 @@ import eventsSymbolsFactory from "./internal/events/symbols";
 import abortListenerFactory from "./internal/events/abort_listener";
 import webstreamsAdaptersFactory from "./internal/webstreams/adapters";
 import blobFactory from "./internal/blob";
+import fileFactory from "./internal/file";
 import optionsFactory from "./internal/options";
 import startupSnapshotFactory from "./internal/v8/startup_snapshot";
 import fetchTransportFactory from "./internal/fetch-transport";
@@ -136,6 +137,7 @@ const FACTORIES: Record<string, NodeFactory> = {
   "internal/events/abort_listener": abortListenerFactory,
   "internal/webstreams/adapters": webstreamsAdaptersFactory,
   "internal/blob": blobFactory,
+  "internal/file": fileFactory,
   "internal/options": optionsFactory,
   "internal/v8/startup_snapshot": startupSnapshotFactory,
   "internal/fetch-transport": fetchTransportFactory,

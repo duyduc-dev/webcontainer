@@ -998,15 +998,58 @@ session's own decision, still true.
    whatever vite/rolldown's own dependency chain actually needed from
    `net.BlockList`.
 
-   **Where it stops now**: `Error: no vendored Node builtin
-   'internal/file'`, from a lazy `get File()` accessor (presumably
-   `buffer.js`'s own exposure of the Web `File` API, alongside the
-   already-vendored `Blob` - not yet confirmed). Not yet investigated -
-   likely a smaller, more ordinary vendoring gap than `block_list` was
-   (real Node's own `internal/file.js` is pure JS, no native binding
-   involved, similar in shape to the already-vendored `internal/blob.js`),
-   but not yet confirmed. The next concrete step for whoever picks this
-   up.
+   **`internal/file` — DONE, committed.** Confirmed exactly as guessed:
+   `buffer.js`'s own lazy `get File()` accessor, alongside the
+   already-vendored `Blob`. Same trick as `internal/blob.js` right next
+   to it (not a verbatim vendor of real Node's ~150-line `class File
+   extends Blob` - every engine this runs on already has a spec `File`
+   global in Worker scope, same constructor shape and all): new
+   `internal/file.js` is a two-line shim exposing `globalThis.File`
+   directly. Deliberately does NOT include real Node's own structured-
+   clone transfer plumbing (`TransferableFile`/`kClone`/`kDeserialize`) -
+   nothing traced needs a File surviving this runtime's own
+   `worker_threads.Worker` transfer protocol specifically (see
+   `worker_threads.ts`'s own doc comment on its narrow, traced scope).
+
+   **One more real gap surfaced right after, in the exact same live
+   trace: `util.types` didn't exist on this project's own hand-written
+   `util` builtin at all.** Real Node exposes the SAME object two ways -
+   `require('util/types')` (already vendored, registered as its own
+   top-level specifier) AND `require('util').types` (a property of the
+   main module) - real npm-installed code in vite/rolldown's own
+   dependency tree reached for the second form
+   (`require('util').types.isUint8Array(...)`), which crashed with
+   "Cannot read properties of undefined (reading 'isUint8Array')" since
+   nothing had ever wired `.types` onto this project's own `util`
+   builtin. Fixed by invoking the already-vendored `internal/util/
+   types.js` factory directly from `builtins/util.ts` and exposing its
+   result as `util.types` - safe since that factory's body never
+   actually touches its own require/internalBinding/process/primordials
+   parameters (confirmed by reading it), only real global constructors
+   already available in scope.
+
+   **Verified live: `npm install vite` (exit 0) followed by the real,
+   installed `vite.js --version` now runs to completion and prints the
+   real version string** - `vite/8.2.2 linux-x64 node-v24.18.0`, exit
+   code 0. This is the full chain working end-to-end for the first
+   time: real npm registry install → real rolldown loading → real
+   WebContainer WASM fallback → real `@rolldown/binding-wasm32-wasi`
+   download via the sync-exec/pnpm-shim bridge → real `node:wasi`
+   servicing the wasm module's file I/O → real `wasi.thread-spawn` →
+   real `worker_threads.Worker` spawning a genuine nested browser
+   Worker → real `net.BlockList`/`SocketAddress` → real `File` → a
+   clean, correct exit. Every piece this multi-session investigation
+   built (node:wasi, worker_threads.Worker, the "exports"-map resolver
+   fix, the ESM-interop masking fix, `process.execArgv`, `net.BlockList`
+   from scratch, `internal/file`, `util.types`) was load-bearing for
+   this one outcome.
+
+   **Not yet attempted**: an actual `vite dev`/`vite build` run (only
+   `--version` has been verified) - HMR (item 4 below) is a known,
+   separate, unresolved design question regardless, and a real build/
+   dev-server invocation may surface further gaps `--version`'s own
+   much smaller code path never touches. The next concrete step for
+   whoever picks this up.
 
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over

@@ -1,3 +1,34 @@
+import utilTypesFactory from "../node/internal/util/types";
+
+// Real Node's `require('util').types` is the exact same object
+// `require('util/types')`/`require('node:util/types')` returns (already
+// vendored at internal/util/types.js, registered as its own top-level
+// specifier in node/loader.ts) - traced need: real npm-installed code
+// commonly reaches for `require('util').types.isUint8Array(...)` as one
+// object property access rather than a separate top-level import, which
+// this hand-written `util` builtin never exposed at all (`.types` was
+// simply undefined). Invoked directly rather than routed through
+// require('util/types') (a second module instance, distinct from require()
+// call to reuse it here would need this file to have its own require()
+// available, which builtins/util.ts doesn't take as a parameter) - safe
+// since its factory body never actually touches its own require/
+// internalBinding/process/primordials parameters (confirmed by reading it),
+// only real global constructors (Uint8Array, DataView, ...) already
+// available in this scope.
+const utilTypesModule = { exports: {} as Record<string, (...args: unknown[]) => unknown> };
+utilTypesFactory(
+  utilTypesModule.exports,
+  () => {
+    throw new Error("internal/util/types.js unexpectedly called require()");
+  },
+  utilTypesModule,
+  undefined as never,
+  () => {
+    throw new Error("internal/util/types.js unexpectedly called internalBinding()");
+  },
+  undefined as never,
+);
+
 const inspectValue = (value: unknown): string => {
   if (typeof value === "string") return value;
   try {
@@ -290,6 +321,7 @@ const utilModule = {
   parseEnv,
   TextEncoder: globalThis.TextEncoder,
   TextDecoder: globalThis.TextDecoder,
+  types: utilTypesModule.exports,
 };
 
 export default utilModule;
