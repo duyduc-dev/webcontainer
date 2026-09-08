@@ -151,6 +151,22 @@ const boot = async (payload: WorkerThreadsBootPayload): Promise<void> => {
     { isMainThread: false, parentPort, workerData: payload.workerData },
   );
 
+  // Real Worker global scope spec: `self` is a getter-only accessor on
+  // WorkerGlobalScope.prototype (configurable, but with no setter) -
+  // assigning it directly throws in strict mode. Real Node's worker_threads
+  // has no such restriction (there `self` is an ordinary global, if it
+  // exists at all), so real guest code written against real Node's own
+  // worker_threads semantics can - and does - assign it directly. Traced
+  // need: real @napi-rs/wasm-runtime's own wasi-worker.mjs (the ONLY real
+  // caller of worker_threads.Worker this project has traced) does exactly
+  // `Object.assign(globalThis, { self: globalThis, ... })` at its own top
+  // level - confirmed live running a real `vite build`, which crashed
+  // every single WASI thread-spawn with "Cannot set property self of
+  // #<WorkerGlobalScope> which has only a getter" the moment that line
+  // ran. Redefined as a plain writable data property before any guest code
+  // runs so that real assignment succeeds normally.
+  Object.defineProperty(self, "self", { value: self, writable: true, configurable: true, enumerable: true });
+
   Object.assign(self, {
     global: self,
     console,

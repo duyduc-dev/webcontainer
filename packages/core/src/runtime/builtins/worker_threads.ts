@@ -199,12 +199,45 @@ const createWorkerThreadsModule = (EventEmitterCtor: new () => EventEmitterLike,
       return this;
     }
 
-    // Real Node: an unref'd Worker no longer keeps its owner process alive
-    // on its own - matches spawnWorker's own ref(), taken at construction so
-    // a live Worker (the common case: still expected to send/receive
-    // messages) doesn't let its owner process conclude "nothing left to do"
-    // and tear itself down mid-flight (see SpawnedWorker's own doc comment
-    // for the real hang this caused before `unref` existed).
+    // KNOWN GAP, not a considered-correct implementation - see PROGRESS.md's
+    // own entry on this for the full investigation. Real Node's unref()'d
+    // Worker stops keeping its OWNER alive on its own because a SEPARATE
+    // primitive (a libuv-level async handle backing whatever in-flight
+    // native N-API work the worker is doing, plus Emscripten's own
+    // runtime-keepalive counter - both confirmed present in real
+    // @napi-rs/wasm-runtime's own compiled output) independently keeps the
+    // real event loop alive for as long as that work is actually pending.
+    // This runtime's own event loop has no equivalent second signal, only
+    // this Worker's own liveness ref - so there is no single correct
+    // behavior available here with what currently exists:
+    //   - Honoring unref() (real Node semantics) let a real `vite build`
+    //     exit successfully after its very first output line, with no
+    //     dist/ ever written - the pool worker's own real unref() call (real
+    //     @napi-rs/wasm-runtime unrefs every pool worker immediately, a
+    //     legitimate idle-efficiency pattern) released the only signal
+    //     keeping the process alive before the real bundling work even
+    //     started.
+    //   - Making unref() a permanent no-op (tried, reverted) traded that for
+    //     a WORSE failure: a genuine infinite hang, confirmed live across
+    //     two separate runs (a 5-minute and a 10-minute wait, zero
+    //     progress past "vite v8.2.2 building client environment...") -
+    //     real Node processes exit once a build's real async work finishes
+    //     specifically BECAUSE those pool workers are unref'd; ignoring
+    //     that permanently means nothing ever signals "done."
+    // Kept as real, honored semantics (matching real Node) rather than the
+    // permanent no-op: a fast, clean failure with a real error surface to
+    // debug beats a silent, resource-consuming hang with zero feedback.
+    // The correct fix needs the actual missing signal - either wiring real
+    // eventLoop.ref()/unref() calls to whatever this runtime can observe of
+    // @emnapi/core's own Env.ref()/unref() (the real N-API-level keep-alive
+    // primitive, confirmed to exist via `envObject.ref()`/`.unref()` calls
+    // in real @napi-rs/wasm-runtime's own compiled output - not yet traced
+    // further: what `envObject` actually is, where it's constructed, or
+    // whether this runtime has any real hook into it), or a deliberately
+    // heuristic compromise (e.g. a delayed/debounced unref that only
+    // actually releases after a period of no message traffic on any live
+    // worker_threads.Worker) if the real signal turns out to be
+    // unreachable. Not yet attempted - the next concrete step.
     unref(): this {
       this.#clearRef();
       return this;

@@ -122,8 +122,39 @@ const deprecate = (fn: (...args: unknown[]) => unknown, message: string): ((...a
 // JSON-based fallback, not real Node's full recursive/colorized formatting.
 const inspectCustomSymbol = Symbol.for("nodejs.util.inspect.custom");
 
+// Real Node's util.inspect(error) prints the real stack trace text, plus any
+// extra own enumerable properties as a trailing ` { key: value }` block
+// (e.g. a `.code`/`.cause`) - NOT `JSON.stringify(error)`, which silently
+// produces the near-useless "{}" for any Error (message/stack are
+// non-enumerable, so JSON.stringify skips both entirely). Traced need: real
+// Vite's own CLI does exactly `` `error during build:\n${inspect(e)}` ``
+// around its top-level try/catch - every real build failure printed through
+// this was reduced to the single, undiagnosable string "{}", regardless of
+// what actually went wrong. Best-effort, not full Node parity (no color, no
+// depth limit, no circular-reference guard, a flat one-line property dump
+// rather than Node's own recursive per-value inspection) - scoped to making
+// the common case (a real Error reaching a real catch block) actually
+// legible, matching this function's own established "best-effort fallback"
+// precedent for everything else.
+const inspectError = (error: Error): string => {
+  const base = error.stack ?? `${error.name}: ${error.message}`;
+  const extraKeys = Object.keys(error).filter((key) => key !== "message" && key !== "stack");
+  if (extraKeys.length === 0) return base;
+  const extras = extraKeys
+    .map((key) => {
+      const extraValue = (error as unknown as Record<string, unknown>)[key];
+      // A `.cause` chain (real rolldown's own WebContainer-fallback error
+      // does exactly this - see module.ts's doc comment) would otherwise
+      // hit the same "{}" bug this function exists to fix, one level down.
+      return `  ${key}: ${extraValue instanceof Error ? inspectError(extraValue) : inspectValue(extraValue)}`;
+    })
+    .join(",\n");
+  return `${base} {\n${extras}\n}`;
+};
+
 const inspect = Object.assign(
   (value: unknown): string => {
+    if (value instanceof Error) return inspectError(value);
     try {
       return JSON.stringify(value, null, 2) ?? String(value);
     } catch {

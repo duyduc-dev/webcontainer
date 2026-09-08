@@ -85,6 +85,27 @@ describe("createWorkerThreadsModule", () => {
     expect(unref).toHaveBeenCalledTimes(1);
   });
 
+  // Real Node semantics, kept despite a known real gap this causes - see
+  // this Worker's own unref() doc comment in worker_threads.ts (and
+  // PROGRESS.md) for the full "real vite build hangs vs. exits early"
+  // investigation: neither honoring unref() nor making it a permanent
+  // no-op is fully correct with what this runtime can currently observe,
+  // and a fast, clean failure (this behavior) was judged better than a
+  // silent infinite hang (the no-op alternative, tried and reverted).
+  it("Worker.unref() releases the spawnWorker liveness ref immediately, same as .terminate()", async () => {
+    const target = new EventTarget();
+    const fakeWorker = Object.assign(target, { postMessage: vi.fn(), terminate: vi.fn() }) as unknown as globalThis.Worker;
+    const unref = vi.fn();
+    const spawnWorker = vi.fn().mockReturnValue({ worker: fakeWorker, ready: Promise.resolve(), unref });
+
+    const { Worker } = createWorkerThreadsModule(TestEventEmitter, { spawnWorker });
+    const worker = new (Worker as unknown as new (path: string) => { unref(): void; terminate(): Promise<number> })("/x.mjs");
+
+    worker.unref();
+    worker.unref();
+    expect(unref).toHaveBeenCalledTimes(1);
+  });
+
   it("exposes the other commonly-destructured top-level members with plausible values", () => {
     const mod = createWorkerThreadsModule(TestEventEmitter);
     expect(mod.isMainThread).toBe(true);

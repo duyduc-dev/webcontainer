@@ -21,6 +21,7 @@ const requireCrypto = () => {
     randomBytes(size: number, callback?: (err: Error | null, buf: unknown) => void): { length: number } | undefined;
     randomUUID(): string;
     randomInt(min: number, max?: number, callback?: (err: Error | null, n: number) => void): number | undefined;
+    getRandomValues<T extends ArrayBufferView>(array: T): T;
     getHashes(): string[];
   };
 };
@@ -116,6 +117,20 @@ describe("vendored 'crypto' (pure-JS hash/hmac/random subset)", () => {
     const bytes = crypto.randomBytes(16) as unknown as { length: number };
     expect(bytes.length).toBe(16);
     expect(crypto.randomUUID()).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  // Traced need: real rolldown's own WASM binding loader calls
+  // `crypto.getRandomValues(...)` directly (not via randomBytes/randomUUID) -
+  // found live running a real installed vite.js build, which crashed with
+  // "crypto.getRandomValues is not a function" since this project's own
+  // vendored crypto.js used the real global internally but never
+  // re-exported it as a top-level member the way real Node does.
+  it("getRandomValues fills a typed array in place and returns it (real Node exposes this directly on require('crypto'), not just via .webcrypto)", () => {
+    const crypto = requireCrypto();
+    const array = new Uint8Array(16);
+    const result = crypto.getRandomValues(array);
+    expect(result).toBe(array);
+    expect(array.some((byte) => byte !== 0)).toBe(true);
   });
 
   it("randomBytes supports the callback style", async () => {

@@ -358,5 +358,19 @@ export default function (exports, require, module, process, internalBinding, pri
   // right here, not a lie to paper over.
   const getHashes = () => Object.keys(CORES);
 
-  module.exports = { createHash, createHmac, randomBytes, randomInt, randomUUID, getHashes, Hash, Hmac };
+  // Real Node's require('crypto') exposes getRandomValues directly (not
+  // just via .webcrypto) - the exact same real, synchronous Web Crypto API
+  // method randomBytes/randomInt above already call internally, just never
+  // re-exported at this module's own top level. Traced need: real
+  // rolldown's own WASM binding loader calls `crypto.getRandomValues(...)`
+  // directly (presumably generating a nonce/id) - confirmed live running a
+  // real installed vite.js build, which crashed with "crypto.
+  // getRandomValues is not a function" reaching exactly this. `.bind(crypto)`
+  // because Web Crypto API methods are WebIDL-brand-checked against their
+  // original object - calling a detached reference with the wrong `this`
+  // throws, same reasoning as randomUUID's own `() => crypto.randomUUID()`
+  // wrapper just above.
+  const getRandomValues = crypto.getRandomValues.bind(crypto);
+
+  module.exports = { createHash, createHmac, randomBytes, randomInt, randomUUID, getRandomValues, getHashes, Hash, Hmac };
 }

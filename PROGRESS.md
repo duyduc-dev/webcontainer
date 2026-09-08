@@ -1044,12 +1044,109 @@ session's own decision, still true.
    from scratch, `internal/file`, `util.types`) was load-bearing for
    this one outcome.
 
-   **Not yet attempted**: an actual `vite dev`/`vite build` run (only
-   `--version` has been verified) - HMR (item 4 below) is a known,
-   separate, unresolved design question regardless, and a real build/
-   dev-server invocation may surface further gaps `--version`'s own
-   much smaller code path never touches. The next concrete step for
-   whoever picks this up.
+   **Follow-up, same day: tried a real `vite build` (a genuine 2-file
+   project, not just `--version`) - found and fixed three more real
+   bugs, then hit a real, unresolved design tension, not yet fixed.**
+   Same live method as everywhere else in this section: `npm install
+   vite` against a real `/project` with a real `index.html` + two real
+   JS modules, then run the installed `vite.js build`.
+
+   1. **`util.inspect(error)` printed `"{}"` for every real Error - a
+      real, broadly-impactful bug, not specific to Vite.** This
+      project's own `inspect()` was a bare `JSON.stringify`, which
+      silently drops an Error's `.message`/`.stack` (both non-
+      enumerable, invisible to `JSON.stringify`). Real Vite's own CLI
+      does exactly `` `error during build:\n${inspect(e)}` `` around its
+      top-level try/catch - every real build failure printed through
+      this was reduced to the single, undiagnosable string `"{}"`,
+      regardless of what actually went wrong. Fixed with a real
+      Error-aware path: the real stack trace text, plus any extra own
+      enumerable properties (`.code`, `.cause`, ...) appended as a
+      trailing block matching real Node's own format - including
+      recursing into a `.cause` chain (real rolldown's own
+      WebContainer-fallback error shape, from earlier in this session)
+      rather than hitting the same `"{}"` bug one level down. This is
+      what actually made the REST of this list debuggable at all - every
+      fix below was found by reading a real, legible error for the
+      first time instead of `"{}"`.
+   2. **`crypto.getRandomValues` didn't exist on `require('crypto')`.**
+      Real Node exposes it directly (not just via `.webcrypto`); this
+      project's own vendored `crypto.js` used the real global
+      internally (backing `randomBytes`/`randomUUID`) but never
+      re-exported it as a top-level member. Real rolldown's own WASM
+      binding loader calls `crypto.getRandomValues(...)` directly
+      (presumably a nonce/id) - fixed with a one-line re-export,
+      `.bind()`-ed the same way `randomUUID`'s own wrapper already is
+      (Web Crypto API methods are WebIDL-brand-checked against their
+      original object).
+   3. **A real Worker-global-scope-vs-Node difference: `self` is a
+      getter-only accessor in a real Worker, but real Node's
+      worker_threads has no such restriction.** Real
+      `@napi-rs/wasm-runtime`'s own `wasi-worker.mjs` (the fixed
+      bootstrap file WASI's `thread-spawn` loads inside a
+      `worker_threads.Worker` - see this doc's own earlier notes) does
+      `Object.assign(globalThis, { self: globalThis, ... })` at its top
+      level, assuming real Node's own unrestricted global object - every
+      single WASI thread-spawn crashed with "Cannot set property self of
+      #<WorkerGlobalScope> which has only a getter" the moment that line
+      ran. Fixed in `workers/workerThreads/worker.ts`'s own boot() by
+      redefining `self` as a plain writable data property before any
+      guest code runs.
+
+      **With all three fixed, the build got much further** - past
+      "vite v8.2.2 building client environment for production..." (a
+      real progress message that was never reached before) - into
+      genuine WASM-side bundling work, for the first time.
+
+   **Where it stops now: a real, unresolved design tension between two
+   observed failure modes, neither of which is currently correct.**
+   Real `@napi-rs/wasm-runtime`'s own worker-pool code calls
+   `worker.unref()` on every pool worker immediately after spawning it
+   (confirmed live by reading its own compiled `emnapi-plugins.cjs`) - a
+   legitimate real-Node idle-efficiency pattern there, because a
+   SEPARATE primitive (a libuv-level async handle backing whatever
+   native N-API work is actually in flight, PLUS Emscripten's own
+   runtime-keepalive counter - both confirmed to exist in the same
+   compiled output via `envObject.ref()`/`.unref()` and
+   `__emnapi_runtime_keepalive_push()` calls) independently keeps a real
+   Node process alive for as long as real work is pending, regardless of
+   the spawning Worker's own ref state. This runtime's own event loop
+   has no equivalent second signal - only the Worker's own liveness ref
+   this session already built:
+   - **Honoring `unref()` (real Node's own semantics, and what's
+     currently shipped)**: a real `vite build` exits successfully after
+     printing only its first line, `dist/` never written - the pool
+     worker's own real `unref()` call released the only signal keeping
+     the process alive before the real bundling work even started.
+     Confirmed live, repeatedly.
+   - **Making `unref()` a permanent no-op (tried, reverted)**: traded
+     that for a WORSE failure - a genuine infinite hang, confirmed live
+     across two separate long-timeout runs (5 minutes, then 10 minutes),
+     zero progress past the same first line either way. Real Node
+     processes exit once a build's real async work finishes SPECIFICALLY
+     because those pool workers are unref'd; permanently ignoring that
+     means nothing this runtime can currently observe ever signals
+     "done."
+   Kept as real, honored semantics (the first option) rather than the
+   no-op: a fast, clean, debuggable failure was judged better than a
+   silent, resource-consuming hang with zero feedback - but neither is
+   actually correct, and this is flagged as a real, open design question
+   in `worker_threads.ts`'s own doc comment on `unref()`, not a settled
+   answer. The real fix needs the actual missing signal: either (a)
+   wiring real `eventLoop.ref()`/`unref()` calls to whatever this
+   runtime can observe of `@emnapi/core`'s own `Env.ref()`/`unref()` (the
+   real N-API-level keep-alive primitive `envObject` above is an
+   instance of - not yet traced further: what `envObject` actually is,
+   where it's constructed, or whether this runtime has any real hook
+   into it at all from outside that library's own closures), or (b) a
+   deliberately heuristic compromise (e.g. a delayed/debounced `unref()`
+   that only actually releases after a period of no message traffic on
+   any live `worker_threads.Worker`) if the real signal turns out to be
+   unreachable from here. Not yet attempted - the next concrete step for
+   whoever picks this up. (`vite --version` was re-verified working
+   after every fix and revert in this list, including the final one -
+   this regression is specific to real build-time WASM async work,
+   `--version`'s own code path never reaches it.)
 
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over

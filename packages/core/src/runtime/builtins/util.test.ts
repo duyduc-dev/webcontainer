@@ -86,6 +86,35 @@ describe("util.inspect", () => {
     expect(inspect({ a: 1 })).toContain('"a": 1');
     expect(inspect("hi")).toBe('"hi"');
   });
+
+  // Traced need: real Vite's own CLI does exactly `` `error during
+  // build:\n${inspect(e)}` `` around its top-level try/catch - before this
+  // fix, `JSON.stringify(error)` silently produced "{}" for every real
+  // build failure (Error's own message/stack are non-enumerable, so
+  // JSON.stringify skips both), regardless of what actually went wrong.
+  // Found live running a real installed vite.js build.
+  it("formats an Error as its real stack trace, not '{}' (message/stack are non-enumerable, invisible to JSON.stringify)", () => {
+    const error = new Error("boom");
+    const formatted = inspect(error);
+    expect(formatted).not.toBe("{}");
+    expect(formatted).toContain("Error: boom");
+  });
+
+  it("appends an Error's extra own enumerable properties (e.g. .code) as a trailing block, matching real Node's own format", () => {
+    const error = Object.assign(new Error("boom"), { code: "EFOO" });
+    const formatted = inspect(error);
+    expect(formatted).toContain("Error: boom");
+    expect(formatted).toContain("code:");
+    expect(formatted).toContain("EFOO");
+  });
+
+  it("recurses into a .cause chain (real rolldown's own WebContainer-fallback error shape) instead of hitting the same '{}' bug one level down", () => {
+    const error = Object.assign(new Error("outer"), { cause: new Error("inner") });
+    const formatted = inspect(error);
+    expect(formatted).toContain("Error: outer");
+    expect(formatted).toContain("Error: inner");
+    expect(formatted).not.toContain("{}");
+  });
 });
 
 describe("util.promisify", () => {
