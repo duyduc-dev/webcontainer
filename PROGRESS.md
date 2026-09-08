@@ -1,6 +1,140 @@
 # Progress notes — real npm install + dev-server preview
 
-Written to hand off work-in-progress across devices. Branch: `feature/new-core`.
+Written to hand off work-in-progress across devices.
+
+**Two separate threads live in this file now, on different branches:**
+- **Docs site + Playground demo** (section 0 below) — branch `main`,
+  everything in it already pushed to `origin/main` and live at
+  `https://duyduc-dev.github.io/webcontainer/`.
+- **Real npm install / dev-server preview** (sections 1–6 below, the
+  original content of this file) — branch `feature/new-core`, not yet
+  merged to `main`.
+
+## 0. Docs site (GitHub Pages) + Playground demo — `main` branch
+
+Goal for this thread: a public docs site for `@dwc/core` with a live,
+editable code sandbox embedded in it (StackBlitz-style — edit a
+file, see it rebuild and re-preview, entirely client-side). Everything
+below is already committed and pushed to `origin/main`; the GitHub Actions
+workflow (`.github/workflows/deploy-docs.yml`) redeploys automatically on
+every push that touches `apps/docs/**` or `packages/core/**`.
+
+### Shipped and verified
+
+- **CI actually builds `@dwc/core` before `apps/docs`, and redeploys on
+  core-only changes too.** Two separate bugs: the workflow only ran
+  `pnpm --filter docs build` (now `pnpm --filter docs... build`, which
+  topologically builds workspace deps first), and its `paths:` trigger
+  only watched `apps/docs/**` (now also `packages/core/**`). Without
+  both fixes the deployed site could silently run stale `@dwc/core` code
+  indefinitely.
+- **Real `@dwc/core` bug: a consumer bundler can't always re-bundle a
+  worker file.** `tsup`'s default code-splitting factored shared code
+  across `dist/index.js` and the `dist/workers/*/worker.js` files into
+  sibling `chunk-*.js` files — fine for a plain npm install (the whole
+  `dist/` ships together), but Vite's `new Worker(new URL(...))` handling
+  copies a worker file out to its own `assets/` dir *without* recursively
+  re-bundling it, so the copied file's `chunk-*.js` imports 404'd. Every
+  `dwc.fs`/`dwc.process` call then hung forever with zero console output
+  — nothing threw, because `fsClient.ts`/`fetcherClient.ts`/
+  `processClient.ts`'s spawned workers never had an `onerror` handler, so
+  a worker script load failure was silently swallowed. Fixed both ends:
+  `tsup.config.ts` disables `splitting` for the worker entry points (each
+  is now fully self-contained), and all three clients now reject pending
+  requests on `worker.onerror` instead of hanging. This is a real,
+  general library bug — affects any consumer deploying under a subpath
+  with a bundler that doesn't recursively re-bundle copied-out workers,
+  not just this docs site.
+- **Real `@dwc/core` bug: the `"listen"` event fired from the wrong
+  message.** `bindings/net.ts`'s `net.Server.listen()` posts `net-listen`
+  then `net-pipe-listen` as two separate, sequential messages for one
+  `.listen()` call. The top-level `dwc.addEventListener("listen", ...)`
+  event — what a host page uses to know a preview URL is ready — fired
+  from the *first* message, but `dwc.preview.fetch()`/the iframe-preview
+  path depends on `net-pipe-listen` having *already* landed
+  (`netRelay.pipeConnect()` only succeeds once that registration exists).
+  Under normal conditions the gap between the two messages is far too
+  narrow to matter, but it was real and reproducible: confirmed failing
+  repeatedly on a fresh page's very first preview, fixed by moving the
+  `"listen"` event to fire from `net-pipe-listen` instead (the message
+  that actually establishes reachability), verified with new unit tests
+  in `processClient.test.ts` and dozens of clean live reproductions
+  after the fix (both a direct `dwc.preview.fetch()` stress test and the
+  full iframe/Service-Worker path, 25+ successes with zero failures,
+  every time run **locally**).
+- **`process.kill()` added to `@dwc/core`'s public API** — a real,
+  previously-missing capability (no way to stop a spawned process short
+  of it exiting on its own). Threaded through end-to-end: `apis/
+  Process.ts` → `PROCESS_KILL` request → kernel `processClient.ts`
+  (reuses the existing "exit" cleanup path, code `143` matching
+  `child_process`'s own killed-child convention). Unit tested at both
+  layers.
+- **The Playground demo** (`apps/docs/src/docs/pages/Playground.tsx`):
+  a real multi-file project (`server.js` + `greeting.js`, genuine
+  cross-file `require("./greeting")` resolution, not a single-file
+  toy), with tabs to switch/add/delete files; editing any file debounces
+  into an automatic kill-old/spawn-new restart (uses `process.kill()`
+  above), like `vite dev`; the whole file set persists to
+  `localStorage`, with a **Reset** control back to the example.
+
+### Known limitation — NOT fixed, deliberately not chased further
+
+On GitHub Pages specifically (never reproduces on `localhost`/`vite
+preview`), a fresh page's first preview can fail with `dwc preview relay
+error: ... nothing is listening on port 3000` even though the guest
+server is confirmed listening. Direct evidence gathered this session:
+
+- `dwc.preview.fetch(port, "/")` called **directly** (bypassing the
+  Service Worker/iframe entirely) succeeds every time, including at the
+  exact moment the iframe path is failing — so the kernel/netRelay logic
+  itself is healthy. The bug is isolated to the Service-Worker-mediated
+  relay (SW → `postMessage` → host page's `handleRelay` → back to SW).
+- Manually attaching a raw `navigator.serviceWorker.addEventListener
+  ("message", ...)` listener on the host page and then triggering a new
+  iframe load shows **zero relay messages ever arrive**, even though the
+  error text visibly displayed can only be produced by that exact relay
+  path having run and failed — not yet reconciled, and not investigated
+  further.
+- Three different app-level mitigations were tried and **none** fixed
+  it: re-navigating the same iframe URL, a full respawn (kill + re-spawn
+  the process, same as clicking the demo's own "Run now" button),
+  and a respawn with 2s/4s/8s backoff. Diagnostic logging showed the
+  backoff version retrying in an unbounded loop (dozens of respawns over
+  tens of seconds), never once succeeding via the Service Worker path,
+  while a **direct** kernel fetch succeeded throughout — i.e. this isn't
+  a "needs a moment to settle" timing issue at the app layer at all.
+  All three attempts were reverted; the Playground page is back to the
+  simple version (see `git log -- apps/docs/src/docs/pages/
+  Playground.tsx`, look for "Revert the preview auto-retry experiments").
+- The failure was reproduced dozens of times, but every reproduction
+  followed **this session's own test methodology**: `navigator.
+  serviceWorker.getRegistrations()` → `unregister()` → immediate reload,
+  repeated 15+ times in rapid succession against the same origin within
+  about 20 minutes, to force a "fresh SW" condition for testing. That is
+  not something a real visitor's browser ever does (a real browser
+  registers this site's Service Worker once, ever). The leading
+  hypothesis is that this specific Chrome profile's internal
+  Service-Worker bookkeeping for `duyduc-dev.github.io` got wedged by
+  that churn, rather than this being a library or app defect — but this
+  is **not confirmed**, only inferred from the pattern (kernel healthy +
+  zero relay messages arriving + a genuinely fresh, never-before-used
+  browser tab in the *same* profile still reproducing it, which a
+  brand-new profile/incognito window was never actually tested against
+  to fully rule the theory in).
+
+**If picking this up:** first try reproducing in a genuinely fresh
+Chrome profile or incognito window (not just a new tab — this session
+never got to test that) hitting the live site with **no** manual SW
+unregister/reload churn beforehand — just normal repeated visits. If it
+reproduces there too, this is a real bug and the next step is figuring
+out why the SW's own `relay()` (`workers/preview/PreviewServiceWorker.
+ts`) — `self.clients.matchAll({type:"window", includeUncontrolled:true})`
+finding the host client, then `host.postMessage(relayRequest)` — isn't
+resulting in the host page's `handleRelay` (`apis/Preview.ts`) ever
+receiving it, despite the SW's fetch handler visibly having gone through
+the whole relay-and-catch path to produce the error text it shows. If it
+does *not* reproduce in a clean profile, this can be closed as a
+testing artifact, not a real gap.
 
 ## 1. Real `npm install` — DONE, committed
 
