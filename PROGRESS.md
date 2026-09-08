@@ -373,16 +373,16 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated):** `node:wasi` and `worker_threads.Worker` (this
-note's own previous blockers) are both DONE - see item 7 at the very end
-of this file, which is now the active thread. Real Vite's dev server has
-booted successfully at least once via the real rolldown/WASM/WASI
-fallback chain; what's NOT yet confirmed is whether its own guest HTTP
-server actually accepts a preview connection (item 7 has the full
-diagnostic trail and the concrete next step - re-test in a clean browser
-profile). Item 6 (`npm exec`/`@npmcli/promise-spawn`) turned out to be
-the same root cause as item 3's own `sh -c` dispatch work and is also
-DONE - see its own entry below for the full fix.
+**Pick up here (updated):** item 7's own "browser-profile-artifact" theory
+for the `npm run dev` preview failure is now DISPROVEN - see item 8 at the
+very end of this file. It's a real, 100%-reproducible bug: vite's own
+process genuinely calls `net.Server.listen()` on the correct port (5173)
+and then exits cleanly (`code: 0`, no error) before ever printing its own
+ready banner. The full call chain from `cp-spawn` through vite's own exit
+is traced end-to-end; what's NOT yet identified is the exact reason vite's
+process considers itself done right after (or during) binding that
+listener. Item 8 has the complete diagnostic trail, what's been ruled out,
+and the concrete next step.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -1506,6 +1506,177 @@ Worker relay - that's the fastest way to tell which side is actually
 wrong). HMR (item 4) is still a wholly separate, unstarted question even
 once this is resolved - what's being verified here is a working `vite
 dev`, not live-reload-on-edit.
+
+## 8. `npm run dev` preview failure is real, not a profile artifact — root-caused down to vite's own process exiting after `listen()`
+
+Picked item 7 back up on a new device. The very first direct-fetch check
+(`dwc.preview.fetch(5173, '/')`, bypassing the Service Worker relay
+entirely) **also** failed with `nothing is listening on port 5173` - the
+same kernel-level check that always succeeded in section 0's docs-site
+investigation. That result alone disproves the "same as the docs site,
+probably a profile artifact" theory this file previously recorded for this
+call path: the kernel genuinely has no listener registered, so this isn't
+a Service-Worker-relay-only issue at all.
+
+**Root cause, traced end-to-end via live instrumentation (see technique
+notes below - all of it was temporary, non-committed debug code, reverted
+before this section was written):**
+
+1. `examples/playground/src/main.ts`'s own `waitForMarker()` helper has a
+   real bug, found first: it resolves as soon as the stream closes (EOF),
+   not only when the marker text (`"Local:"`) is actually seen. This means
+   the demo silently proceeds to `dwc.preview.enable()` regardless of
+   whether vite ever actually became ready - "nothing is listening" is the
+   *symptom* this masking bug lets through, not the disease. Worth fixing
+   before further live debugging of this thread (make the demo visibly
+   report "dev server exited before printing Local:" instead of silently
+   continuing to the preview step).
+2. The real underlying failure: `npm run dev` correctly reaches
+   `@npmcli/run-script` → `promiseSpawn` →
+   `child_process.spawn('sh', ['-c', 'vite'], { stdio: 'inherit' })` → this
+   runtime's own `cp-spawn`/`runShellLineStreamed` dispatch (item 3's
+   work) → `resolveEntryPoint` correctly resolves `vite` to
+   `/my-app/node_modules/vite/bin/vite.js` → `bootProcess` boots it as a
+   real nested process worker. All of this is correct and was verified
+   live, hop by hop.
+3. **Vite's own process worker genuinely calls the low-level
+   `net.Server.listen()` binding on port 5173** - confirmed via three
+   `net-pipe-listen` registrations, each carrying `{ port: 5173 }` (ruling
+   out a port mismatch - the user's own "maybe it's listening on a
+   different port" theory, asked live during this session, is
+   **disproven**: it's the right port, every time).
+4. **That same process worker then exits cleanly - `postEvent("exit",
+   { code: 0 })`, zero stderr, zero thrown error** - shortly after (not
+   during a long synchronous block; the whole `execFileSync`+WASI-binding
+   load this session originally suspected completes in low single-digit
+   seconds even on a cold cache, confirmed by isolated repro below).
+5. That clean exit is what npm's own `lib/cli/exit-handler.js:171`
+   (`this.#process.exit(exitCode)`) is reacting to - `@npmcli/promise-
+   spawn`'s `proc.on('close', ...)` fires with `code: 0`, so
+   `run-script`'s own promise resolves successfully, and npm's own CLI
+   entry (`await execPromise; return exitHandler.exit()`) calls
+   `process.exit(0)` right on schedule. **npm, the kernel's `cp-spawn`
+   relay, and the shell dispatch are all faithfully reporting a real,
+   premature exit of vite's own process - none of them are the bug.**
+6. Vite's own "ready" output (the `VITE vX.X.X ready in Yms` banner, or
+   the `➜  Local:   http://localhost:5173/` line every real `vite`
+   invocation prints immediately after a successful listen) **never
+   appears, in any run.** The process dies with the low-level TCP handle
+   already registered as listening but before vite's own higher-level
+   "the server is ready" code path ever runs.
+
+**Ruled out, each independently, with a live isolated repro (write a
+small script to `/bin/<name>.js`, `dwc.process.spawn()` it directly - much
+faster than the full multi-minute `npm create vite` → `npm install` cycle
+for testing one hypothesis at a time):**
+- **Not the `execFileSync`+pnpm-install-the-WASI-binding step.** Reproduced
+  standalone (both a fresh download+install and a cache-hit require of the
+  already-installed `/tmp/rolldown-<version>/.../rolldown-binding.wasi.cjs`)
+  - both return cleanly and fast, no hang, no partial state.
+  Confirmed the currently-installed real `rolldown-binding.wasm32-wasi`
+  binding module loads and returns a fully-formed native-binding object
+  (`BindingDevEngine`, `startAsyncRuntime`, etc. all present).
+- **Not `drain()`'s `DRAIN_GRACE_YIELDS` idle-exit timeout** (the
+  mechanism that tears a process down after enough consecutive idle
+  macrotask yields with no tracked pending work - see `eventLoop.ts`'s own
+  doc comments). Bumped from 20 to 20,000 (1000x) and rebuilt; the failure
+  reproduced at the exact same point, meaning it isn't a "ran out of grace
+  yields waiting on an untracked native-promise chain" issue.
+- **Not an uncaught exception.** `worker.ts`'s `reportUncaught()` always
+  writes to stderr and exits with code 1 - this exit is code 0 with zero
+  stderr, going through the guest-called `process.exit()` path, not the
+  fatal-exception path.
+- **Not a kernel-side relay bug.** Every hop of the chain above (`cp-spawn`
+  receipt → `resolveEntryPoint` resolution → the three `listen` events →
+  the final `exit` event → the relay back to npm's own `child_process`
+  `'close'` handler) was individually traced and each is a correct,
+  faithful forwarding of what vite's own process worker actually did.
+- **Not obviously a missing `eventLoop.ref()` on `net.Server.listen()`**
+  either, on inspection: `bindings/net.ts`'s `recount()` function (shared
+  by both `TCP.listen()` and `Pipe.listen()`) does correctly call
+  `ref()`/`unref()` based on `_live && _refed && !_closed` - a listening,
+  non-unref'd handle *should* keep `drain()` from ever concluding "no
+  pending work". Given the process still exits, either (a) vite's own code
+  explicitly closes/unrefs these three listeners shortly after opening
+  them (a "probe the port, then really bind" pattern - plausible, since
+  three registrations for the *same* port 5173 is one more than a single
+  real bind would produce), or (b) something else entirely is going on
+  that hasn't been isolated yet. Not yet distinguished - see next step.
+
+**Concrete next step, in order of cost:**
+1. Trace `net-close-server`/`net-pipe-close-server` messages the same way
+   the `listen` events were traced this session (relay through the
+   existing `cp-event`(kind: `"stderr"`) mechanism on the SAME child's
+   `id` - see technique notes below) to see whether any of the three
+   listeners get closed again before the process's own `exit` event fires.
+   If yes, that's a live ref/unref race worth root-causing directly in
+   `net.ts`. If no listener ever closes and `activeHandles` should
+   therefore still be > 0, the bug is elsewhere (mismatched ref/unref
+   pairing, or the low-level `TCP`/`Pipe` handles that got `.listen()`
+   called on them aren't the SAME handle objects `drain()`'s eventLoop
+   instance is tracking - e.g. a handle created in a context whose
+   `eventLoop.ref()` doesn't reach the actual polling `drain()` loop).
+2. Read real vite's own `dist/node/*.js` (or `npm pack vite@8.2.2`
+   locally, same technique used for rolldown - see below) to find exactly
+   what runs between its dev server's `httpServer.listen()` call and its
+   own `printUrls()`/ready-banner code - there may be a real async step in
+   between (a port-conflict retry probe, an `optimizeDeps` warm-up, a
+   `require('node:tls')`-adjacent check, etc.) that depends on something
+   this runtime doesn't fully back, and which - critically - *also* isn't
+   visible to `drain()`'s own ref-counting the way a genuinely pending
+   fs/network operation would be.
+3. Once root-caused: fix `waitForMarker()` (item 1 above) regardless, so
+   future runs surface "vite exited early" as a visible, distinct failure
+   instead of silently reaching the preview step every time.
+
+**Diagnostic technique notes for whoever picks this up (all learned live
+this session, worth keeping in mind before re-inventing them):**
+- **`read_console_messages` (browser automation) only reliably captures
+  the main page thread's console.** `console.log()` calls from inside a
+  nested Worker (the kernel worker, a process worker, etc.) do fire, but
+  don't show up through that tool - confirmed by adding logging that
+  never appeared no matter how it was searched for, until it was rerouted
+  through the existing `cp-event`(kind: `"stdout"`/`"stderr"`) relay
+  mechanism (`worker.postMessage({ type: "cp-event", payload: { id, kind:
+  "stderr", chunk: ... } })`, using the same request `id` a spawn is
+  already tracking, or `onEvent("stderr", { chunk }, "")` inside
+  `processClient.ts` functions that already have an `onEvent` in scope) -
+  at which point it appeared immediately as ordinary stdout/stderr on
+  whatever host-visible process was already being piped.
+- **The vendored guest `console.log()` (`worker.ts`) stringifies via
+  `args.map(String).join(" ")`** - passing an object logs the useless
+  `[object Object]`. Always `JSON.stringify()` first when relaying trace
+  data through it or through the `cp-event` stderr channel above.
+- **`//# sourceURL=dwc://module<path>` was added to `moduleLoader.ts`'s
+  `new Function` compilation this session** (committed separately,
+  `4d0f2b6`, kept - not reverted with the rest of this session's debug
+  code) - every guest stack trace now names the real vendored file
+  instead of `eval at loadModule (...), <anonymous>:N:M`. This is what
+  turned an unattributable `process.exit(0)` call into an immediately
+  actionable `npm/lib/cli/exit-handler.js:171`, and should make every
+  future guest-code debugging session in this runtime faster.
+- **A single-file isolated repro is much faster than the full cycle** for
+  testing one hypothesis at a time: `dwc.fs.writeFile('/bin/foo.js',
+  script)` then `dwc.process.spawn('/bin/foo.js', { argv: [], cwd: '/' })`
+  runs in seconds, versus several real minutes for a fresh `npm create
+  vite` → `npm install` → `npm run dev` cycle. Also: `dwc.process.spawn`
+  (the **host-facing** API) does not support the `command === "node"` +
+  script-argv special case guest-side `child_process.spawn()`/shell
+  dispatch gets via `resolveEntryPoint` - always give it a real, existing
+  file path as `command` directly, not `"node"` as the command with the
+  script as an arg.
+- **Patching a real npm/dependency file directly inside the guest VFS**
+  (read via `dwc.fs.readFile`, string-`replace()` in the browser to avoid
+  ever pulling a large file through the agent's own context/hitting the
+  browser tool's base64/cookie-like-data output filter, `dwc.fs.writeFile`
+  back) is a fast way to add temporary tracing to real vendored dependency
+  code (npm itself, `@npmcli/run-script`, `@npmcli/promise-spawn`, the
+  real rolldown `dist/shared/binding-*.mjs` fallback) without needing a
+  local checkout - `npm pack <pkg>@<version>` into a scratch directory
+  gives you the exact same source to diff against/copy patches from
+  first. These VFS patches don't persist across a real npm reinstall (this
+  demo's own `npm create vite` reinstalls `/my-app` fresh on every page
+  reload), so they're inherently throwaway and need no cleanup.
 
 ## Reminder: no AI attribution in commits
 
