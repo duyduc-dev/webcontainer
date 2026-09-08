@@ -1357,13 +1357,72 @@ session's own decision, still true.
       else, ever. Even with (1) fixed, `create-vite` would still resolve to
       "command not found" without this.
 
-   Not yet attempted - a real, scoped follow-on (extend `resolveEntryPoint`
-   to search `env.PATH.split(':')` before falling back to `/bin/`, and give
-   `spawn()` a `sh -c` dispatch path, streamed or not) for whoever picks this
-   up next, separate from the Vite build/HMR gaps above. The
-   silent-failure-swallowing fix above is real and shipped regardless of
-   whether this is ever built - every `spawn()` caller now gets an honest
-   `'error'`/non-zero exit instead of a misleading clean success.
+   **Follow-up, same session: built both, then found and fixed two more real
+   bugs live-testing them - `npm create vite@latest` now works completely,
+   end to end, for the first time.**
+
+   1. **`resolveEntryPoint()` now does a real PATH search.** Given an `env`
+      parameter, a bare command word that isn't `/bin/<name>.js` now searches
+      each `env.PATH.split(':')` directory in order (first match wins,
+      matching POSIX `execvp`) before giving up - threaded through from every
+      call site that has a real `env` available (`cp-spawn`, `execFileSync`'s
+      kernel-side backer). A resolved candidate is then run through a new
+      `resolveRealEntryPath()` helper (`fsClient.request({action:
+      "realpath", ...})`, already a supported VFS op, just never called from
+      here before) before being used as an entryPath - real npm's own bin-
+      linking creates `node_modules/.bin/<name>` as a genuine symlink into
+      the package's own directory, and real Node's module resolution uses
+      the symlink's REAL target directory (not the symlink's own location)
+      as the base for that module's relative `require()`s. Skipping this
+      step is exactly what the second bug below surfaced as - a resolved
+      but wrongly-based entry point, not a resolution failure.
+   2. **`child_process.spawn()` now has a real `sh -c "<line>"` dispatch
+      path.** A new `runShellLineStreamed()` (`workers/kernel/
+      processClient.ts`) reuses the exact same `shell/tokenize.ts`
+      interpreter `runShellInternal`/`cp-exec` already use, but relays each
+      resulting command's stdout/stderr AS PRODUCED via the same streaming
+      `bootProcess()`/`cp-event` machinery an ordinary `cp-spawn` uses,
+      instead of `runShellInternal`'s buffered single-string-then-return
+      shape - matching `spawn()`'s real streaming contract, which real npm's
+      own promise-based consumers (`@npmcli/promise-spawn`) actually rely
+      on. `cp-spawn`'s handler now special-cases `command === "sh" &&
+      args[0] === "-c"` (real npm's own `@npmcli/run-script` always spawns
+      scripts, including `npm exec`/`npx`'s fetched-package launch, exactly
+      this way) and dispatches here instead of the normal single-
+      resolveEntryPoint-then-bootProcess path. A command with a `>` redirect
+      still goes through the older buffered `runProgramViaShell` (streaming
+      stdout while redirecting it to a file doesn't make sense), now also
+      given `env` for the same PATH-search reason.
+   3. **A missing default `PATH` silently made (1) a no-op.** Real npm's own
+      `setPATH()` (`@npmcli/run-script/lib/set-path.js`) only ever UPDATES an
+      existing PATH-shaped key in the env object it's given - it never adds
+      one from scratch. This runtime's guest `process.env` had no `PATH` key
+      at all by default (never needed before - `resolveEntryPoint`'s
+      original `/bin/<name>.js` lookup is PATH-independent), so that update
+      was silently a no-op and (1) never had anything to search. Fixed with
+      a real, minimal default (`PATH: "/bin"`) in `apis/Process.ts`'s own
+      `spawn()`, overridable by a caller's own `options.env.PATH` - confirmed
+      live via a temporary diagnostic (`PATH= undefined` before this fix).
+   4. **`fs.copyFileSync` didn't exist at all.** Found live, past both bugs
+      above: real `create-vite`'s own scaffolding step (copying a template's
+      static files into the target directory) calls it directly - `TypeError:
+      t.copyFileSync is not a function`. Added as a straightforward
+      `readFileSync`+`writeFileSync` composition in `runtime/builtins/fs.ts`
+      (single-file copy only - no traced need yet for `fs.cpSync`'s
+      recursive-tree form).
+
+   **Verified live, full end-to-end run** (`npm create vite@latest my-app --
+   --template vanilla`, same harness as every other entry in this section):
+   exit code 0, and `/my-app` now contains real, correct scaffolded output -
+   `.gitignore`, `index.html`, `package.json`, `public/`, `src/{assets,
+   counter.js, main.js, style.css}` - the actual real-vite `vanilla` template,
+   not an empty directory. This is the first time `npm create`/`npx` has
+   worked completely in this runtime. The four bugs above were found and
+   fixed in sequence, each live run's own error message pointing at exactly
+   the next one - `sh: command not found` → `create-vite: command not found`
+   (missing default PATH) → `Cannot find module './dist/index.js' from
+   .../node_modules/.bin/create-vite` (symlink realpath) → `TypeError:
+   t.copyFileSync is not a function` → real success.
 
 ## Reminder: no AI attribution in commits
 

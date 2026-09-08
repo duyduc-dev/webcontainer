@@ -32,7 +32,18 @@ const createProcessAPI = (request: Requester, on: Subscriber): ProcessAPI => {
       const { processId } = await request<{ processId: string }>("PROCESS_SPAWN", {
         entryPath,
         argv: options.argv ?? [],
-        env: options.env ?? {},
+        // A real, if minimal, default PATH - not needed by resolveEntryPoint's
+        // own primary /bin/<name>.js lookup (that's always tried first,
+        // PATH-independent), but real npm's own setPATH() (workers/kernel/
+        // processClient.ts's resolveEntryPoint - PATH search, used for
+        // resolving a spawn shelled out via `sh -c`) only ever UPDATES an
+        // existing PATH-shaped key in the env object it's given - it never
+        // adds one from scratch. Without at least one truthy PATH key already
+        // present here, that update is silently a no-op and every child this
+        // process spawns (transitively - env merges downstream from here)
+        // loses PATH-based command resolution entirely. A caller's own
+        // `options.env.PATH` still wins if given.
+        env: { PATH: "/bin", ...options.env },
         cwd: options.cwd ?? "/",
       });
 

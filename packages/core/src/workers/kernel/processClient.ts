@@ -77,29 +77,81 @@ interface BootProcessPayload {
 
 type ProcessEventHandler = (type: string, eventPayload: any, processId: string) => void;
 
+/** Resolves a PATH/coreutils-lookup candidate to its real, symlink-free
+ * path before it's used as a module's own entryPath - real npm's own bin-
+ * linking (how a fetched package like `create-vite` ends up resolvable via
+ * PATH search at all) creates `node_modules/.bin/<name>` as a real symlink
+ * pointing INTO the package's own directory, and real Node's module
+ * resolution uses the symlink's REAL target directory (not the symlink's
+ * own location) as the base for that module's relative require()s, unless
+ * `--preserve-symlinks` is set. Skipping this left a bin-linked entry
+ * point's own relative requires (`require('./dist/index.js')`, its most
+ * common shape) resolving against the WRONG directory - confirmed live via
+ * a real `npm create vite@latest` run: "Cannot find module './dist/
+ * index.js' from '.../node_modules/.bin/create-vite'", the symlink's own
+ * directory, not `node_modules/create-vite/` where that file actually
+ * lives. Falls back to the original candidate on a realpath failure (this
+ * function is only ever called right after confirming the candidate
+ * exists, so a failure here would be a genuinely unexpected VFS error, not
+ * a normal "not found" case worth hiding a resolved entryPath over). */
+const resolveRealEntryPath = async (fsClient: FsClient, candidate: string): Promise<string> => {
+  try {
+    return await fsClient.request<string>({ action: "realpath", path: candidate });
+  } catch {
+    return candidate;
+  }
+};
+
 /** child_process.spawn('node', [...]) is an extremely common real-world
  * pattern (build tools re-invoking themselves), so it gets the exact same
  * resolution `node <script>` already gets in a shell line: a direct entryPath
  * rather than a /bin/node.js lookup (no vendored Node script can require() an
  * arbitrary absolute path the way moduleLoader.run(entryPath) can). Every
- * other command resolves against /bin/<name>.js (kernel/fs/coreutils.ts,
- * seeded at FS Worker boot). Returns null - not a thrown error - so callers
- * (the shell's "command not found" vs. child_process's ENOENT-shaped error)
- * can each report it their own way. */
+ * other command first resolves against /bin/<name>.js (kernel/fs/
+ * coreutils.ts, seeded at FS Worker boot), falling back to a real PATH
+ * search (a colon-delimited `env.PATH`, first match wins, matching POSIX
+ * execvp) when a caller has an env to search with - needed for anything
+ * resolved via npm's own bin-linking (node_modules/.bin/<name>, or an npx
+ * cache dir's own bin path), which never lives under /bin/. Returns null -
+ * not a thrown error - so callers (the shell's "command not found" vs.
+ * child_process's ENOENT-shaped error) can each report it their own way. */
 const resolveEntryPoint = async (
   fsClient: FsClient,
   command: string,
   args: string[],
   cwd: string,
+  env?: Record<string, string>,
 ): Promise<{ entryPath: string; args: string[] } | null> => {
   if (command === "node") {
     const scriptArg = args[0];
     if (!scriptArg) return null;
     return { entryPath: resolvePath(cwd, scriptArg), args: args.slice(1) };
   }
-  const entryPath = `/bin/${command}.js`;
-  const exists = await fsClient.request<boolean>({ action: "exists", path: entryPath });
-  return exists ? { entryPath, args } : null;
+  // A command containing a path separator (`./foo`, `/bin/foo`,
+  // `node_modules/.bin/foo`, ...) is used exactly as given, real-shell-
+  // style - never PATH-searched, real coreutils/PATH lookup below is only
+  // for a bare command word.
+  if (command.includes("/")) {
+    const entryPath = resolvePath(cwd, command);
+    const exists = await fsClient.request<boolean>({ action: "exists", path: entryPath });
+    return exists ? { entryPath: await resolveRealEntryPath(fsClient, entryPath), args } : null;
+  }
+  const builtin = `/bin/${command}.js`;
+  if (await fsClient.request<boolean>({ action: "exists", path: builtin })) {
+    return { entryPath: builtin, args };
+  }
+  // Real PATH search, first match wins (matching POSIX execvp) - needed for
+  // anything resolved via npm's own bin-linking (node_modules/.bin/<name>,
+  // or an npx cache dir's own bin path), which never lives under /bin/.
+  const pathVar = env?.PATH ?? env?.Path ?? "";
+  for (const dir of pathVar.split(":")) {
+    if (!dir) continue;
+    const candidate = resolvePath(cwd, `${dir}/${command}`);
+    if (await fsClient.request<boolean>({ action: "exists", path: candidate })) {
+      return { entryPath: await resolveRealEntryPath(fsClient, candidate), args };
+    }
+  }
+  return null;
 };
 
 const decoder = new TextDecoder();
@@ -301,7 +353,41 @@ const bootProcess = async (
       const { id, command, args: childArgs, cwd: childCwd, env: childEnv } = eventPayload;
       (async () => {
         try {
-          const resolved = await resolveEntryPoint(fsClient, command, childArgs, childCwd);
+          const relayEvent = (childType: string, childPayload: any) => {
+            if (childType === "stdout" || childType === "stderr") {
+              worker.postMessage({ type: "cp-event", payload: { id, kind: childType, chunk: childPayload.chunk } });
+              return;
+            }
+            if (childType === "exit") {
+              childWorkersByRequestId.delete(id);
+              worker.postMessage({ type: "cp-event", payload: { id, kind: "exit", code: childPayload.code } });
+            }
+          };
+
+          // Real npm's own @npmcli/run-script (backing `npm exec`/`npx`,
+          // and any package.json "scripts" launch) always spawns through a
+          // shell - `spawn('sh', ['-c', '<line>'], {env, ...})` - after its
+          // own shell:true handling turns the literal command into that
+          // shape. There's no vendored `/bin/sh` this could ever resolve to
+          // via the normal single-command path below; dispatch through the
+          // same shell/tokenize.ts interpreter cp-exec's own runShellInternal
+          // already uses instead, but streamed (see runShellLineStreamed's
+          // own doc comment) rather than buffered, matching spawn()'s real
+          // contract.
+          if (command === "sh" && childArgs.length === 2 && childArgs[0] === "-c") {
+            await runShellLineStreamed(
+              fsClient,
+              processTable,
+              fetcherClient,
+              netRelay,
+              { line: childArgs[1], cwd: childCwd, env: childEnv ?? {} },
+              relayEvent,
+              (childWorker) => childWorkersByRequestId.set(id, childWorker),
+            );
+            return;
+          }
+
+          const resolved = await resolveEntryPoint(fsClient, command, childArgs, childCwd, childEnv);
           if (!resolved) {
             worker.postMessage({ type: "cp-event", payload: { id, kind: "error", message: `${command}: command not found` } });
             return;
@@ -312,16 +398,7 @@ const bootProcess = async (
             fetcherClient,
             netRelay,
             { entryPath: resolved.entryPath, argv: resolved.args, env: childEnv ?? {}, cwd: childCwd },
-            (childType, childPayload) => {
-              if (childType === "stdout" || childType === "stderr") {
-                worker.postMessage({ type: "cp-event", payload: { id, kind: childType, chunk: childPayload.chunk } });
-                return;
-              }
-              if (childType === "exit") {
-                childWorkersByRequestId.delete(id);
-                worker.postMessage({ type: "cp-event", payload: { id, kind: "exit", code: childPayload.code } });
-              }
-            },
+            relayEvent,
             (childWorker) => childWorkersByRequestId.set(id, childWorker),
           );
         } catch (error) {
@@ -444,7 +521,7 @@ const runProgramToCompletion = async (
   netRelay: NetRelay,
   payload: { command: string; args: string[]; cwd: string; env: Record<string, string> },
 ): Promise<{ output: string; exitCode: number }> => {
-  const resolved = await resolveEntryPoint(fsClient, payload.command, payload.args, payload.cwd);
+  const resolved = await resolveEntryPoint(fsClient, payload.command, payload.args, payload.cwd, payload.env);
   if (!resolved) {
     throw new Error(`${payload.command}: command not found`);
   }
@@ -476,6 +553,106 @@ const runProgramToCompletion = async (
 
   await exited;
   return { output, exitCode };
+};
+
+/** child_process.spawn()'s own real, streaming counterpart to
+ * runShellInternal below - same `&&`-chained-line, `cd`-mutates-cwd-in-
+ * place, resolveEntryPoint()-per-command shape (reusing the exact same
+ * shell/tokenize.ts interpreter), but relays each command's stdout/stderr
+ * to `onEvent` AS PRODUCED, matching spawn()'s real streaming contract,
+ * instead of buffering everything into one string and returning only at the
+ * end. Traced need: real npm's own @npmcli/run-script (backing `npm exec`/
+ * `npx`, and any package.json "scripts" launch) always spawns through a
+ * shell - `spawn('sh', ['-c', line], {env, ...})` - so a caller-visible
+ * child_process.spawn()'d process (real npm's own promise-based
+ * `.on('data', ...)`/`.on('close', ...)` consumers, not just a one-shot
+ * exec() result) needs this, not runShellInternal's buffered shape. `env`
+ * is threaded through to resolveEntryPoint() on every command specifically
+ * so its own PATH search can find whatever real npm's own setPATH()
+ * resolved (a fetched package's bin-linked node_modules/.bin, never
+ * `/bin/`) - the one piece runShellInternal/runProgramViaShell don't carry
+ * at all today, and the actual reason `npm create <template>` couldn't find
+ * its own fetched package's executable before this existed. A command with
+ * a `>` redirect target still runs through the older buffered
+ * runProgramViaShell (real Node's own streaming stdout wouldn't make sense
+ * with output being redirected to a file instead), sharing this function's
+ * own env for the same PATH-search reason. */
+const runShellLineStreamed = async (
+  fsClient: FsClient,
+  processTable: ProcessTable,
+  fetcherClient: FetcherClient,
+  netRelay: NetRelay,
+  payload: { line: string; cwd: string; env: Record<string, string> },
+  onEvent: ProcessEventHandler,
+  onWorkerCreated?: (worker: Worker) => void,
+): Promise<void> => {
+  const commands = parseCommands(tokenize(payload.line));
+  let cwd = payload.cwd;
+  let exitCode = 0;
+
+  for (const command of commands) {
+    const name = command.argv[0];
+    if (!name) continue;
+
+    if (name === "cd") {
+      const target = command.argv[1] ? resolvePath(cwd, command.argv[1]) : "/";
+      const stat = await fsClient.request<{ isDirectory: boolean }>({ action: "stat", path: target }).catch(() => null);
+      if (!stat?.isDirectory) {
+        onEvent("stderr", { chunk: new TextEncoder().encode(`cd: not a directory: ${command.argv[1] ?? target}\n`) }, "");
+        exitCode = 1;
+        break;
+      }
+      cwd = target;
+      exitCode = 0;
+      continue;
+    }
+
+    if (command.redirectOut) {
+      const resolved = await resolveEntryPoint(fsClient, name, command.argv.slice(1), cwd, payload.env);
+      if (!resolved) {
+        onEvent("stderr", { chunk: new TextEncoder().encode(`${name}: command not found\n`) }, "");
+        exitCode = 127;
+        break;
+      }
+      const result = await runProgramViaShell(resolved.entryPath, resolved.args, cwd, fsClient, processTable, fetcherClient, netRelay);
+      await fsClient.request({ action: "writeFile", path: resolvePath(cwd, command.redirectOut), contents: result.output });
+      exitCode = result.exitCode;
+      if (exitCode !== 0) break;
+      continue;
+    }
+
+    const resolved = await resolveEntryPoint(fsClient, name, command.argv.slice(1), cwd, payload.env);
+    if (!resolved) {
+      onEvent("stderr", { chunk: new TextEncoder().encode(`${name}: command not found\n`) }, "");
+      exitCode = 127;
+      break;
+    }
+
+    let resolveExit!: () => void;
+    const exited = new Promise<void>((resolve) => {
+      resolveExit = resolve;
+    });
+    await bootProcess(
+      fsClient,
+      processTable,
+      fetcherClient,
+      netRelay,
+      { entryPath: resolved.entryPath, argv: resolved.args, env: payload.env, cwd },
+      (childType, childPayload, childProcessId) => {
+        if (childType === "exit") {
+          exitCode = childPayload.code;
+          resolveExit();
+          return;
+        }
+        onEvent(childType, childPayload, childProcessId);
+      },
+      onWorkerCreated,
+    );
+    await exited;
+    if (exitCode !== 0) break;
+  }
+
+  onEvent("exit", { code: exitCode }, "");
 };
 
 /** Runs an `&&`-chained shell line: `cd` mutates cwd in place (a subprocess

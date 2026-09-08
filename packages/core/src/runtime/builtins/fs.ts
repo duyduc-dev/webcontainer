@@ -54,6 +54,11 @@ interface FsBuiltinCore {
   rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
   renameSync(from: string, to: string): void;
   existsSync(path: string): boolean;
+  // Traced need: real create-vite's own file-copying helper (used to lay
+  // down a template's static files during scaffolding) calls this directly -
+  // `fs.cpSync`-style recursive tree copying has no traced need yet, only
+  // this single-file form.
+  copyFileSync(src: string, dest: string): void;
 }
 
 interface FsBuiltin extends FsBuiltinCore {
@@ -301,6 +306,9 @@ const createFsBuiltin = (
     existsSync(path) {
       const response = call({ op: FsOp.EXISTS, path }) as Extract<FsResponseOk, { op: FsOp.EXISTS }>;
       return response.exists;
+    },
+    copyFileSync(src, dest) {
+      core.writeFileSync(dest, core.readFileSync(src));
     },
   };
 
