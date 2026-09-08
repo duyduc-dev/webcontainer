@@ -235,6 +235,21 @@ const bootProcess = async (
       return;
     }
 
+    // worker_threads.Worker's own nested-Worker bootstrap (workers/
+    // workerThreads/worker.ts) needs a real sync-fs channel to this
+    // project's own VFS, same as this process itself got at spawn time -
+    // createSyncFsChannelFor(fsClient) is already a standalone, repeatable
+    // helper (not coupled 1:1 to the process table), so granting a SECOND
+    // one to an already-running process is just calling it again, not a
+    // redesign. See runtime/builtins/worker_threads.ts's `spawnWorker`
+    // (worker.ts's own wiring) for the requesting side.
+    if (type === "wt-request-sync-fs-channel") {
+      const { id } = eventPayload as { id: string };
+      const syncFs = createSyncFsChannelFor(fsClient);
+      worker.postMessage({ type: "wt-sync-fs-channel-response", payload: { id, syncFs } }, syncFs ? [syncFs.port] : []);
+      return;
+    }
+
     // Cross-process net: this process either registered a port/path (fire-
     // and-forget) or is dialing one (net-pipe-connect gets a synchronous
     // local-registry answer back as net-pipe-connect-response), or is

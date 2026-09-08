@@ -77,6 +77,7 @@ const pendingChildExecs = new Map<
   string,
   { resolve: (v: { output: string; cwd: string; exitCode: number }) => void; reject: (error: unknown) => void }
 >();
+const pendingSyncFsChannelRequests = new Map<string, (channel: SyncFsChannelPayload | null) => void>();
 
 /** Bridges the guest realm's globalThis.__dwcFetchAsync (see internal/fetch-transport.js)
  * up through the kernel to the Fetcher Worker — the only place with real network access.
@@ -227,6 +228,63 @@ const createChildProcessBridge = (eventLoop: ReturnType<typeof createEventLoop>,
     return { exitCode: response.exitCode, output: response.output };
   },
 });
+
+/** Asks the kernel for a fresh sync-fs channel to this project's own VFS -
+ * the one-time setup a worker_threads.Worker's own nested bootstrap
+ * (workers/workerThreads/worker.ts) needs to make its own `require('fs')`/
+ * moduleLoader resolution work, exactly like this process itself got one at
+ * spawn time (createSyncFsChannelFor(fsClient), reused as-is on the kernel
+ * side - see processClient.ts's "wt-request-sync-fs-channel" handler).
+ * Resolves `null` (not a throw) when not cross-origin isolated, matching
+ * BootPayload.syncFs's own convention - the nested worker's own fs.ts
+ * builtin already throws a clear ERR_NOT_ISOLATED the first time guest code
+ * actually tries a *Sync call, same as this process's own fs does. */
+const requestSyncFsChannel = (): Promise<SyncFsChannelPayload | null> => {
+  const id = crypto.randomUUID();
+  return new Promise((resolve) => {
+    pendingSyncFsChannelRequests.set(id, resolve);
+    self.postMessage({ type: "wt-request-sync-fs-channel", payload: { id } });
+  });
+};
+
+const handleSyncFsChannelResponse = (payload: { id: string; syncFs: SyncFsChannelPayload | null }): void => {
+  const waiting = pendingSyncFsChannelRequests.get(payload.id);
+  if (!waiting) return;
+  pendingSyncFsChannelRequests.delete(payload.id);
+  waiting(payload.syncFs);
+};
+
+/** worker_threads.ts's `spawnWorker` hook (see its own ThreadContext doc
+ * comment) - constructs a REAL nested browser Worker directly (no kernel
+ * relay needed for the resulting parentPort<->Worker message channel itself,
+ * only for the one-time channel grant above), running the shared
+ * workers/workerThreads/worker.ts bootstrap. `ready` resolves once the
+ * channel has actually been granted and the boot message sent; real message
+ * traffic sent before that would arrive before the nested worker has even
+ * installed its own listener. */
+const spawnWorker = (
+  entryPath: string,
+  options: { workerData?: unknown; env?: Record<string, string> },
+  cwd: string,
+  defaultEnv: Record<string, string>,
+  eventLoop: ReturnType<typeof createEventLoop>,
+): { worker: Worker; ready: Promise<void>; unref: () => void } => {
+  const worker = new Worker(new URL("../workerThreads/worker.js", import.meta.url), { type: "module", name: `WorkerThreads:${entryPath}` });
+  // Refed for as long as this worker is alive (see worker_threads.ts's own
+  // SpawnedWorker doc comment for the real hang this fixes) - without it,
+  // a guest script with no other pending work looks "done" the instant its
+  // own top-level code returns, and this process tears itself (and every
+  // worker it spawned, including a not-yet-booted one) down mid-flight.
+  eventLoop.ref();
+  const ready = requestSyncFsChannel().then((syncFs) => {
+    const transfer = syncFs ? [syncFs.port] : [];
+    worker.postMessage(
+      { type: "boot", payload: { entryPath, cwd, env: options.env ?? defaultEnv, workerData: options.workerData ?? null, syncFs } },
+      transfer,
+    );
+  });
+  return { worker, ready, unref: () => eventLoop.unref() };
+};
 
 const handleChildProcessEvent = (payload: {
   id: string;
@@ -475,6 +533,9 @@ const boot = async (payload: BootPayload): Promise<void> => {
       }
       return fsBuiltinForWasi;
     },
+    {
+      spawnWorker: (entryPath, options) => spawnWorker(entryPath, options, payload.cwd, payload.env, eventLoop),
+    },
   );
 
   // process.stdin - a real vendored Readable (the same class require('stream')
@@ -695,4 +756,5 @@ self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   else if (event.data.type === "cp-event") handleChildProcessEvent(event.data.payload as Parameters<typeof handleChildProcessEvent>[0]);
   else if (event.data.type === "cp-exec-response") handleChildExecResponse(event.data.payload as Parameters<typeof handleChildExecResponse>[0]);
   else if (event.data.type === "stdin") stdinPush?.((event.data.payload as { chunk: Uint8Array }).chunk);
+  else if (event.data.type === "wt-sync-fs-channel-response") handleSyncFsChannelResponse(event.data.payload as Parameters<typeof handleSyncFsChannelResponse>[0]);
 };

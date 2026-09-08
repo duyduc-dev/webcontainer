@@ -13,6 +13,7 @@ export default defineConfig([
       "workers/kernel/worker": "src/workers/kernel/worker.ts",
       "workers/fs/worker": "src/workers/fs/worker.ts",
       "workers/process/worker": "src/workers/process/worker.ts",
+      "workers/workerThreads/worker": "src/workers/workerThreads/worker.ts",
       "workers/fetcher/worker": "src/workers/fetcher/worker.ts",
       "workers/preview/PreviewServiceWorker": "src/workers/preview/PreviewServiceWorker.ts",
     },

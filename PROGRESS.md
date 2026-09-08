@@ -768,38 +768,108 @@ session's own decision, still true.
    `environ_sizes_get`/`random_get`/`clock_time_get`/`sched_yield` all
    return successfully without trapping.
 
-   **`worker_threads.Worker` — traced, not yet implemented.** The real
-   reason a `Worker` is needed turns out to be much narrower than "make
-   worker_threads work in general": `@napi-rs/wasm-runtime`'s own
-   `wasi-worker.mjs` (a FIXED file the library itself ships, not
+   **`worker_threads.Worker` — DONE, committed, verified end-to-end live.**
+   The real reason a `Worker` is needed turned out to be much narrower
+   than "make worker_threads work in general": `@napi-rs/wasm-runtime`'s
+   own `wasi-worker.mjs` (a FIXED file the library itself ships, not
    arbitrary guest code) uses `new Worker(filename)` purely to implement
-   WASI's `thread-spawn` import - spawn a new thread that
-   re-instantiates the SAME wasm module with SHARED memory and runs a
-   fixed bootstrap. That bootstrap needs only: a working `require()`
-   (this project's existing moduleLoader against the real VFS), a `wasi`
-   builtin (now done, above), and `require('worker_threads').parentPort`
-   wired to whatever spawned it. The rest (message-passing protocol,
-   actual wasm re-instantiation with shared memory) is entirely handled
-   by `@napi-rs/wasm-runtime`'s own already-correct JS, once npm-installed
-   - nothing new to write there.
+   WASI's `thread-spawn` import - spawn a new thread that re-instantiates
+   the SAME wasm module with SHARED memory and runs a fixed bootstrap.
+   That bootstrap needs only: a working `require()` (this project's
+   existing moduleLoader against the real VFS), a `wasi` builtin (done,
+   above), and `require('worker_threads').parentPort` wired to whatever
+   spawned it - the rest (message-passing protocol, actual wasm
+   re-instantiation with shared memory) is entirely handled by
+   `@napi-rs/wasm-runtime`'s own already-correct JS once npm-installed,
+   nothing new to write there.
 
-   The concrete shape of the remaining work: (1) a new kernel message
-   granting a *second* sync-fs channel to an already-running process
-   worker (`createSyncFsChannelFor(fsClient)` in `processClient.ts` is
-   already a standalone, repeatable helper - not coupled 1:1 to the
-   process table - so this is a small addition, not a redesign); (2) a
-   new bundled worker entry point (mirroring how `workers/process/
-   worker.ts` itself is loaded via `new URL(..., import.meta.url)` from
-   the kernel) that boots a minimal guest environment - require/fs/
-   process, reusing existing moduleLoader/createBuiltinModules/
-   createFsBuiltin machinery, NOT a new nested Node-sandbox
-   implementation - and wires `parentPort`; (3) `worker_threads.ts`'s
-   `Worker` class spawning that entry as a REAL nested browser Worker
-   directly from the calling guest process's own Worker context (no
-   kernel relay needed for the parentPort<->Worker message channel itself
-   - only for the one-time sync-fs-channel grant), matching real Node's
-   own direct (non-kernel-mediated) worker_threads semantics. Not yet
-   built - the next concrete step for whoever picks this up.
+   Built exactly the three pieces this doc previously scoped: (1) a new
+   kernel message (`wt-request-sync-fs-channel`) granting a *second* sync-fs
+   channel to an already-running process worker - `createSyncFsChannelFor
+   (fsClient)` in `processClient.ts` was already a standalone, repeatable
+   helper, so this was a small addition, not a redesign; (2) a new bundled
+   worker entry point (`workers/workerThreads/worker.ts`, its own tsup
+   entry, mirroring how `workers/process/worker.ts` itself is loaded) that
+   boots a minimal guest environment - require/fs/process/console/timers/
+   Buffer, reusing the existing moduleLoader/createBuiltinModules/
+   createFsBuiltin machinery verbatim, deliberately NOT a full nested
+   Node sandbox (no net/http/child_process/readline - add if/when
+   something traces a need) - and wires `parentPort`; (3)
+   `worker_threads.ts`'s real `Worker` class, spawning that entry as a
+   genuine nested browser Worker directly from the calling guest
+   process's own Worker context (no kernel relay for the resulting
+   parentPort<->Worker channel itself - only for the one-time sync-fs
+   grant), matching real Node's own direct, non-kernel-mediated
+   worker_threads semantics.
+
+   **Two real, load-bearing bugs found and fixed getting an actual
+   message round-trip working live** (via a real Playwright Chromium run
+   against `examples/playground`'s dev server, `dwc.process.spawn()`ing a
+   guest script that does `new Worker(path)` + `parentPort` messaging for
+   real - not a unit test, since this needed real nested-Worker/
+   cross-origin-isolation/SharedArrayBuffer behavior no Node-based test
+   runner provides):
+   - **The channel-grant round trip (and the live Worker itself) weren't
+     `ref()`d.** A guest script with no other pending work (no timers, no
+     net requests - exactly `new Worker(...)` + one `postMessage()`, the
+     realistic common case) finishes its own top-level code almost
+     instantly; `hasPendingWork()` then read false, and this process
+     (along with every worker it had spawned, including the
+     workerThreads one that hadn't even finished booting yet) tore itself
+     down via the SAME drain()/exitProcess() path real script completion
+     already uses - with zero errors, since nothing had actually failed,
+     it just looked "done." Confirmed live: the nested worker's own
+     script never even got a chance to load before its parent process,
+     and therefore itself, was torn down. Fixed by `ref()`ing the event
+     loop for as long as a `worker_threads.Worker` instance is alive
+     (matching real Node: an active, non-unref'd Worker keeps its owner
+     process alive), released by `.terminate()`/`.unref()`.
+   - **A caller's first `postMessage()` raced ahead of this project's own
+     internal "boot" message and was silently dropped.** `spawnWorker()`
+     returns the real `Worker` object synchronously, but its "boot"
+     message (the entry path, env, granted sync-fs channel) is posted
+     only after the async channel-grant round trip resolves - real code
+     (this project's own end-to-end test included) calls `.postMessage()`
+     immediately after construction, with no synchronization, and that
+     message reached the nested worker BEFORE "boot" did. Fixed by
+     queuing a `DwcWorker`'s own `.postMessage()` calls on the same
+     `ready` promise `spawnWorker()` resolves after posting "boot" -
+     ordering guaranteed by the promise chain itself, transparent to
+     callers (still looks synchronous).
+   - A closely related, subtler gap surfaced by the SAME trace, fixed
+     alongside the two real bugs above even though it never actually
+     fired once they were fixed: the nested worker's own internal message
+     re-dispatch (`workers/workerThreads/worker.ts`'s `parentPort`) had no
+     buffering for a message arriving before the guest script's own
+     `parentPort.on("message", ...)` call - unlike a real `MessagePort`,
+     which queues internally until its first listener attaches. Real
+     script evaluation (resolving the entry module via the sync-fs
+     bridge's own `Atomics.wait` round trips) takes real, measurable time,
+     during which an already-in-flight message could otherwise arrive and
+     find zero listeners, vanishing. Fixed with an explicit pending-queue,
+     flushed in order to the first `parentPort.on("message", ...)`
+     listener that attaches.
+
+   **Verified live, full round trip**: a real guest process does
+   `new (require('worker_threads').Worker)('/child.mjs', { workerData })`;
+   the nested worker gets a real sync-fs-channel grant from the kernel,
+   boots a real `.mjs` ESM module through the existing ESM loader,
+   `parentPort.on('message', ...)`/`.postMessage(...)` round-trip real
+   data end-to-end, `isMainThread` correctly reads `false` inside the
+   nested worker and `true` in the spawning process, and `workerData`
+   passes through intact (`{"hello":"world"}` observed byte-for-byte on
+   the other side).
+
+   **Not yet attempted**: wiring this into the real, full rolldown/
+   `@napi-rs/wasm-runtime` chain (real `npm install vite`, real
+   `execFileSync`-driven WASM binding download, real `wasi-worker.mjs`
+   actually spawned by `@napi-rs/wasm-runtime`'s own internal code) - the
+   underlying mechanism (`node:wasi` + `worker_threads.Worker`) is now
+   real and independently verified, but the full integration hasn't been
+   re-run end-to-end since these two pieces landed. That's the next
+   concrete step for whoever picks this up: rerun the `npm install vite`
+   → real `vite.js` trace from where item 3 left off before this session,
+   see what (if anything) breaks next.
 
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over

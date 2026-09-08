@@ -16,6 +16,7 @@ import { createUrlModule } from "./url";
 import { createVmModule } from "./vm";
 import { createWasiModule } from "./wasi";
 import { createWorkerThreadsModule } from "./worker_threads";
+import type { ThreadContext } from "./worker_threads";
 import pathModule from "./path";
 import utilModule from "./util";
 import type { FsBuiltin } from "./fs";
@@ -108,6 +109,13 @@ const createBuiltinModules = (
   getFsBuiltin: () => FsBuiltin = () => {
     throw new Error("require('wasi')'s WASI class was constructed with no fs builtin wired up");
   },
+  // Per-thread identity/spawn capability for worker_threads - see
+  // ThreadContext's own doc comment (worker_threads.ts) for why this varies
+  // by boot() call site (top-level process worker vs. the nested
+  // workers/workerThreads/worker.ts bootstrap) and defaults to plain
+  // "isMainThread, no spawn capability" for every other caller of this
+  // function (existing behavior, unchanged).
+  threadContext: ThreadContext = {},
 ): Record<string, unknown> => {
   const nodeModules = createNodeModules(process, netContext);
   const EventEmitter = nodeModules.require("events") as new () => { emit(event: string, ...args: unknown[]): boolean };
@@ -149,7 +157,7 @@ const createBuiltinModules = (
     vm: createVmModule(),
     readline: createReadlineModule(EventEmitter),
     perf_hooks: createPerfHooksModule(),
-    worker_threads: createWorkerThreadsModule(),
+    worker_threads: createWorkerThreadsModule(EventEmitter, threadContext),
     wasi: createWasiModule(getFsBuiltin),
   };
 };
