@@ -373,18 +373,16 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here:** item 3 below (Vite dev server) is the active thread and
-stopped at a specific, well-understood point - a real `node:wasi` builtin
-(traced against exactly what `@rolldown/binding-wasm32-wasi`'s own `.wasm`
-file imports, via `WebAssembly.Module.imports()` on the real downloaded
-binary, not a guessed-at preview1 surface), plus likely making
-`worker_threads.Worker` genuinely work. See item 3's own tail for the full
-context - what's already verified working (the whole `execFileSync` +
-`pnpm` shim + `.resolve` chain, live, including a real npm-registry
-install of the WASM binding package) and exactly where `require('node:wasi')`
-fails. Item 6 (`npm exec`/`@npmcli/promise-spawn`) is a separate, lower-
-priority gap - explicitly deprioritized versus item 3 in an earlier
-session's own decision, still true.
+**Pick up here (updated):** `node:wasi` and `worker_threads.Worker` (this
+note's own previous blockers) are both DONE - see item 7 at the very end
+of this file, which is now the active thread. Real Vite's dev server has
+booted successfully at least once via the real rolldown/WASM/WASI
+fallback chain; what's NOT yet confirmed is whether its own guest HTTP
+server actually accepts a preview connection (item 7 has the full
+diagnostic trail and the concrete next step - re-test in a clean browser
+profile). Item 6 (`npm exec`/`@npmcli/promise-spawn`) turned out to be
+the same root cause as item 3's own `sh -c` dispatch work and is also
+DONE - see its own entry below for the full fix.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -1423,6 +1421,91 @@ session's own decision, still true.
    (missing default PATH) → `Cannot find module './dist/index.js' from
    .../node_modules/.bin/create-vite` (symlink realpath) → `TypeError:
    t.copyFileSync is not a function` → real success.
+
+## 7. Real vite dev server actually starts — MAJOR MILESTONE (new session)
+
+Continuing right where item 3 left off, now that scaffolding works: ran
+`npm create vite@latest` → `npm install` → `npm run dev` end-to-end, in
+`examples/playground`, repeatedly, fixing whatever broke next (same method
+as everywhere else in this file). Three more real, previously-unknown
+runtime gaps, each confirmed by getting the dev server further before
+hitting the next one - all found via `dwc.process.spawn()`'s own stdout/
+stderr, decoded from `window.__fullLog` chunks the way earlier debugging
+in this file used direct diagnostics (huge single console.log calls choke
+an automated console reader - the terminal's xterm DOM also only ever
+holds the visible viewport, not full scrollback, so neither was usable for
+a 40-150MB error dump on its own):
+
+1. **`readdirSync` ignored `{ withFileTypes: true }` entirely**, always
+   returning bare filename strings - real Vite's own filesystem walk calls
+   `readdir(dir, { withFileTypes: true })` then `dirent.isSymbolicLink()`
+   on each entry, crashing on startup with "dirent.isSymbolicLink is not a
+   function" (a string has no such method). Fixed via `lstat` per entry
+   (no cheaper way to get a type from one `readdir` round-trip in this
+   VFS); threaded through the sync, callback, and `fs/promises` forms.
+2. **`crypto.hash()` didn't exist** - real rolldown/vite's own `getHash()`
+   helper calls this synchronous one-shot form directly (not
+   `createHash().update().digest()`) to fingerprint a module's source for
+   its dependency-optimizer cache. Added as a thin wrapper over the
+   already-real `createHash`.
+3. **`fs.watch()` didn't exist at all** - real Vite's own config/dependency
+   watcher (chokidar's fallback `createFsWatchInstance`) calls it at
+   *startup*, not only for live-reload. This VFS has no push-based change-
+   notification mechanism (every fs op is a synchronous request/response
+   round-trip), so the implementation deliberately doesn't detect real
+   changes - same "exists and is callable, doesn't fake infrastructure
+   this runtime doesn't have" precedent as `vm.runInNewContext`/
+   `worker_threads.Worker` elsewhere. Real hot-reload-on-change remains
+   the separately-tracked open design question (item 4 above).
+
+All three: unit tested, `tsc --noEmit` clean, committed, pushed.
+
+**After all three: real Vite's dev server, backed by the real rolldown
+WASM/WASI fallback chain (item 3's own `execFileSync`+pnpm-shim+WASI
+work), successfully printed its own real startup banner and reached the
+point of calling `dwc.preview.enable()` - i.e. it actually started.** This
+is the first time in this project's history a real, unmodified `npm run
+dev` (Vite, via rolldown) has booted successfully inside the sandbox, not
+just resolved its dependency graph or gotten past an import error.
+
+**What's NOT yet confirmed: whether the guest server actually accepted a
+connection.** The preview iframe (and a plain direct `fetch()` to the same
+`__dwc_preview__` URL, same result) showed `dwc preview relay error: ...
+nothing is listening on port 5173` - the exact same failure mode section 0
+above investigated at length for the docs site's own Playground demo, and
+concluded (there, independently reconfirmed by another session's 23/23
+clean retest) was a Service-Worker/browser-profile-state artifact from
+repeated test churn, not a code defect. This session's own test tab had
+already undergone several reloads and one memory-pressure crash (from
+buffering ~150MB of decoded error text into a plain JS array while
+debugging bug #1 above - don't do that; read `window.__fullLog` in small
+slices instead) by the time this specific run happened, so the same
+profile-state explanation is the leading one here too, but this specific
+combination (npm's own child-process spawn chain → real vite → real
+rolldown-over-WASI → the preview relay) has NOT been separately re-tested
+in a clean profile the way the docs-site case was. That is the concrete
+next step - not assumed, since this is a materially different call path
+than the docs site's.
+
+**If picking this up:** re-run the same `npm create vite` → `npm install`
+→ `npm run dev` cycle in a genuinely fresh Chrome profile/incognito
+window (each full cycle takes several real minutes - two real npm-registry
+installs, one of them the WASM binding package). Watch for the literal
+`Local:` string in stdout (confirms Vite's real ready banner was actually
+printed - it did appear in the one successful run so far) and then check whether the
+preview iframe actually renders the guest server's page. If it does, this
+whole thread (items 1, 2, 3, 7) is complete: real npm install, real npm
+create, and a real running Vite dev server previewed live, all working
+end-to-end for the first time. If the "nothing is listening" error
+reproduces there too, that upgrades it from "probably a testing artifact"
+to "a real bug in this specific call path" and warrants the same kind of
+direct-fetch-vs-SW-relay diagnostic section 0 used (expose the `dwc`
+instance, call `dwc.preview.fetch(port, path)` directly to check whether
+the *kernel* thinks something is listening, independent of the Service
+Worker relay - that's the fastest way to tell which side is actually
+wrong). HMR (item 4) is still a wholly separate, unstarted question even
+once this is resolved - what's being verified here is a working `vite
+dev`, not live-reload-on-edit.
 
 ## Reminder: no AI attribution in commits
 
