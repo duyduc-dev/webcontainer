@@ -8,6 +8,7 @@
 // (the event loop's close phase / liveness ref-unref, and later the kernel's
 // cross-process relay) that a module-load-time singleton can't carry.
 
+import { createBlockListBindings } from "./bindings/blockList";
 import { createBufferBinding } from "./bindings/buffer";
 import { createChildProcessBindings } from "./bindings/childProcess";
 import type { ChildProcessBindingContext } from "./bindings/childProcess";
@@ -48,6 +49,7 @@ const createInternalBinding = (context: InternalBindingContext): ((name: string)
 
   const bindings: Record<string, unknown> = {
     buffer: createBufferBinding(),
+    block_list: createBlockListBindings(),
     tcp_wrap: net.tcp_wrap,
     stream_wrap: net.stream_wrap,
     uv: net.uv,

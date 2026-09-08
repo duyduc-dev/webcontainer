@@ -962,26 +962,51 @@ session's own decision, still true.
    about, now confirmed working end-to-end with the real artifact, not
    a synthetic test.
 
-   **Where it stops now**: `Error: internalBinding('block_list') is not
-   implemented yet`, from `net.js`'s own lazy `get BlockList()` accessor
-   (something in vite/rolldown's real dependency chain touches
-   `net.BlockList`, not yet identified exactly what or why). Unlike
-   every fix in this list, `net.BlockList`'s native half
-   (`internalBinding('block_list')`) has no vendor-and-adapt path
-   available - real Node's own implementation is a genuine native
-   binding doing real IP/CIDR range matching, not pure JS callable
-   through some existing bridge (`internal/blocklist.js` is already
-   vendored verbatim, sitting ready, exactly like `internal/
-   socketaddress.js` - both are waiting on this same native half).
-   Comparable in size to the zlib decoder or HTTP wire-format work
-   earlier in this project - a real, separate undertaking, not a quick
-   stub, and not yet started. Not yet determined whether `vite --version`
-   specifically needs real BlockList *behavior* or just needs the
-   property access itself to not throw (worth checking with a minimal
-   stub FIRST - a `BlockList` class whose methods all honestly no-op/
-   return "not blocked" - before committing to real IP-matching logic
-   nothing has confirmed is actually exercised yet). The next concrete
-   step for whoever picks this up.
+   **`internalBinding('block_list')` — DONE, committed.** Real
+   `net.BlockList`'s native half doing real IP/CIDR range matching, from
+   scratch (no vendor-and-adapt shortcut exists for a genuine native
+   binding the way there does for pure-JS builtins) - new
+   `bindings/blockList.ts`, wired into `internalBinding.ts`'s registry.
+   Scoped to exactly the 8 members `internal/blocklist.js`/`internal/
+   socketaddress.js` (both already vendored verbatim, sitting unused
+   until now) actually destructure: `SocketAddress`, `AF_INET`,
+   `AF_INET6`, and `BlockList`'s `addAddress`/`addRange`/`addSubnet`/
+   `check`/`getRules`. IPv4/IPv6 text parsing and RFC-5952-canonical
+   formatting were NOT reimplemented - `bindings/ip.ts` already had real,
+   tested versions (built earlier for `cares_wrap`/DNS), reused as-is;
+   the only new logic is address/range/subnet storage, byte-level
+   comparison, and rule-string formatting.
+
+   Verified against **real Node directly** (`node -e "..."`, not just
+   documentation), matching the "gated against real Node, rule for rule
+   and answer for answer" approach `blocklist.js`'s own vendoring comment
+   had aspired to but never actually built: rule string formats
+   (`"Address: IPv4 x"` / `"Range: IPv4 x-y"` / `"Subnet: IPv4 x/y"`,
+   IPv6 equivalents), `getRules()` returning most-recently-added first
+   (not insertion order - a real, easy-to-miss detail confirmed by
+   direct comparison), `check()`'s exact-family-match requirement, and
+   IPv6 canonicalization specifics (only the well-known `::ffff:0:0/96`
+   prefix keeps a dotted-quad tail - a *different* embedded-IPv4 form,
+   e.g. a NAT64 `64:ff9b::/96` address, renders as plain hex groups
+   instead, confirmed by direct comparison rather than assumed). 13 new
+   unit tests encode these real-Node-verified vectors directly.
+
+   **Verified live**: the real `npm install vite` → real `vite.js`
+   trace no longer hits `block_list` at all - it now runs further and
+   hits a completely different, unrelated gap (`internal/file` isn't
+   vendored - see below), confirming this fix is real and complete for
+   whatever vite/rolldown's own dependency chain actually needed from
+   `net.BlockList`.
+
+   **Where it stops now**: `Error: no vendored Node builtin
+   'internal/file'`, from a lazy `get File()` accessor (presumably
+   `buffer.js`'s own exposure of the Web `File` API, alongside the
+   already-vendored `Blob` - not yet confirmed). Not yet investigated -
+   likely a smaller, more ordinary vendoring gap than `block_list` was
+   (real Node's own `internal/file.js` is pure JS, no native binding
+   involved, similar in shape to the already-vendored `internal/blob.js`),
+   but not yet confirmed. The next concrete step for whoever picks this
+   up.
 
 4. **HMR (hot module reload) — a real, unresolved design question, not
    just an implementation gap.** Vite's dev server pushes HMR updates over
