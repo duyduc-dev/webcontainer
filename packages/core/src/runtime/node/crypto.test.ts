@@ -17,6 +17,7 @@ const requireCrypto = () => {
   const { require } = createNodeModules(fakeProcess());
   return require("crypto") as {
     createHash(algorithm: string): HashLike;
+    hash(algorithm: string, data: string, outputEncoding?: string): string;
     createHmac(algorithm: string, key: string): HashLike;
     randomBytes(size: number, callback?: (err: Error | null, buf: unknown) => void): { length: number } | undefined;
     randomUUID(): string;
@@ -72,6 +73,18 @@ describe("vendored 'crypto' (pure-JS hash/hmac/random subset)", () => {
       length: number;
     };
     expect(digest.length).toBe(32);
+  });
+
+  // Traced need: real rolldown/vite's own getHash() helper calls this
+  // synchronous one-shot form directly (not createHash().update().digest())
+  // to fingerprint a module's source for its dependency-optimizer cache -
+  // found live running a real installed vite.js dev server, which crashed
+  // on startup with "crypto.hash is not a function" since only the older
+  // createHash()-based API existed here.
+  it("hash() matches createHash().update().digest() for the same input, and defaults to hex encoding", () => {
+    const crypto = requireCrypto();
+    expect(crypto.hash("sha256", "abc")).toBe(crypto.createHash("sha256").update("abc").digest("hex"));
+    expect(crypto.hash("sha256", "abc", "base64")).toBe(crypto.createHash("sha256").update("abc").digest("base64"));
   });
 
   it("throws a clear error for an unsupported digest", () => {

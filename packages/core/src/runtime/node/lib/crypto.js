@@ -307,6 +307,16 @@ export default function (exports, require, module, process, internalBinding, pri
   }
 
   const createHash = (algorithm) => new Hash(algorithm);
+
+  // Real Node's crypto.hash(algorithm, data[, outputEncoding='hex']) - a
+  // synchronous one-shot convenience wrapper real Node documents as
+  // equivalent to createHash(algorithm).update(data).digest(outputEncoding),
+  // just without allocating a Hash object for one-off use. Traced need: real
+  // rolldown/vite's own getHash() helper (used to fingerprint a module's own
+  // ESM source for its dependency-optimizer cache) calls this directly
+  // instead of the older createHash()-based form - confirmed live, crashed
+  // real vite's dev server on startup with "crypto.hash is not a function".
+  const hash = (algorithm, data, outputEncoding = "hex") => new Hash(algorithm).update(data).digest(outputEncoding);
   const createHmac = (algorithm, key) => new Hmac(algorithm, key);
 
   const randomBytes = (size, callback) => {
@@ -372,5 +382,5 @@ export default function (exports, require, module, process, internalBinding, pri
   // wrapper just above.
   const getRandomValues = crypto.getRandomValues.bind(crypto);
 
-  module.exports = { createHash, createHmac, randomBytes, randomInt, randomUUID, getRandomValues, getHashes, Hash, Hmac };
+  module.exports = { createHash, hash, createHmac, randomBytes, randomInt, randomUUID, getRandomValues, getHashes, Hash, Hmac };
 }
