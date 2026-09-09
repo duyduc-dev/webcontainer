@@ -353,23 +353,9 @@ const unwrapTimerHandle = (handle: unknown): number =>
   typeof handle === "object" && handle !== null ? (handle as TimerHandle).id : (handle as number);
 
 // Captured before boot()'s own Object.assign(self, {MessageChannel: ...})
-// below can shadow them - same "grab the real one before any override
-// exists" precaution as eventLoop.ts's own nativeSetTimeout/
-// nativeMessageChannel. Deliberately real, untracked host timers (NOT
-// eventLoop.setTimeout) - see wrapRefPort's own doc comment for why.
-// Typed explicitly as the Worker/DOM shape (a bare number handle) - ambient
-// @types/node's own global setTimeout()/clearTimeout() declarations
-// otherwise win inference here (returning NodeJS.Timeout), even though
-// this is a real browser Worker's own setTimeout, not Node's.
-const nativeSetTimeout: (handler: () => void, timeout?: number) => number = globalThis.setTimeout.bind(globalThis);
-const nativeClearTimeout: (handle: number) => void = globalThis.clearTimeout.bind(globalThis);
+// below can shadow it - same "grab the real one before any override
+// exists" precaution as eventLoop.ts's own nativeMessageChannel.
 const nativeMessageChannel = globalThis.MessageChannel;
-
-// Picked, not measured - same disclaimer as worker_threads.ts's own
-// UNREF_DEBOUNCE_MS. Short on purpose: this coalesces a hot ref()/unref()
-// cycle into far fewer real eventLoop transitions without meaningfully
-// extending a genuinely-finished async call's lifetime.
-const REF_PORT_DEBOUNCE_MS = 100;
 
 /** Adds real, ref-counted .ref()/.unref() to a real, native MessagePort,
  * wired into this worker's own eventLoop - mirrors bindings/net.ts's TCP/
@@ -384,40 +370,31 @@ const REF_PORT_DEBOUNCE_MS = 100;
  * here was a silently-swallowed no-op (`if (port.ref) ...`), invisible to
  * drain()'s own hasPendingWork() check. See PROGRESS.md's own
  * investigation for the full trace, including two prior live attempts
- * that both froze the browser tab's own renderer (a naive 1:1 wire-up,
- * then this debounced version too, at a different point) - THIS COPY IS
- * BEING RE-APPLIED SPECIFICALLY TO TEST IN ISOLATION, not against the
- * live end-to-end demo again, per that investigation's own documented
- * next step. Do not run the full npm-create-vite pipeline against this
- * without first confirming a small, standalone repro doesn't freeze.
+ * (a naive 1:1 wire-up, then a debounced version) that both froze the
+ * browser tab at different points, neither one root-caused.
  *
- * Debounced (REF_PORT_DEBOUNCE_MS, via a real, untracked host timer - NOT
- * eventLoop.setTimeout, which would itself call wake() on every single
- * unref() and reintroduce a similar problem one level down): `.ref()`
- * cancels any pending release and re-refs immediately if not already
- * ref'd; `.unref()` starts (or leaves running) a debounce window that
- * only calls eventLoop.unref() once it fires with no intervening
- * `.ref()` - same shape as worker_threads.ts's own UNREF_DEBOUNCE_MS. */
+ * This version drops the debounce entirely and wires ref()/unref()
+ * directly to eventLoop.ref()/unref(), immediate and unconditional -
+ * matching (as closely as this codebase's own eventLoop shape allows) the
+ * proven-working approach in Vivari (~/workspace/duck/vivari's
+ * @vivari/core, a real published WebContainer implementation that hit
+ * this exact bug against this exact library - see its own
+ * packages/runtime/node/lib/worker_threads.js, patchMessagePortPrototype)
+ * - no debounce timer, no coalescing, just a direct counter update on
+ * every call, same as real Node's own MessagePort.ref()/unref() are
+ * themselves just bookkeeping with no side effect beyond the count. */
 const wrapRefPort = (port: MessagePort, eventLoop: ReturnType<typeof createEventLoop>): MessagePort => {
   let refed = false;
-  let releaseTimer: number | undefined;
   const anyPort = port as MessagePort & { ref?: () => void; unref?: () => void };
   anyPort.ref = () => {
-    if (releaseTimer !== undefined) {
-      nativeClearTimeout(releaseTimer);
-      releaseTimer = undefined;
-    }
     if (refed) return;
     refed = true;
     eventLoop.ref();
   };
   anyPort.unref = () => {
-    if (!refed || releaseTimer !== undefined) return;
-    releaseTimer = nativeSetTimeout(() => {
-      releaseTimer = undefined;
-      refed = false;
-      eventLoop.unref();
-    }, REF_PORT_DEBOUNCE_MS);
+    if (!refed) return;
+    refed = false;
+    eventLoop.unref();
   };
   return port;
 };

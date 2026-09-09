@@ -373,26 +373,34 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated):** item 7's own "browser-profile-artifact" theory
-for the `npm run dev` preview failure is now DISPROVEN and fully root-
-caused - **read item 8's own "TL;DR for whoever picks this up next" at
-the very end of this file first**, it's written specifically for
-continuing on a fresh device/session. Short version: a real native
-rolldown plugin (`builtin:oxc-runtime`) makes an async call into Rust/WASM
-during vite's startup that never resolves, because the native code's
-"keep me alive" signal (`MessagePort.ref()`/`.unref()`, a real Node.js
-API) was a silent no-op in this runtime's `MessageChannel`. **Two fix
-attempts (a naive 1:1 wire-up, then a debounced version) both froze the
-browser tab solid on live end-to-end tests, at two different points.**
-Both reverted. A follow-up isolated stress test of the override alone
-(no vite/rolldown involved) ran clean with zero issues, narrowing the
-problem to something in the override's interaction with the real
-pipeline specifically. **The debounced fix is currently re-applied in the
-tree (check `git log`/`git status` on `eventLoop.ts`, `builtins/
-worker_threads.ts`, `workers/process/worker.ts`) but has only been
-isolated-tested, not re-verified against the real end-to-end demo since -
-do not assume it works.** Item 8 has the complete diagnostic trail, both
-fix attempts, the isolated-test result, and the concrete next steps.
+**Pick up here (updated, latest session): the `npm run dev` hang's REAL
+root cause is found and fixed — `resolveId()` now genuinely returns.**
+Read item 8's "FINAL ROOT CAUSE — found and fixed" subsection at the very
+end of this file first. Short version: it was never really about
+ref-counting/keep-alive at all (that theory, and both fix attempts under
+it, are now superseded, though the direct/non-debounced ref-count rewrite
+they left behind in `workers/process/worker.ts` is still a real
+improvement, kept). The actual bug: `workers/workerThreads/worker.ts`'s
+own `parentPort.postMessage()` called the *live* `self.postMessage`
+reference instead of one captured before any guest code could run — real
+`@napi-rs/wasm-runtime`'s own `wasi-worker.mjs` legitimately overrides
+`globalThis.postMessage` to forward to `parentPort.postMessage`, and once
+that landed, the next call to `self.postMessage` recursed forever
+(`self.postMessage` → guest's wrapper → `parentPort.postMessage` → same
+`self.postMessage` → …) — a silent, unrecoverable hang with no error, on
+the exact call path this whole investigation was chasing. Fixed by
+capturing `nativePostMessage` at module load (same pattern as this file's
+own `nativeSetTimeout`/`nativeMessageChannel` precedents). **Verified
+live, twice**, with heavy diagnostic instrumentation (see item 8): the
+native `resolveId()` call that had NEVER once returned across the entire
+multi-session investigation now completes cleanly, the WASI worker's
+`handle()` returns, multiple worker threads spin up and complete
+correctly. Real Vite then gets past `buildStart()`/`resolveId()` entirely
+and into genuine dependency-scan logic — where it hits a **new, much
+smaller, unrelated** bug (`TypeError: Expected pattern to be a
+non-empty string` in `picomatch`, during Vite's own dependency
+pre-bundling scan) - see item 8's own final section for exactly where
+this was left off and the concrete next step.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -1825,13 +1833,282 @@ narrower than before, but still not pinned down.
 
 **Current repo state:** the debounced fix (attempt 2, plus the
 independent `nativeMessageChannel`-capture correctness fixes) was
-re-applied after the isolated test passed, and is either committed or
-sitting in the working tree as of this writing — check `git log`/`git
-status` on `eventLoop.ts`, `builtins/worker_threads.ts`, and
-`workers/process/worker.ts` to see exactly which. **It has NOT been
-re-verified against the real end-to-end demo since the isolated test was
-added.** Treat it as "passed a stress test in isolation, unknown against
-the real pipeline" — not as fixed.
+re-applied after the isolated test passed, and is committed as `c659c31`.
+
+**Follow-up session: re-verified live against the real end-to-end demo —
+confirmed NOT sufficient, and found a new, more precise failure signature.**
+Rebuilt `@dwc/core` (dist was stale relative to `c659c31`), then drove the
+real `examples/playground` demo (`npm create vite` → `npm install` → `npm
+run dev`) with a Playwright script polling tab responsiveness every 10s via
+`document.readyState`, per this doc's own prior recommendation.
+
+Result: `npm create vite` (exit 0) and `npm install` (exit 0, `added 13
+packages in 1m`) both succeeded exactly as before. `npm run dev` printed
+`[rolldown] Downloading @rolldown/binding-wasm32-wasi@1.2.7 on
+WebContainer...` and then **nothing further, ever** — no `Local:` banner,
+no error, no exit — reproducing the exact same stall as the pre-fix
+baseline (section 7's "execFileSync"-area freeze location). The debounced
+`MessageChannel` fix does not unstick this.
+
+**New signal, not previously observed:** this time the tab's main thread
+never froze — `document.readyState` polling kept succeeding instantly for
+16+ minutes straight. Direct OS-level process inspection (`ps`/`top -H` on
+the Chromium renderer process) told the real story: the main render thread
+sat at 0% CPU the entire time, while **one Dedicated Worker thread was
+pinned at ~100% CPU continuously for the full 16+ minutes**, accumulating
+CPU time linearly with zero forward progress in the demo's own output.
+This is a real, live-observed **livelock confined to a background worker**
+— not a deadlock, not a frozen tab, not insufficient patience, and (since
+the port-5173 "nothing is listening" symptom was never even reached this
+time — the hang is upstream of vite's real bind) not the same failure mode
+as section 7's original "browser-profile artifact" concern either.
+
+This matches, and now directly confirms with process-level evidence, the
+"livelock, not deadlock" theory from Attempt 1's postmortem above (a
+ref/unref toggle loop turning what used to be a harmless no-op into a real
+wake-and-recheck cycle that never settles) — it just surfaces as a pinned
+worker thread instead of a fully frozen tab this time, which is why the
+tab-freeze-detection method this doc previously relied on (polling
+`document.readyset`/`javascript_exec` responsiveness) did NOT catch it as
+a freeze at all. **A responsiveness poll on the main thread is not a
+reliable signal for this bug** — future verification needs to check OS-level
+CPU usage per-thread (`ps -o pid,time,%cpu` / `top -H -p <renderer-pid>`
+inside the browser's own renderer process), not just tab responsiveness.
+
+**Not yet done:** identifying exactly which loop is spinning inside that
+pinned worker thread (the debounced `wrapRefPort`'s own timer logic in
+`worker_threads.ts`, `@emnapi/core`'s JS-emulated async-work polling, or
+something else in the rolldown/WASI chain) — no JS-level stack sample was
+taken of the pinned thread before killing it. That's the concrete next
+step: reproduce again, then attempt to get a CPU profile of the pinned
+Dedicated Worker specifically (e.g. via the CDP `Profiler` domain against
+that worker's own target, if Playwright/CDP can address a nested worker
+directly) rather than guessing from the mechanism alone.
+
+**Immediate re-run, same session: reproduced again, faster, with a finer-
+grained CPU pattern than the first observation — profiling attempt blocked
+by tooling, not yet by design.** Re-ran the same demo a second time,
+this time watching OS-level per-thread CPU (`top -H -p <renderer-pid>`)
+from the very start via a Monitor loop, instead of only noticing it after
+16 minutes.
+
+- **The livelock this time started ~21 seconds after the "Downloading..."
+  line** (much faster than needing 16 minutes to notice) - a Dedicated
+  Worker thread pinned at 93-100% CPU. Unlike the first observation
+  (flat 100% for the entire 16+ minutes straight), this run's CPU pattern
+  **oscillated**: a continuous ~4-minute hot stretch, a few-second cool
+  dip, hot again, repeating - not a perfectly flat spin, but a real,
+  sustained one all the same. **Zero new stdout/stderr appeared for the
+  entire ~15.5 minutes this run was allowed to continue** (confirmed via
+  the same `[out]`-tailing log used throughout this investigation) -
+  ruling out the alternative read that the CPU burst was just legitimate
+  slow-but-working install activity (real npm install of these packages
+  was independently confirmed fast - "seconds" - in isolation per
+  diagnostic #5 above; a real, if slower, install would also eventually
+  print *something*, which never happened here either run).
+- **Attempted to get an actual JS/native stack sample of the pinned
+  thread, blocked by environment tooling, not a design limitation of the
+  approach itself**: `perf` is not installed in this environment;
+  `strace -p <tid>` is present but refused with `ptrace(PTRACE_SEIZE):
+  Operation not permitted` (`/proc/sys/kernel/yama/ptrace_scope` = 1,
+  same-uid attach still restricted here); `/proc/<tid>/stack` and
+  `/proc/<tid>/syscall` both `Permission denied`. What WAS confirmed via
+  `/proc/<tid>/status`/`wchan`: the thread's state is `R` (running, not
+  blocked) with `wchan: 0` (not parked in a kernel wait) - i.e., this is
+  definitely genuine userspace CPU-bound spinning, not a thread blocked
+  on a syscall/futex that merely *looks* busy in `ps`. That's consistent
+  with (though doesn't yet prove) the "livelock via a JS-level loop"
+  theory over any kind of native-side blocking wait.
+- **Also ruled out, by reading the source directly**: the two other
+  `new MessageChannel()` call sites in this codebase
+  (`workers/kernel/processClient.ts` lines ~173 and ~210, backing the
+  sync-fs channel grant and the sync-exec channel respectively) are NOT
+  affected by `worker.ts`'s debounced global-`MessageChannel` override -
+  they run inside the **kernel worker**, a separate bundled worker
+  script that never calls the **process worker's** own `boot()` (the
+  only place `Object.assign(self, {MessageChannel: ...})` happens). So
+  the debounced override provably cannot be the direct cause of whatever
+  is spinning during the execFileSync/pnpm-install window specifically -
+  at this point in the flow, nothing has yet `require()`d
+  `@napi-rs/wasm-runtime`/`@emnapi/core` (the ONLY real caller of the
+  wrapped global `MessageChannel`), so that code path isn't even reached
+  yet. This narrows, but does not yet resolve, the open question: same
+  hang location as this doc's own "Attempt 2" already recorded, still
+  unexplained, still correlated with the fix's mere presence in the
+  built bundle for reasons not yet identified (memory/timing perturbation
+  from the larger bundle? something else in the execFileSync/kernel-side
+  `runProgramToCompletion` path entirely unrelated to `MessageChannel`?
+  not yet distinguished).
+
+**Concrete next step, more specific than before:** get root/CAP_SYS_PTRACE
+(or run inside a container/VM where `ptrace_scope` can be relaxed, or
+`perf_event_paranoid` allows a non-root profile) so `strace`/`perf` can
+actually sample the pinned thread - or, alternatively, pursue the CDP
+`Profiler.start()`/`.stop()` route directly against the specific worker's
+own DevTools target (requires talking raw CDP, since Chromium was
+launched with `--remote-debugging-pipe` rather than a discoverable
+`--remote-debugging-port`, and Playwright's own high-level `Worker`
+object has no built-in CPU-profile method) - either would finally show
+the actual function/loop responsible instead of continuing to infer it
+from process-level CPU/thread-state evidence alone.
+
+### Follow-up session: ported a real fix from a sibling implementation, confirmed it doesn't touch THIS hang, then found what looks like the actual root cause
+
+**Found a real, production WebContainer implementation
+(`~/workspace/duck/vivari`, `@vivari/core` - a separate project on this
+same machine, an open-source WebContainer this project's own kernel/
+worker/preview design was modeled on from the start) that hit this EXACT
+bug already**, against this exact library. Its
+`packages/runtime/node/lib/worker_threads.js` has a comment describing
+our symptom almost word for word: *"rolldown's wasm binding
+(@napi-rs/wasm-runtime, via Vite 8) spawns its wasi worker, hands it a
+channel, and awaits the reply. The reply was on its way; the process was
+not there to receive it."* Its fix: no debounce at all - `port.ref()`/
+`.unref()` wired directly and immediately to its event loop's real
+hold-counter, plus a `duringInternalSetup` guard so the runtime's OWN
+internal plumbing ports never accidentally count as a guest hold (their
+own postmortem: a naive full replacement "held a guest loop open on a
+port the guest had never heard of: every worker spawn hung, one layer
+below anything a guest could see" - this project's own two prior
+freezes, at two different points, are at least superficially the same
+SHAPE of bug).
+
+**Ported the direct-wiring half of this** (`workers/process/
+worker.ts`'s `wrapRefPort`): dropped `REF_PORT_DEBOUNCE_MS`/the release
+timer entirely, `.ref()`/`.unref()` now call `eventLoop.ref()`/`unref()`
+immediately and unconditionally, matching Vivari's own proven-live
+shape as closely as this codebase's own `eventLoop` allows. (The
+`duringInternalSetup`-style guard was NOT ported - see below for why a
+project-wide source read showed it doesn't apply verbatim here.)
+Typechecked clean, all 584 tests still passing, rebuilt.
+
+**Before re-testing live, worked out that this fix cannot be what's
+causing the CURRENT observed hang, and confirmed it by testing anyway.**
+`workers/process/syncExecClient.ts`'s `callSyncExec` blocks via a real
+`Atomics.wait` (not a busy spin) - so the calling (vite) process
+worker is genuinely, harmlessly parked while the kernel runs the pnpm
+install. And @emnapi/core's own ref/unref-based keep-alive signal is
+only reachable AFTER something `require()`s the downloaded WASM
+binding - which hasn't happened yet at the "Downloading..." point where
+this session's stall occurs. So whatever hangs here cannot be the
+ref/unref mechanism this fix targets at all. Re-ran the full live demo
+anyway to confirm empirically rather than rely on the reasoning alone:
+**same result as before the fix** - stall at the same point, same
+oscillating-hot-then-idle CPU pattern on one Dedicated Worker thread
+(started ~90s in this time, ran continuously hot for ~2m10s, then a
+brief idle blip, hot again - not periodic, no forward progress in
+output). Confirms: **this specific fix is a real improvement (worth
+keeping, matches a proven design) but does not fix the currently-
+observed stall.**
+
+Also confirmed by direct source read, not just reasoning: the OTHER two
+`new MessageChannel()` call sites in this codebase
+(`workers/kernel/processClient.ts`, backing the sync-fs and sync-exec
+channel grants) run in the **kernel worker**, a separate bundled script
+that never calls the **process worker's** own `boot()` - the only place
+the wrapped global override is installed. So Vivari's specific
+"internal plumbing port counted as a guest hold" hazard doesn't have an
+obvious matching instance in this codebase's `MessageChannel` usage
+specifically (this project's own internal worker-to-worker plumbing for
+`worker_threads.Worker` uses a real `Worker` object directly, not a
+`MessageChannel`/`MessagePort` pair the way Vivari's design does - a
+different architecture that doesn't share this exact contamination
+path, though it may have its own, not yet identified).
+
+**Then, guided by "if it's not the ref/unref mechanism, what IS active
+at this exact point," built a fast isolated test and found what looks
+like the real root cause: installing into a directory with NO
+`package.json` throws a real npm error in this runtime, always, and
+real rolldown's own fallback code does exactly that.**
+
+Built a minimal test page (`main.isolated-test.ts` + `isolated-test.html`,
+temporary, not committed, since deleted) that boots dwc, loads vendored
+npm, and calls ONLY `execFileSync('pnpm', ['i',
+'@rolldown/binding-wasm32-wasi'])` - no vite, no create-vite, nothing
+concurrent. Result, run twice for reproducibility: **not a hang** -
+fails FAST (2.2-4.6s) both times with `npm error Tracker "idealTree"
+already exists`, a real npm/npmlog internal error (calling
+`log.newGroup('idealTree')` a second time before the first is closed).
+
+Narrowed further, each a fresh isolated run:
+- **Not pnpm-shim-specific**: calling `execFileSync('npm', ['install',
+  ...])` directly (bypassing `/bin/pnpm.js` entirely) fails the exact
+  same way.
+- **Not package-specific**: swapping the target package for `left-pad`
+  (this project's own very first, most-exercised install target,
+  verified working correctly dozens of times across this whole project's
+  history) fails the SAME way, with the SAME error.
+- **Not execFileSync/sync-exec-bridge-specific**: the NORMAL async
+  `dwc.process.spawn("/bin/npm.js", {argv: ["install", "left-pad", ...]})`
+  path (used successfully throughout this entire project) ALSO fails
+  the same way, given the same conditions.
+- **The actual distinguishing variable, found by elimination**: `cwd`.
+  Installing `left-pad` into `/proj` (a directory this test pre-created
+  with a minimal `package.json`) **succeeds cleanly, exit 0** - identical
+  command, identical package, only the cwd's own contents differ (a
+  `package.json` present vs. absent).
+- **Confirmed this is NOT how real, host-machine npm behaves**: the
+  exact same command (`npm install left-pad --no-save --no-audit
+  --no-fund --loglevel=warn`), run for real via this session's own
+  shell in a genuinely empty, package.json-less scratch directory on
+  the actual host machine (`npm 11.9.0`/`node v24.14.0`, both real,
+  unrelated to this sandbox) - `added 1 package in 2s`, exit 0, no error
+  at all. **This project's own runtime is the only place this specific
+  scenario throws** - a real, previously-undiscovered gap, not
+  documented real npm behavior this runtime happens to be faithfully
+  reproducing.
+- **Confirmed real rolldown's own fallback code hits exactly this
+  scenario, every time, by design**: read the actual fallback source
+  directly (`npm pack rolldown@1.2.7` on the host,
+  `dist/shared/binding-*.mjs`'s `require_webcontainer_fallback`) -
+  `baseDir` is a freshly `mkdirSync(..., {recursive:true})`'d directory
+  (`/tmp/rolldown-<version>`) with **no package.json ever written to
+  it**, and `execFileSync("pnpm", ["i", bindingPkg], {cwd: baseDir,
+  stdio: "inherit"})` is called completely unguarded - **no try/catch
+  anywhere around it**. This is a precise, exact match for the
+  bug just isolated.
+
+**CORRECTION, same session, immediately after writing the above: this
+was a red herring - narrowed further and retracted as the root-cause
+candidate.** The very next isolated test filled in a missing control
+that the reasoning above skipped past: a real, non-root, package.json-
+less directory (`/emptydir`, freshly `mkdir`'d, nothing else touched
+it) - **installs cleanly, exit 0, no error at all.** So "no
+`package.json`" was never the actual distinguishing variable; the
+original failing test happened to use `cwd: "/"` (the literal VFS
+root) specifically, and root-ness, not package.json presence, is what
+triggers it. Tested this precisely: `cwd:
+"/tmp/rolldown-1.2.7"` - **exactly** the `baseDir` real rolldown's own
+fallback source computes (`` `/tmp/rolldown-${version}` ``, confirmed
+directly from `npm pack rolldown@1.2.7`'s actual source, same file
+already read above) - **also installs cleanly, exit 0.**
+
+**So this bug is real (installing at the literal VFS root throws `npm
+error Tracker "idealTree" already exists`, confirmed not to be genuine
+npm behavior - real npm 10.9.2 as a genuine separate host process,
+AND even the same "require npm-cli.js in-process with mutated argv"
+technique run in plain host Node with no sandbox at all, both handle a
+root-equivalent package.json-less cwd fine) - but it is NOT what real
+rolldown's own fallback code would ever hit, since rolldown never
+installs at the literal root. It's a separate, narrower, genuinely
+worth-fixing gap (something in this runtime's own VFS/fs emulation
+behaves differently at the root path specifically vs. any other
+directory, in a way that trips npm's own per-process idealTree tracker
+bookkeeping) - but chasing it further is NOT the way to unblock the
+vite/rolldown investigation. Retracting the "leading root-cause
+candidate" claim and the priority-ordered next-steps list that followed
+it in the same session - they were reasoning from an incomplete control
+group (root vs. non-root was never actually isolated from
+has-package.json vs. doesn't) and turned out to point at the wrong
+thing once that gap was closed.
+
+**Where this actually leaves item 8:** back to the CPU-pinned-worker-
+thread / livelock evidence from earlier in this session (the
+`ptrace`/`perf`-permission-blocked profiling attempt) as the genuine
+next lead - see "Concrete next steps" further up this section for that.
+The VFS-root npm bug is worth a note for whoever eventually works on
+general npm/VFS-root robustness, but it's off the critical path for
+`npm run dev`'s own hang specifically.
 
 ### Concrete next steps, in order
 
@@ -1927,6 +2204,202 @@ re-discovering)
   frozen or unresponsive") is the tell; when it happens, close the tab
   (don't keep retrying against a frozen one) and start a fresh one for
   the next attempt.
+
+### FINAL ROOT CAUSE — found and fixed (latest session, picks up right after the "corrected/retracted VFS-root npm bug" entry above)
+
+**Read this section first if picking this up on a new device — it
+supersedes the ref-counting theory above as the explanation for the
+actual hang, though the ref-counting rewrite itself is a real, separate
+improvement that's still correct and still in the tree.**
+
+**Method: added a real, permanent-for-the-session diagnostic technique -
+patching the REAL, installed dependency files at runtime, not just this
+project's own source** - both `main.ts` (temporarily, since reverted -
+see "how this was found" below for the general technique, reusable any
+time this project's own source isn't the suspect) and, for the real fix,
+`workers/workerThreads/worker.ts` (permanently, the actual bug was here).
+Confirmed the debounced ref/unref fix from the entry above doesn't touch
+the currently-observed hang (reasoned first - `Atomics.wait` in
+`syncExecClient.ts` proves the caller is genuinely, harmlessly blocked,
+and nothing has `require()`'d the WASM binding yet at the "Downloading…"
+point where this session's stall occurred - then confirmed live: same
+stall, same oscillating-CPU pattern, with the fix in place). **Ported
+Vivari's own proven-working direct (non-debounced) ref/unref design
+anyway** (a real, separate sibling WebContainer implementation at
+`~/workspace/duck/vivari` that hit this exact class of bug against this
+exact library before - see its `packages/runtime/node/lib/
+worker_threads.js`) - dropped `REF_PORT_DEBOUNCE_MS` entirely,
+`workers/process/worker.ts`'s `wrapRefPort` now wires `.ref()`/`.unref()`
+straight to `eventLoop.ref()`/`unref()`. Real improvement, kept, but (as
+predicted) doesn't fix the hang below - they're unrelated bugs.
+
+**How this was found: instrumented the REAL execution path directly,
+live, in the actual full pipeline - not guesswork.** Built a reusable
+technique: a `patchRolldownFallback()` helper added temporarily to
+`main.ts` that walks the real, installed dependency tree (`dwc.fs.readdir`
++ `dwc.fs.stat` recursively) and rewrites specific call sites in place
+(`dwc.fs.writeFile` back) with `console.error`-based before/after/catch
+timing markers - then re-runs the real `npm create vite` → `npm install`
+→ `npm run dev` cycle and watches the real timestamps. Three rounds,
+each based on what the previous round proved:
+
+1. **Wrapped `execFileSync("pnpm", …)` itself** (in the real installed
+   `rolldown/dist/shared/binding-*.mjs`) - proved it returns cleanly
+   (confirmed independently too: isolated `execFileSync` tests, with
+   rolldown's own real `cwd` - `/tmp/rolldown-<version>` - always
+   succeeded; the earlier same-session "VFS-root npm bug" finding was
+   real but a red herring, retracted above, since rolldown never
+   actually installs at the VFS root).
+2. **Wrapped the native `resolveId()` dispatch itself**
+   (`return await callablePlugin[key](...args)` inside
+   `makeBuiltinPluginCallable`'s `wrappedHook`, in
+   `rolldown/dist/shared/normalize-string-or-regex-*.mjs`) - confirmed,
+   yet again, that this specific call is where execution stops: "before
+   native call key=resolveId" always printed, "RETURNED" never did,
+   across every attempt up to this point.
+3. **Patched the REAL, freshly-downloaded `wasi-worker.mjs` itself**
+   (a completely separate tree, `/tmp/rolldown-<version>/node_modules/
+   @rolldown/binding-wasm32-wasi/wasi-worker.mjs` - only created by
+   execFileSync mid-run, never reachable by `main.ts`'s own `/my-app`
+   walk, so this needed patching it right after `execFileSync` returns,
+   from within the SAME guest code, using the real `fs`/`baseDir`
+   already in that function's own closure) - wrapped its own
+   `globalThis.onmessage = function (e) { handler.handle(e); };` with
+   before/after logging.
+
+**That third patch showed the real message DID arrive and the listener
+DID attach** (`parentPort.on("message", …)` fired, buffered messages
+flushed correctly) **but nothing downstream of that ever ran again -
+not even a bare, independent, native `Promise.resolve().then(cb)` probe
+registered at that exact point ever fired.** That's the tell: a native
+microtask *always* fires once the current synchronous stack unwinds,
+unless that stack never actually unwinds - meaning something in the
+supposedly-trivial remaining top-level code of `wasi-worker.mjs` (after
+`parentPort.on(...)`, before `globalThis.onmessage = ...`) was
+genuinely, synchronously never returning.
+
+**Root cause, precisely:** `wasi-worker.mjs`'s own top-level code (real,
+unmodified `@napi-rs/wasm-runtime`-generated code) does, in order:
+
+```js
+if (parentPort) {
+  parentPort.on("message", (data) => { globalThis.onmessage({ data }); });
+}
+Object.assign(globalThis, {
+  self: globalThis, require, Worker, importScripts,
+  postMessage: function (msg) { if (parentPort) { parentPort.postMessage(msg); } },
+});
+// ... (trivial setup) ...
+globalThis.onmessage = function (e) { handler.handle(e); };
+```
+
+This `Object.assign` call **legitimately overrides `globalThis.postMessage`**
+(real Node's own `worker_threads` convention: wire a bare top-level
+`postMessage` to `parentPort`, for code written against a Web-Worker-
+shaped API) - a completely normal, expected thing for Node-emulating
+vendored code to do, not a bug in wasi-worker.mjs at all. But this
+project's OWN `workers/workerThreads/worker.ts` (before this fix) had
+`parentPort.postMessage: (value, transferList) => self.postMessage(value,
+transferList ?? [])` - calling the **bare, live** `self.postMessage`
+reference, not one captured before any guest code could run. The instant
+anything calls `self.postMessage(...)` after that `Object.assign` has
+run, it recurses forever: `self.postMessage` (now the guest's own
+wrapper) → `parentPort.postMessage` (this project's own code) →
+`self.postMessage` (the guest's wrapper again, unchanged) → … - a
+genuine, silent, synchronous infinite loop with no error, no stack
+overflow message reaching any caller (the recursion happens entirely
+inside plain function calls, never crossing a Promise/task boundary
+where a stack-overflow RangeError would have anywhere to surface to).
+**This is the exact same class of bug this codebase has fixed multiple
+times before for its OWN overrides** (`eventLoop.ts`'s own
+`nativeSetTimeout`/`nativeMessageChannel`, `workers/process/worker.ts`'s
+own `nativeMessageChannel`) **- just never caught for `postMessage`,
+because this is the one case where GUEST code (not this project's own
+`Object.assign(self, {...})` calls) does the overriding.**
+
+**Fix**: `workers/workerThreads/worker.ts` now captures
+`const nativePostMessage = self.postMessage.bind(self)` at module load,
+before any guest code can run (same pattern, same precaution, as the
+existing `nativeSetTimeout`/`nativeMessageChannel` precedents elsewhere
+in this codebase) - `parentPort.postMessage()` and the `BOOT_ERROR_TAG`
+failure-reporting path both use this captured reference instead of the
+live, guest-shadowable `self.postMessage`. Typechecked clean, all 584
+tests still passing, rebuilt.
+
+**Verified live, twice, with full diagnostic instrumentation still in
+place (before stripping it) - the fix works:** the native `resolveId()`
+call that had NEVER ONCE returned across this entire multi-session
+investigation now **completes successfully** ("native call RETURNED
+key=resolveId"), the WASI worker's own `handle()` call returns cleanly
+for both `'load'` and `'start'` message types, and multiple worker
+threads spin up, load, and complete in sequence - the exact chain item
+8's own diagnostic trail (steps 6-9 above) originally traced as the
+hang point, now fully unblocked. All temporary diagnostic instrumentation
+(in `main.ts`, `worker.ts`, `runtime/builtins/worker_threads.ts`) has
+been stripped back out - `main.ts` and `runtime/builtins/worker_threads.ts`
+are back to their original committed state (`git checkout`'d), and
+`workers/workerThreads/worker.ts` keeps only the real fix (the
+`nativePostMessage` capture, the deferred-microtask message flush from
+the ref-counting entry above, and `dispatchToListener`'s per-listener
+try/catch) - no debug logging left behind.
+
+**Where it stops now - real vite/rolldown gets much further, into a
+new, much smaller, unrelated bug:** past `resolveId()`, past
+`buildStart()`, into Vite's own real dependency-scan logic, which fails
+with:
+
+```
+(!) Failed to run dependency scan. Skipping dependency pre-bundling.
+TypeError: Expected pattern to be a non-empty string
+    at picomatch (dwc://module/my-app/node_modules/picomatch/lib/picomatch.js:61:11)
+```
+
+Vite's own scanner catches this and logs "Skipping dependency
+pre-bundling" rather than crashing - real Vite resilience, matching its
+own documented graceful-degradation behavior for a failed pre-bundling
+scan - so the process does NOT hang here; it continues. What happens
+after that was not yet observed to conclusion: the last live run reached
+this exact point and then produced a genuinely huge (~67MB) stderr chunk
+(a base64-embedded `data:` URL as part of a stack trace, flowing through
+this test's own console-log-based observation pipe) that overloaded the
+Playwright driver's own IPC pipe ("write data discarded, use flow
+control to avoid losing data") and ultimately crashed the renderer
+(confirmed via `ps`: a zombie chrome-headless-shell process with 33+
+minutes of accumulated CPU time) - **this is a testing-harness artifact,
+not a hang in the app** (same class of pitfall this doc's own
+"Diagnostic techniques" section already warns about: "huge single
+console.log calls choke an automated console reader... don't buffer
+~150MB... read in small slices instead").
+
+**Concrete next steps, in order, for whoever picks this up:**
+1. Root-cause the `picomatch` `TypeError: Expected pattern to be a
+   non-empty string` itself - likely some config value (an ignore
+   pattern, an include/exclude glob) that's empty/undefined in this
+   sandboxed environment where real Node would have a real, non-empty
+   default (a `path`/`cwd`-derived value computed differently here,
+   perhaps). Trace via the same "patch the real installed file with
+   before/after logging" technique documented above, applied to
+   whatever real Vite/rolldown code calls into `getPartialMatcher`/
+   `picomatch` during its dependency-scan step.
+2. Re-run the full live demo **without** heavy diagnostic
+   instrumentation this time (the real fix needs no more proving) and
+   with the test harness's OWN console-capture made resilient to large
+   output specifically around this step - e.g. truncate any single
+   captured console message hard (a few KB) before it ever reaches the
+   host-side pipe, not just when logging it, since the crash this
+   session hit was in the CAPTURE path itself, not just in what got
+   displayed afterward.
+3. If the picomatch issue is fixed (or shown to be harmless/skippable,
+   matching Vite's own "Skipping dependency pre-bundling" resilience)
+   and the demo reaches the real `Local:` ready banner with the preview
+   iframe actually rendering the dev server's page, **this closes out
+   the ENTIRE multi-session item 7/8 investigation** - real npm install,
+   real npm create, and a real running Vite dev server (via real
+   rolldown/WASI) previewed live, all working end-to-end, for the first
+   time in this project's history. Still separately verify HMR (item 4)
+   afterward - a working `vite dev` server is not the same as
+   live-reload-on-edit, which remains its own, entirely unstarted
+   question.
 
 ## Reminder: no AI attribution in commits
 

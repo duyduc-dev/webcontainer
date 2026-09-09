@@ -16,6 +16,27 @@ import { createModuleLoader } from "../../runtime/moduleLoader";
 import { callSyncFs } from "../process/syncFsClient";
 import type { SyncFsChannel } from "../process/syncFsClient";
 
+// Captured before any guest code can run - real Node-emulating vendored
+// code routinely does `Object.assign(globalThis, { postMessage: (msg) =>
+// parentPort.postMessage(msg), ... })` at its own top level (confirmed
+// live: real @napi-rs/wasm-runtime's own wasi-worker.mjs does exactly
+// this, a legitimate, expected thing for code written against real Node's
+// worker_threads shape, where a bare top-level `postMessage` is commonly
+// wired to parentPort as a convenience). If this file's own
+// parentPort.postMessage() below called the bare `self.postMessage`
+// instead of a reference captured here, the FIRST call after that guest
+// override lands would recurse forever: self.postMessage -> the guest's
+// wrapper -> parentPort.postMessage -> self.postMessage (now the guest's
+// own wrapper again) -> ... - a real, silent, unrecoverable hang with no
+// error, no stack overflow message a caller ever sees (confirmed live:
+// this exact mechanism was this session's actual root cause for the
+// long-investigated "npm run dev never reaches Local:" hang - see
+// PROGRESS.md item 8). Same "grab the real one before any override can
+// exist" precaution as eventLoop.ts's own nativeSetTimeout/
+// nativeMessageChannel and workers/process/worker.ts's own
+// nativeMessageChannel.
+const nativePostMessage = self.postMessage.bind(self) as (message: unknown, transferList?: Transferable[]) => void;
+
 interface SyncFsChannelPayload {
   port: MessagePort;
   control: SharedArrayBuffer;
@@ -66,18 +87,52 @@ const boot = async (payload: WorkerThreadsBootPayload): Promise<void> => {
       pendingMessages.push(event.data);
       return;
     }
-    for (const listener of messageListeners) listener(event.data);
+    for (const listener of messageListeners) dispatchToListener(listener, event.data);
   });
+  // Real MessagePort/EventTarget semantics: a listener throwing is reported
+  // as an uncaught error on its own turn, never propagated synchronously
+  // back into whoever posted the message or registered the listener -
+  // dispatchEvent() itself never throws because one handler misbehaved.
+  // Matters here because this call site's own caller (below) may be guest
+  // top-level module code that has no reason to expect .on("message", ...)
+  // itself to throw.
+  const dispatchToListener = (listener: ParentPortListener, data: unknown): void => {
+    try {
+      listener(data);
+    } catch (error) {
+      queueMicrotask(() => {
+        throw error;
+      });
+    }
+  };
   const startListening = (listener: ParentPortListener): void => {
     const alreadyStarted = messageListeners.size > 0;
     messageListeners.add(listener);
-    if (!alreadyStarted) {
+    if (!alreadyStarted && pendingMessages.length > 0) {
       const queued = pendingMessages.splice(0, pendingMessages.length);
-      for (const data of queued) for (const l of messageListeners) l(data);
+      // Real Node's own MessagePort delivery is always genuinely
+      // asynchronous - even a message that arrived before this listener
+      // existed is only ever handed to it on a LATER turn, never inside the
+      // same synchronous call stack as the .on("message", ...) call itself.
+      // A caller's own top-level module body routinely finishes additional
+      // setup (assigning globalThis.onmessage, etc.) AFTER calling .on() -
+      // confirmed live, this exact ordering (real
+      // @napi-rs/wasm-runtime's own wasi-worker.mjs: `parentPort.on(
+      // "message", data => globalThis.onmessage({data}))` on one line,
+      // `globalThis.onmessage = ...` several lines later, in the same
+      // top-level body) - flushing synchronously here called
+      // globalThis.onmessage while it was still null, throwing and
+      // silently aborting the rest of module evaluation. Deferred via a
+      // microtask so the flush always happens after the current
+      // synchronous stack (including the rest of the registering module's
+      // own top-level code) has finished, matching real delivery order.
+      queueMicrotask(() => {
+        for (const data of queued) for (const l of messageListeners) dispatchToListener(l, data);
+      });
     }
   };
   const parentPort = {
-    postMessage: (value: unknown, transferList?: Transferable[]) => self.postMessage(value, transferList ?? []),
+    postMessage: (value: unknown, transferList?: Transferable[]) => nativePostMessage(value, transferList ?? []),
     on: (event: string, listener: ParentPortListener) => {
       if (event === "message") startListening(listener);
     },
@@ -241,6 +296,6 @@ const BOOT_ERROR_TAG = "__dwc_worker_threads_boot_error__";
 self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   if (event.data.type !== "boot") return;
   boot(event.data.payload as WorkerThreadsBootPayload).catch((error: unknown) => {
-    self.postMessage({ [BOOT_ERROR_TAG]: true, message: error instanceof Error ? error.message : String(error) });
+    nativePostMessage({ [BOOT_ERROR_TAG]: true, message: error instanceof Error ? error.message : String(error) });
   });
 };
