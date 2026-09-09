@@ -378,14 +378,22 @@ this file first — MAJOR MILESTONE, real Vite dev server now serves a
 real HTTP 200 response, for the first time in this project's history,
 but crashes ~0-1s later with a non-deterministic WASM-level trap
 (different trap type each run — the signature of memory corruption).
-Forcing both known thread-count knobs (`RAYON_NUM_THREADS`,
-`NAPI_RS_ASYNC_WORK_POOL_SIZE`) to 1 does NOT stop the crash — the
-"race among several worker threads" hypothesis is refuted in its
-original form. Leading hypothesis is now a memory-safety bug in this
-project's OWN WASI host-function shims (`fd_write`/`fd_read`/
-`path_open`/etc. — wherever they read/write the guest's linear memory
-at a computed address), not necessarily a cross-thread race at all —
-see item 9's own "Concrete next steps" for exactly where to look.**
+Pushed the threading angle as far as this project's own tools allow:
+env vars (`RAYON_NUM_THREADS=1`, `NAPI_RS_ASYNC_WORK_POOL_SIZE=1`) AND a
+direct guest-VFS patch of the loader's `asyncWorkPoolSize` to a literal
+`0` all still crash identically — and a trace confirmed the patch still
+leaves 2 real worker threads running (`onCreateWorker` fires regardless
+of that setting), so true zero-extra-thread execution isn't reachable
+from the JS side at all. The "race among several worker threads"
+hypothesis is refuted in ITS ORIGINAL form (more than 2 threads isn't
+needed), but a race specific to the 2 threads that can't be eliminated
+remains technically open. Practical read: the threading avenue has hit
+its limit without real WASM/Rust debugging tools this project doesn't
+have — see item 9's own "Concrete next steps" for the WASI-shim read
+still worth doing and the two independent, actionable bugs (a
+`toHeaders`/`toUTCString` static-asset 500, and `preview.fetch()` never
+rejecting when its process crashes mid-request) that are now the more
+productive use of effort.**
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2611,31 +2619,94 @@ require a race at all - worth checking this project's own WASI syscall
 implementations for exactly this class of bug before spending further
 effort on the threading angle.
 
+**Update, same session: pushed the single-threading test further by
+patching the loader directly (guest VFS, ephemeral) rather than relying
+on env vars - the "always-present pool worker" framing above was itself
+still not the whole picture.**
+
+Found the real, on-disk location of the WASI binding this runtime
+actually loads (not under `/my-app/node_modules` at all - rolldown's own
+WebContainer-detection fallback installs it lazily on first use, into
+`/tmp/rolldown-1.2.8/node_modules/@rolldown/binding-wasm32-wasi/`, found
+by a recursive filename search from `/` after `@rolldown/binding-wasm32-
+wasi` came up missing everywhere under the project directory itself).
+Patched `rolldown-binding.wasi.cjs`'s `asyncWorkPoolSize` computation
+in-place (guest VFS write, same technique as the earlier tinyglobby
+tracing patch) from the env-var-driven expression down to a hardcoded
+`asyncWorkPoolSize: 0`, respawned vite fresh so it re-reads the patched
+file, and re-ran the same crashing requests. **The crash still happened
+identically** (same `RuntimeError: unreachable` / `operation does not
+support unaligned accesses` pattern).
+
+To confirm this patch actually achieved zero pool workers (rather than
+`instantiateNapiModuleSync` silently flooring `0` back up to some
+minimum the way the env-var path floors to 4), added a one-line
+`console.error` trace at the top of the loader's own `onCreateWorker()`
+callback and re-ran. **`onCreateWorker` still fired - twice - even with
+`asyncWorkPoolSize: 0` and `RAYON_NUM_THREADS=1` both set.** This means
+`asyncWorkPoolSize` does NOT govern all real-thread creation the way its
+name suggests - something else (most plausibly: real WASI `thread-spawn`
+calls issued on demand by rayon/rolldown's own Rust code, serviced
+through `onCreateWorker`'s `reuseWorker: true` pooling regardless of the
+async-dispatch pool's own configured size) unconditionally creates at
+least 2 real worker threads, and neither of the two knobs tested (env
+vars or this direct patch) can suppress that. A genuinely single-
+threaded, zero-extra-real-thread run of this WASM module does not appear
+to be reachable through anything exposed at the JS loader level.
+
+**Net result of the whole threading investigation, stated precisely:**
+every configuration tried - default (pool defaults to 4, rayon
+unconstrained), pool forced to 1 via env var, and pool patched to 0
+directly in the loader (which still produced 2 real worker threads) -
+crashes identically, with the trap type still varying run to run in
+every case. This does NOT prove the bug is thread-count-independent
+(true 0-extra-thread execution was never actually achieved, so a race
+specific to those 2 always-created threads remains technically
+possible), but it does mean **the crash cannot be described as "goes
+away below N threads" for any N reachable from the JS side** - so
+"reduce the thread count" is not a viable workaround path with the tools
+available here, and further threading-focused effort would need to
+intercept the Rust-level `wasi_thread_spawn` import itself (well beyond
+what's practical to patch from the guest VFS). Combined with the earlier
+observation that `operation does not support unaligned accesses` is
+specifically an atomic-instruction trap and the trap type varies run to
+run, a memory-corruption bug (write through a bad/stale pointer,
+surfacing differently depending what it clobbers) remains the best
+overall explanation - whether that pointer bug originates from a genuine
+2-thread race that survives every mitigation tried, or from something
+that would corrupt memory even on one thread, is still open.
+
 **Concrete next steps, in order:**
-1. **New leading hypothesis: audit this project's own WASI host-function
-   shims (`fd_write`/`fd_read`/`path_open`/`fd_seek`/etc. - wherever they
-   read a pointer+length pair out of the guest's `WebAssembly.Memory` and
-   write into or read out of it) for an address/length computation bug**,
+1. **Audit this project's own WASI host-function shims** (`fd_write`/
+   `fd_read`/`path_open`/`fd_seek`/etc. - wherever they read a
+   pointer+length pair out of the guest's `WebAssembly.Memory` and write
+   into or read out of it) for an address/length computation bug,
    focusing on the real file-read path a transform/resolve call actually
-   exercises (reading a real source file's real bytes into WASM memory
-   for rolldown to parse) - since that's the exact code shared by every
-   request type that crashes and absent from the one (`/favicon.svg`)
-   that doesn't reach rolldown's native code at all. A single off-by-one
-   or wrong-buffer-view bug here would produce exactly the "corrupts
-   something nearby, trap type varies by what got clobbered" signature
-   observed, without needing multiple real threads to race at all.
-2. If (1) doesn't turn up anything, the remaining, narrower threading
-   question is whether the ONE always-present async-work-pool worker
-   (unavoidable via `asyncWorkPoolSize`, since the knob floors at 4 and
-   never goes below 1) races with the main WASI thread specifically -
-   worth checking whether `@napi-rs/wasm-runtime` exposes any way to
-   disable the async-work pool entirely (pool size truly 0, forcing
-   emnapi's async dispatch onto the main thread with no second thread at
-   all) as a cleaner test than what's achievable via the documented env
-   vars alone.
+   exercises - since that's the exact code shared by every request type
+   that crashes and absent from the one (`/favicon.svg`) that doesn't
+   reach rolldown's native code at all. Note: the actual pointer/iovec
+   math here is NOT hand-rolled by this project - `packages/core/src/
+   runtime/builtins/wasi.ts` only adapts a Node-fs-shaped `options.fs`
+   backend onto a real, vendored, complete preview1 implementation
+   (`runtime/node/vendor/wasi/*.mjs`, from `@tybys/wasm-util`, part of
+   the same emnapi org that ships `@napi-rs/wasm-runtime` - likely
+   already exercised by real production napi-rs WASM32-WASI users under
+   real Node). Worth a read regardless, but temper expectations
+   accordingly - this project's own new code in this area is just the
+   `fs`-adapter functions in `createWasiFsAdapter`, not the memory-layout
+   code itself.
+2. Already checked and ruled out this session: the synchronous cross-
+   thread fs bridge (`kernel/fs/syncWireFormat.ts`, `workers/process/
+   syncFsClient.ts`, `workers/fs/worker.ts`) is NOT a shared-buffer race
+   - `createSyncFsChannelFor` allocates a fresh, independent
+   `SharedArrayBuffer` pair per requesting thread (confirmed by reading
+   the code directly), and the FS Worker's own single JS thread
+   naturally serializes all channels' requests via normal run-to-
+   completion semantics. Not worth re-checking without new evidence.
 3. Fix the `dwc.preview.fetch()` never-rejects-on-crash gap (new bug
    above) - independent value regardless of the WASM crash's own root
-   cause.
+   cause, and arguably higher-value right now given the threading avenue
+   has hit its practical limit.
 4. Fix the static-asset `toHeaders`/`toUTCString` bug (new bug above) -
    independent, much smaller, likely a missing real `Date` value in this
    runtime's own fs-stat/mtime emulation feeding vite's static-file
@@ -2646,6 +2717,15 @@ effort on the threading angle.
    failure mode - worth fixing now that there's a concrete, reproducible
    "starts working, then crashes" case to make visible instead of hidden
    behind a silent preview failure.
+6. Given the threading angle has now been pushed about as far as this
+   project's own tooling allows (item 4 from the original next-steps
+   list, upgraded from "may" to "does": root-causing the exact
+   mechanism now clearly requires real WASM/Rust-level debugging
+   tooling this project doesn't have), the pragmatic path forward is
+   likely accepting the crash as a known limitation for now and
+   prioritizing 3/4/5 above, rather than continuing to sink further
+   effort into a fix at the shared-memory-bridging level without better
+   tools.
 
 **Technique note, worth keeping:** when capturing a spawned process's
 stdout/stderr for diagnosis, truncate each chunk to a small size (a few
