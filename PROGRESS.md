@@ -394,23 +394,27 @@ re-testing this session found genuine non-determinism consistent with
 this theory (same pristine binary: one run crashed on the first request
 as always, another survived five requests in a row), and found that
 adding synchronous JS overhead in the native call path changes the
-outcome — a real timing-sensitivity signal. The concrete next step
-(not yet done): get Vite's dependency-scan to skip entirely
-(`optimizeDeps.noDiscovery`) via a real `vite.config.js`, so a served
-request becomes the FIRST native rolldown call in the process instead of
-a probable second one — blocked by two separate, unrelated, likely-
-fixable config-loading bugs found along the way (rolldown's native
-config loader throws `Invalid URL`; the `--configLoader native`
-workaround's dynamic `import()` of a `file://` URL doesn't resolve
-through the VFS). Of the two independent bugs found earlier in this same
+outcome — a real timing-sensitivity signal. **Fixed both config-loading
+bugs that were blocking the actual `noDiscovery` test** (a real gap in
+this runtime's own dynamic-`import()` handling for computed specifiers
+— commit `b04b0b4`, with two false-positive traps found and fixed along
+the way, both in real Vite's own `module-runner.js`) **and ran it: a
+served request confirmed as the process's first-ever native rolldown
+call (no dependency-scan messages at all) still crashed on the very
+first request.** This refutes the simple "avoid a second native call"
+framing — either something else still makes an earlier native call, or
+this runtime's instance of the bug isn't purely about call count. The
+underlying crash itself remains open; see item 9's own next steps for
+where this leaves it. Of the three independent bugs fixed this
 investigation: `preview.fetch()` no longer hangs forever when its
-process crashes mid-request (commit `b42d591`). The `toHeaders`/
-`toUTCString` static-asset crash is also fixed (`fs.ts`'s `StatResult`
-now carries a real `mtime: Date` — commit `b363913`), but that unmasked
-a bigger, still-open gap: this runtime's `fs` builtin has no
-`createReadStream` at all (Vivari's own roadmap independently confirms
-this exact gap was necessary for their own static-asset serving to
-work — a real, correctly-scoped fix, not overkill).**
+process crashes mid-request (commit `b42d591`); the `toHeaders`/
+`toUTCString` static-asset crash is fixed (`fs.ts`'s `StatResult` now
+carries a real `mtime: Date` — commit `b363913`), though that unmasked
+a bigger, still-open gap (`fs.createReadStream` isn't implemented at
+all — Vivari's own roadmap independently confirms this exact gap was
+necessary for their own static-asset serving to work, a real,
+correctly-scoped fix); and the ESM loader now correctly handles a
+computed dynamic `import()` specifier (commit `b04b0b4`).**
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2888,35 +2892,47 @@ request afterward the *second* native call overall, matching the "first
 succeeds, second panics" pattern even for a single-optimize-pass demo
 like ours.
 
-**A concrete, not-yet-completed next step this points to:** get Vite to
-skip its own dependency-scan/pre-bundle step entirely (`optimizeDeps:
-{noDiscovery: true, include: []}` in a real `vite.config.js`), so a
-served page request becomes the first native rolldown call ever made in
-that process, and see whether that changes the crash rate the way the
-"first bundle succeeds" theory predicts. Attempted this session and
-blocked by two SEPARATE, unrelated compatibility gaps before ever
-reaching the real test:
-- Vite 8's default (`bundle`) config loader itself uses rolldown
-  natively to process `vite.config.js`, and that failed here with
-  `Error: Failed to construct 'URL': Invalid URL` inside
-  `napi_create_error` - a different bug in the native config-loading
-  path, not yet root-caused.
-- Vivari's own docs flag this exact problem and work around it with
-  `--configLoader native` (a real, documented Vite 8 CLI flag - confirmed
-  present in this project's own vendored vite's `--help` output too).
-  Trying that here instead hit a second, different failure:
-  `TypeError: Failed to fetch dynamically imported module: file:///my-
-  app/vite.config.js?t=...` - this runtime's dynamic `import()` of a
-  `file://`-shaped URL isn't wired up to actually resolve through the
-  VFS the way `require()` is.
-Both are real, fixable-looking gaps (the second one especially - sounds
-like the same class of gap the ESM-interop plan already on file for this
-project touches), but neither is fixed yet, so the `noDiscovery` test
-itself remains unrun. This is the highest-value concrete next step:
-fixing either config-loading path is a normal, scoped bug fix (not a
-"need better WASM tools" wall), and would finally let the actual
-"does avoiding a second native call fix it" prediction get tested
-directly.
+**Update, same session: fixed both config-loading gaps, ran the actual
+`noDiscovery` test - it did NOT eliminate the crash.**
+
+Root-caused and fixed the `--configLoader native` blocker: this
+runtime's ESM loader only rewrote a dynamic `import(...)` when its
+argument was a bare string literal (`DYNAMIC_IMPORT_RE`) - real Vite's
+own native config loader does a COMPUTED specifier
+(`import(pathToFileURL(path).href + "?t=" + Date.now())`), which fell
+through untouched to genuine native `import()`, which can't resolve a
+`file://` URL into this runtime's VFS. Added a fallback pass
+(`DYNAMIC_IMPORT_OPEN_RE` + a real paren-matcher over the existing
+non-code-masked text) that finds any `import(...)` call the literal
+path missed and routes it through the same `__dwcDynamicImport`
+resolver, plus normalizing a `file://`-prefixed specifier (stripping
+the cache-busting query) before resolution. Found and fixed two real
+false-positive traps along the way, both live in real Vite's own
+`dist/node/module-runner.js`: a `.import(...)` PROPERTY/METHOD CALL
+(`this.import(acceptedPath)`, real Vite's own `ModuleRunner` API)
+mistaken for the dynamic-import keyword (fixed with the same `(?<!\.)`
+guard `moduleLoader.ts`'s CJS-side rewriter already uses), and an
+`import(id) { ... }` METHOD DECLARATION (`async import(id) {...}` -
+no preceding `.` for that guard to catch) also mistaken for a call
+(fixed by checking whether the closing paren is followed by a block,
+which a real call expression never is). Five new tests, full suite
+(592 tests) green, verified live. Commit `b04b0b4`.
+
+**With both blockers gone, the actual `noDiscovery` test finally ran:**
+`vite.config.js` with `optimizeDeps: {noDiscovery: true, include: []}`,
+spawned with `--configLoader native`. Config loaded correctly this
+time, and startup printed no "[rolldown] Downloading..." /
+dependency-scan messages at all - confirming the dep-scan step was
+genuinely skipped, meaning a served request really was the first
+native rolldown call in the process. **It still crashed on the very
+first `/` request**, same `RuntimeError` signature as always. This
+refutes the simple form of the "avoid a second native call" theory -
+either something else still makes an earlier native call this test
+didn't account for, or the crash isn't purely a call-count issue for
+this runtime's specific case (it may still be the SAME upstream bug
+Vivari found, just triggered on the very first call here rather than
+the second, given how non-deterministic every characterization of this
+crash has been all along).
 
 **Technique note, worth keeping:** when capturing a spawned process's
 stdout/stderr for diagnosis, truncate each chunk to a small size (a few
