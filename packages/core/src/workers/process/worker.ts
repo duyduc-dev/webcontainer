@@ -352,6 +352,76 @@ const wrapTimerHandle = (id: number): TimerHandle => ({
 const unwrapTimerHandle = (handle: unknown): number =>
   typeof handle === "object" && handle !== null ? (handle as TimerHandle).id : (handle as number);
 
+// Captured before boot()'s own Object.assign(self, {MessageChannel: ...})
+// below can shadow them - same "grab the real one before any override
+// exists" precaution as eventLoop.ts's own nativeSetTimeout/
+// nativeMessageChannel. Deliberately real, untracked host timers (NOT
+// eventLoop.setTimeout) - see wrapRefPort's own doc comment for why.
+// Typed explicitly as the Worker/DOM shape (a bare number handle) - ambient
+// @types/node's own global setTimeout()/clearTimeout() declarations
+// otherwise win inference here (returning NodeJS.Timeout), even though
+// this is a real browser Worker's own setTimeout, not Node's.
+const nativeSetTimeout: (handler: () => void, timeout?: number) => number = globalThis.setTimeout.bind(globalThis);
+const nativeClearTimeout: (handle: number) => void = globalThis.clearTimeout.bind(globalThis);
+const nativeMessageChannel = globalThis.MessageChannel;
+
+// Picked, not measured - same disclaimer as worker_threads.ts's own
+// UNREF_DEBOUNCE_MS. Short on purpose: this coalesces a hot ref()/unref()
+// cycle into far fewer real eventLoop transitions without meaningfully
+// extending a genuinely-finished async call's lifetime.
+const REF_PORT_DEBOUNCE_MS = 100;
+
+/** Adds real, ref-counted .ref()/.unref() to a real, native MessagePort,
+ * wired into this worker's own eventLoop - mirrors bindings/net.ts's TCP/
+ * Pipe recount() precedent. Traced need: a real napi-rs WASI build without
+ * shared memory/real threads (confirmed live: real rolldown's own
+ * @rolldown/binding-wasm32-wasi) runs its native async-work dispatch
+ * through @emnapi/core's JS-emulated fallback (`emnapiAsyncWorkPlugin`),
+ * which signals "don't let the process exit while a native async call is
+ * pending" by calling exactly this Node-shaped `port.ref()`/`.unref()`
+ * pair on a plain `new MessageChannel()` port - real Node's own
+ * MessagePort has these; a real browser one does not, so every prior call
+ * here was a silently-swallowed no-op (`if (port.ref) ...`), invisible to
+ * drain()'s own hasPendingWork() check. See PROGRESS.md's own
+ * investigation for the full trace, including two prior live attempts
+ * that both froze the browser tab's own renderer (a naive 1:1 wire-up,
+ * then this debounced version too, at a different point) - THIS COPY IS
+ * BEING RE-APPLIED SPECIFICALLY TO TEST IN ISOLATION, not against the
+ * live end-to-end demo again, per that investigation's own documented
+ * next step. Do not run the full npm-create-vite pipeline against this
+ * without first confirming a small, standalone repro doesn't freeze.
+ *
+ * Debounced (REF_PORT_DEBOUNCE_MS, via a real, untracked host timer - NOT
+ * eventLoop.setTimeout, which would itself call wake() on every single
+ * unref() and reintroduce a similar problem one level down): `.ref()`
+ * cancels any pending release and re-refs immediately if not already
+ * ref'd; `.unref()` starts (or leaves running) a debounce window that
+ * only calls eventLoop.unref() once it fires with no intervening
+ * `.ref()` - same shape as worker_threads.ts's own UNREF_DEBOUNCE_MS. */
+const wrapRefPort = (port: MessagePort, eventLoop: ReturnType<typeof createEventLoop>): MessagePort => {
+  let refed = false;
+  let releaseTimer: number | undefined;
+  const anyPort = port as MessagePort & { ref?: () => void; unref?: () => void };
+  anyPort.ref = () => {
+    if (releaseTimer !== undefined) {
+      nativeClearTimeout(releaseTimer);
+      releaseTimer = undefined;
+    }
+    if (refed) return;
+    refed = true;
+    eventLoop.ref();
+  };
+  anyPort.unref = () => {
+    if (!refed || releaseTimer !== undefined) return;
+    releaseTimer = nativeSetTimeout(() => {
+      releaseTimer = undefined;
+      refed = false;
+      eventLoop.unref();
+    }, REF_PORT_DEBOUNCE_MS);
+  };
+  return port;
+};
+
 const write = (stream: "stdout" | "stderr", chunk: string | Uint8Array): void => {
   postEvent(stream, { chunk: typeof chunk === "string" ? encoder.encode(chunk) : chunk });
 };
@@ -617,6 +687,16 @@ const boot = async (payload: BootPayload): Promise<void> => {
     clearImmediate: (handle: unknown) => eventLoop.clearImmediate(unwrapTimerHandle(handle)),
     __dwcFetchAsync: createNetRequest(eventLoop),
     Buffer: (vendoredBuiltins.buffer as { Buffer: unknown }).Buffer,
+    // See wrapRefPort's own doc comment above for why this exists at all.
+    MessageChannel: class {
+      port1: MessagePort;
+      port2: MessagePort;
+      constructor() {
+        const { port1, port2 } = new nativeMessageChannel();
+        this.port1 = wrapRefPort(port1, eventLoop);
+        this.port2 = wrapRefPort(port2, eventLoop);
+      }
+    },
   });
 
   // netContext is NOT threaded through here: `builtins` below already carries

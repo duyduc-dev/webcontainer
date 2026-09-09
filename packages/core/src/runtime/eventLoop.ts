@@ -72,6 +72,13 @@ interface EventLoop {
 // here, before any override can exist, keeps this internal usage correct
 // regardless of what the guest-facing global is later reassigned to.
 const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+// Same hazard, same fix, for `MessageChannel`: worker.ts's own guest-facing
+// override (Object.assign(self, {MessageChannel: ...}) - added to give
+// ports real .ref()/.unref() wired into this eventLoop, see its own doc
+// comment) would otherwise shadow the bare `new MessageChannel()` call in
+// yieldToMicrotasks() below once boot() has run, on every single call this
+// internal helper ever makes.
+const nativeMessageChannel = globalThis.MessageChannel;
 
 interface CreateEventLoopOptions {
   now?: () => number;
@@ -140,7 +147,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
 
   const yieldToMicrotasks = (): Promise<void> =>
     new Promise((resolve) => {
-      const channel = new MessageChannel();
+      const channel = new nativeMessageChannel();
       channel.port2.onmessage = () => resolve();
       channel.port1.postMessage(undefined);
     });

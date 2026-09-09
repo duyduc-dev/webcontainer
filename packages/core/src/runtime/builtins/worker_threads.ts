@@ -18,12 +18,24 @@
 // surface built there).
 //
 // `MessageChannel`/`MessagePort` ARE real here - they're also a standard
-// Web/Worker-global API, already available natively in this environment,
-// just missing Node's own `.ref()`/`.unref()` methods (which real Node's
-// ports have so a live channel can opt out of keeping the process alive -
-// irrelevant here since nothing in this runtime's own event loop tracks
-// message ports as handles, so these are safe, real no-ops rather than an
-// approximation of a semantic that doesn't apply).
+// Web/Worker-global API, already available natively in this environment.
+// Deliberately still real no-op .ref()/.unref() here (unlike the GLOBAL,
+// bare `MessageChannel` guest code resolves via the scope chain, which
+// worker.ts's own boot() now gives real, eventLoop-backed ref-counting -
+// see its own doc comment) - this class is `require('worker_threads')
+// .MessageChannel` specifically, and nothing traced needs its own ports'
+// liveness to affect this process's own exit timing the way a native
+// async-work "keep alive" signal does.
+//
+// Captured here, at module load, rather than resolved bare - once boot()
+// has run, a bare `new MessageChannel()` would otherwise pick up that
+// SAME global override (this file is bundled into the same worker script),
+// making `??=` below a no-op since `.ref`/`.unref` would already exist -
+// silently inheriting real ref-counting this class was never meant to
+// have. Same hazard, same fix, as eventLoop.ts's own nativeSetTimeout/
+// nativeMessageChannel captures.
+const nativeMessageChannel = globalThis.MessageChannel;
+
 const wrapPort = (port: MessagePort): MessagePort => {
   const anyPort = port as MessagePort & { unref?: () => void; ref?: () => void };
   anyPort.unref ??= () => {};
@@ -35,7 +47,7 @@ class DwcMessageChannel {
   port1: MessagePort;
   port2: MessagePort;
   constructor() {
-    const { port1, port2 } = new MessageChannel();
+    const { port1, port2 } = new nativeMessageChannel();
     this.port1 = wrapPort(port1);
     this.port2 = wrapPort(port2);
   }

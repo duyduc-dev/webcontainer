@@ -374,27 +374,25 @@ the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
 **Pick up here (updated):** item 7's own "browser-profile-artifact" theory
-for the `npm run dev` preview failure is now DISPROVEN - see item 8 at the
-very end of this file. Root cause is KNOWN precisely: `builtin:oxc-
-runtime`'s native `resolveId()` hook (real rolldown, running its non-
-shared-memory WASI async-work path via `@emnapi/core`'s JS-emulated
-`emnapiAsyncWorkPlugin`) signals "keep the process alive while I'm
-pending" via `messagePort.ref()`/`.unref()` - the real Node.js
-`MessagePort` contract - but this runtime's guest-global `MessageChannel`
-was a plain, unwrapped browser-native one with no such methods, so every
-call was a silent no-op invisible to `drain()`. **Two fix attempts, both
-REVERTED**: a naive 1:1 wire-up into `eventLoop.ref()`/`unref()` froze the
-browser tab's renderer solid during `resolveId()`; a debounced version
-(`REF_PORT_DEBOUNCE_MS`, matching `worker_threads.ts`'s own
-`UNREF_DEBOUNCE_MS` shape) froze it again, at a DIFFERENT point (during
-the `execFileSync`/binding-download step, before any native plugin hook
-even ran). Two different freeze locations across two different fix shapes
-points at something structural to overriding `MessageChannel` globally at
-all - not specifically a ref/unref frequency problem. **Do not attempt a
-third live end-to-end fix without first reproducing the freeze in
-isolation** (a tiny standalone script exercising the override alone,
-outside the vite/rolldown pipeline) - item 8 has the complete diagnostic
-trail from both attempts and the concrete, cheaper next step.
+for the `npm run dev` preview failure is now DISPROVEN and fully root-
+caused - **read item 8's own "TL;DR for whoever picks this up next" at
+the very end of this file first**, it's written specifically for
+continuing on a fresh device/session. Short version: a real native
+rolldown plugin (`builtin:oxc-runtime`) makes an async call into Rust/WASM
+during vite's startup that never resolves, because the native code's
+"keep me alive" signal (`MessagePort.ref()`/`.unref()`, a real Node.js
+API) was a silent no-op in this runtime's `MessageChannel`. **Two fix
+attempts (a naive 1:1 wire-up, then a debounced version) both froze the
+browser tab solid on live end-to-end tests, at two different points.**
+Both reverted. A follow-up isolated stress test of the override alone
+(no vite/rolldown involved) ran clean with zero issues, narrowing the
+problem to something in the override's interaction with the real
+pipeline specifically. **The debounced fix is currently re-applied in the
+tree (check `git log`/`git status` on `eventLoop.ts`, `builtins/
+worker_threads.ts`, `workers/process/worker.ts`) but has only been
+isolated-tested, not re-verified against the real end-to-end demo since -
+do not assume it works.** Item 8 has the complete diagnostic trail, both
+fix attempts, the isolated-test result, and the concrete next steps.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -1519,201 +1517,187 @@ wrong). HMR (item 4) is still a wholly separate, unstarted question even
 once this is resolved - what's being verified here is a working `vite
 dev`, not live-reload-on-edit.
 
-## 8. `npm run dev` preview failure is real, not a profile artifact — root-caused down to vite's own process exiting after `listen()`
+## 8. `npm run dev` never reaches its ready banner — root cause fully identified, fix in progress (currently mid-flight, safe state, do not assume solved)
 
-Picked item 7 back up on a new device. The very first direct-fetch check
-(`dwc.preview.fetch(5173, '/')`, bypassing the Service Worker relay
-entirely) **also** failed with `nothing is listening on port 5173` - the
-same kernel-level check that always succeeded in section 0's docs-site
-investigation. That result alone disproves the "same as the docs site,
-probably a profile artifact" theory this file previously recorded for this
-call path: the kernel genuinely has no listener registered, so this isn't
-a Service-Worker-relay-only issue at all.
+### TL;DR for whoever picks this up next
 
-**Root cause, traced end-to-end via live instrumentation (see technique
-notes below - all of it was temporary, non-committed debug code, reverted
-before this section was written):**
+Real `npm run dev`, backed by real rolldown/WASI, gets all the way
+through scaffolding, install, and vite's own startup — but its dev server
+never actually finishes coming up, so the preview always shows `nothing
+is listening on port 5173`. **This is a real, 100%-reproducible bug in
+this runtime, not a browser-profile artifact, a port mismatch, or a
+timing/patience issue** — all three were suspected at different points
+and all three are now disproven with direct evidence (details below).
 
-1. `examples/playground/src/main.ts`'s own `waitForMarker()` helper has a
-   real bug, found first: it resolves as soon as the stream closes (EOF),
-   not only when the marker text (`"Local:"`) is actually seen. This means
-   the demo silently proceeds to `dwc.preview.enable()` regardless of
-   whether vite ever actually became ready - "nothing is listening" is the
-   *symptom* this masking bug lets through, not the disease. Worth fixing
-   before further live debugging of this thread (make the demo visibly
-   report "dev server exited before printing Local:" instead of silently
-   continuing to the preview step).
-2. The real underlying failure: `npm run dev` correctly reaches
-   `@npmcli/run-script` → `promiseSpawn` →
-   `child_process.spawn('sh', ['-c', 'vite'], { stdio: 'inherit' })` → this
-   runtime's own `cp-spawn`/`runShellLineStreamed` dispatch (item 3's
-   work) → `resolveEntryPoint` correctly resolves `vite` to
-   `/my-app/node_modules/vite/bin/vite.js` → `bootProcess` boots it as a
-   real nested process worker. All of this is correct and was verified
-   live, hop by hop.
-3. **Vite's own process worker genuinely calls the low-level
-   `net.Server.listen()` binding on port 5173** - confirmed via three
-   `net-pipe-listen` registrations, each carrying `{ port: 5173 }` (ruling
-   out a port mismatch - the user's own "maybe it's listening on a
-   different port" theory, asked live during this session, is
-   **disproven**: it's the right port, every time).
-4. **That same process worker then exits cleanly - `postEvent("exit",
-   { code: 0 })`, zero stderr, zero thrown error** - shortly after (not
-   during a long synchronous block; the whole `execFileSync`+WASI-binding
-   load this session originally suspected completes in low single-digit
-   seconds even on a cold cache, confirmed by isolated repro below).
-5. That clean exit is what npm's own `lib/cli/exit-handler.js:171`
-   (`this.#process.exit(exitCode)`) is reacting to - `@npmcli/promise-
-   spawn`'s `proc.on('close', ...)` fires with `code: 0`, so
-   `run-script`'s own promise resolves successfully, and npm's own CLI
-   entry (`await execPromise; return exitHandler.exit()`) calls
-   `process.exit(0)` right on schedule. **npm, the kernel's `cp-spawn`
-   relay, and the shell dispatch are all faithfully reporting a real,
-   premature exit of vite's own process - none of them are the bug.**
-6. Vite's own "ready" output (the `VITE vX.X.X ready in Yms` banner, or
-   the `➜  Local:   http://localhost:5173/` line every real `vite`
-   invocation prints immediately after a successful listen) **never
-   appears, in any run.** The process dies with the low-level TCP handle
-   already registered as listening but before vite's own higher-level
-   "the server is ready" code path ever runs.
+The root cause is now known precisely: a real native plugin inside
+rolldown (`builtin:oxc-runtime`) makes an async call into Rust/WASM code
+during vite's startup, and that call **never resolves or rejects — it
+hangs forever** from the guest script's point of view. The reason it
+hangs: the native code signals "keep me alive, I'm not done yet" using a
+real Node.js API (`MessagePort.ref()`/`.unref()`) that this runtime's
+`MessageChannel` didn't implement, so every one of those calls was a
+silently-swallowed no-op. The runtime's own housekeeping (`drain()`)
+correctly-by-its-own-rules concludes "nothing is happening" a few seconds
+later and shuts the whole process down — mid-flight, silently, before
+vite's dev server ever finishes starting.
 
-**Ruled out, each independently, with a live isolated repro (write a
-small script to `/bin/<name>.js`, `dwc.process.spawn()` it directly - much
-faster than the full multi-minute `npm create vite` → `npm install` cycle
-for testing one hypothesis at a time):**
-- **Not the `execFileSync`+pnpm-install-the-WASI-binding step.** Reproduced
-  standalone (both a fresh download+install and a cache-hit require of the
-  already-installed `/tmp/rolldown-<version>/.../rolldown-binding.wasi.cjs`)
-  - both return cleanly and fast, no hang, no partial state.
-  Confirmed the currently-installed real `rolldown-binding.wasm32-wasi`
-  binding module loads and returns a fully-formed native-binding object
-  (`BindingDevEngine`, `startAsyncRuntime`, etc. all present).
-- **Not `drain()`'s `DRAIN_GRACE_YIELDS` idle-exit timeout** (the
-  mechanism that tears a process down after enough consecutive idle
-  macrotask yields with no tracked pending work - see `eventLoop.ts`'s own
-  doc comments). Bumped from 20 to 20,000 (1000x) and rebuilt; the failure
-  reproduced at the exact same point, meaning it isn't a "ran out of grace
-  yields waiting on an untracked native-promise chain" issue.
-- **Not an uncaught exception.** `worker.ts`'s `reportUncaught()` always
-  writes to stderr and exits with code 1 - this exit is code 0 with zero
-  stderr, going through the guest-called `process.exit()` path, not the
-  fatal-exception path.
-- **Not a kernel-side relay bug.** Every hop of the chain above (`cp-spawn`
-  receipt → `resolveEntryPoint` resolution → the three `listen` events →
-  the final `exit` event → the relay back to npm's own `child_process`
-  `'close'` handler) was individually traced and each is a correct,
-  faithful forwarding of what vite's own process worker actually did.
-- **Not obviously a missing `eventLoop.ref()` on `net.Server.listen()`**
-  either, on inspection: `bindings/net.ts`'s `recount()` function (shared
-  by both `TCP.listen()` and `Pipe.listen()`) does correctly call
-  `ref()`/`unref()` based on `_live && _refed && !_closed` - a listening,
-  non-unref'd handle *should* keep `drain()` from ever concluding "no
-  pending work". Given the process still exits, either (a) vite's own code
-  explicitly closes/unrefs these three listeners shortly after opening
-  them (a "probe the port, then really bind" pattern - plausible, since
-  three registrations for the *same* port 5173 is one more than a single
-  real bind would produce), or (b) something else entirely is going on
-  that hasn't been isolated yet. Not yet distinguished - see next step.
+**Two attempts to fix this (wiring `MessagePort.ref()`/`.unref()` into
+the real event loop) both froze the browser tab solid on a live test, at
+two different points in the flow.** Both were reverted. A follow-up
+*isolated* test (the override alone, stress-tested with thousands of
+`ref()`/`unref()` calls and hundreds of `MessageChannel`s, no vite/
+rolldown involved at all) ran cleanly in ~200ms with zero issues — so the
+override's basic mechanics are NOT the problem; something about its
+interaction with the real vite/rolldown/WASM pipeline is. **As of this
+writing, the fix code IS present in the working tree** (`eventLoop.ts`,
+`builtins/worker_threads.ts`, `workers/process/worker.ts` all have
+uncommitted-or-just-committed changes — check `git log`/`git status` to
+see which) **and has only passed the isolated test, not a live end-to-end
+run.** Do not assume it works. Do not run the full `npm create vite` →
+`npm install` → `npm run dev` demo against it without being ready for a
+tab freeze (poll responsiveness every ~10s rather than waiting blindly —
+see the technique notes at the end of this section).
 
-**Update, same investigation, next device: the three `listen` events were
-never the real bind at all.** Read real vite's own `dist/node/chunks/
-node.js` (`npm pack vite@8.2.2` locally, same technique as below) to find
-exactly what runs between `httpServer.listen()` and `printUrls()` -
-answering the "next step" question above directly:
+### How this was found: the full diagnostic chain, in order
 
-- `httpServerStart()` calls `isPortAvailable(port)` **before** ever
-  attempting the real bind. `isPortAvailable` probes the port once per
-  entry in vite's own `wildcardHosts` Set - which has **exactly three**
-  entries (`"0.0.0.0"`, `"::"`, and `"0000:0000:0000:0000:0000:0000:0000:0000"`,
-  the same address in two notations - vite doesn't dedupe them). Each
-  probe (`tryListen()`) does `net.createServer().listen(port, host)`, then
-  **immediately closes it again** the instant `'listening'` fires. **This
-  is exactly the three `listen` events traced above - all three are
-  probes, all three get closed right away, and none of them is the real,
-  lasting server.** The user's own live "maybe it's a different port?"
-  question, asked mid-session, prompted re-checking this exact detail -
-  confirmed still the right port (5173) throughout, just never the real
-  bind.
-- Only *after* all three probes report the port free does
-  `httpServerStart()` call `tryBindServer()`, which calls
-  `httpServer.listen(port, host)` - and vite has **already overridden**
-  `httpServer.listen` earlier in `_createServer()` to run its own
-  `initServer(true)` first: `await environments.client.pluginContainer
-  .buildStart()`, then `await Promise.all(environments.map(e =>
-  e.listen(server)))`, and only *then* does it call through to the real,
-  original low-level `listen(port, host)`.
-- **This means the real bind - and vite's own ready banner - are gated
-  behind `pluginContainer.buildStart()`, a call into rolldown's own
-  native/WASM machinery. And the process reliably dies during exactly
-  that gap: a fourth `listen` event (the real one) never appears, in any
-  run.**
+**1. Disproving "it's a browser-profile artifact."** A near-identical
+"nothing is listening" failure had been seen once before in this
+project, for a *different* demo (the docs site), and was concluded there
+to be a stale-Service-Worker/browser-profile issue, not a real bug
+(independently reconfirmed by another session's 23/23 clean retest). It
+was reasonable to suspect the same explanation applied here — but a
+direct kernel-level check, `dwc.preview.fetch(5173, '/')` (bypasses the
+Service Worker relay entirely, asks the kernel directly "is anything
+registered on this port"), **also failed** with the same error. That
+kernel-level check always succeeded in the docs-site case. So this is a
+different, real problem specific to this call path — not the same
+profile-state artifact.
 
-**This session's own direct, timed repro of that exact gap** (bypass npm
-and the shell dispatch entirely - `dwc.process.spawn('.../vite/bin/
-vite.js', { cwd: '/my-app' })` directly, with the three lines above
-patched in the guest VFS copy of `node.js` to `console.log(Date.now())`
-immediately before/after `buildStart()`, `environments.listen()`, and the
-real low-level `listen()` call - see technique notes below):
+**2. Finding a real, separate bug on the way: `waitForMarker()` masks
+failure.** `examples/playground/src/main.ts`'s `waitForMarker()` helper
+(waits for the literal string `"Local:"` in a stream before proceeding)
+has a bug: it also resolves when the stream simply *closes* (EOF), not
+only when the marker text is actually seen. This means the demo silently
+proceeds to `dwc.preview.enable()` regardless of whether vite ever
+actually became ready — "nothing is listening" is the *symptom* this
+masking bug lets through, not the disease itself. **Still unfixed** —
+worth fixing independently of the root cause below, so future runs
+visibly report "dev server exited before printing Local:" instead of
+silently continuing to a preview that was never going to work.
 
-- Every run logs `[dwctrace] before buildStart <T>` and then **nothing
-  else at all** - no `after buildStart`, no `environments.listen`, no
-  `REAL low-level listen`, no error, no stderr - before the process exits
-  with code 0, **consistently ~8-9.2 seconds later** (8000ms, 8153ms,
-  9229ms across three separate runs).
-- **That ~8s delay is independent of `drain()`'s own idle-exit grace
-  period - the "not `DRAIN_GRACE_YIELDS`" finding above is now proven
-  twice over, precisely.** Bumped `DRAIN_GRACE_YIELDS` a second time, this
-  time 10,000x (20 → 200,000) with real timestamps on both sides: the
-  process still died at the same ~8-9s mark, not later. Whatever's
-  happening inside `buildStart()`, the eventLoop's own yield-count budget
-  has nothing to do with when it gives up - ruling out "the guest's native
-  promise chain just needed a few more yields" as an explanation
-  entirely, not just as a guess.
-- The ~8-9s isn't obviously a single hardcoded constant in this codebase
-  (grepped for `8000`/`_MS`/`_TIMEOUT` project-wide: the closest matches
-  are `SYNC_TIMEOUT_MS = 5000` in `syncFsClient.ts` and
-  `UNREF_DEBOUNCE_MS = 3000` in `worker_threads.ts` - suggestively close
-  to summing to ~8000 if they fired back-to-back, which was the leading
-  hypothesis picked up next - but not an exact, reproducible-to-the-ms
-  match either, so treat it as a lead, not a conclusion).
-- **That specific hypothesis (a synchronous fs call from inside a nested
-  `worker_threads.Worker`, as rolldown's own WASI thread pool would use,
-  hanging until `SYNC_TIMEOUT_MS` fires) was tested directly and
-  disproven**: a minimal repro - `new Worker('/bin/child.js')` where the
-  child does a plain `fs.readFileSync()` and posts back - completed in
-  under 50ms, no hang, no timeout. Basic worker_threads + sync-fs is fine;
-  whatever's actually slow/hanging inside `buildStart()` is something more
-  specific than that.
+**3. Confirming the port is correct (ruling out a port mismatch).** Asked
+live, mid-session: "maybe it's listening on a different port?" Traced the
+low-level `net-pipe-listen` registrations rolldown/vite's dev server
+process actually makes — all of them carry `{ port: 5173 }`, every single
+time. **Not a port mismatch.**
 
-**Update, same session: found the exact hanging call.** Patched
-`hookParallel()` (the loop `buildStart()` uses to run every plugin's
-`buildStart` hook) with per-plugin `Date.now()`-timestamped tracing -
-**every plugin's `buildStart` hook completes in under 3ms**, all 8 of them
-(`vite:watch-package-data`, `alias`, `vite:resolve-builtin:get-environment`,
-`vite:css`, `vite:worker`, `vite:asset`, `vite:import-glob`,
-`vite:client-inject`). `buildStart()` itself isn't the hang.
+**4. Confirming vite's process really does try to listen, and really
+does exit cleanly (not crash) shortly after.** Traced the full spawn
+chain live: `npm run dev` → `@npmcli/run-script` → `promiseSpawn` →
+`child_process.spawn('sh', ['-c', 'vite'], { stdio: 'inherit' })` → this
+runtime's own `cp-spawn`/`runShellLineStreamed` dispatch → `vite` resolved
+to `/my-app/node_modules/vite/bin/vite.js` → booted as a real nested
+process worker. That process worker genuinely calls the low-level
+`net.Server.listen()` binding (three times — see #6 below for why), then
+**exits cleanly** — `postEvent("exit", { code: 0 })`, zero stderr, zero
+thrown error. That clean exit is exactly what npm's own real
+`lib/cli/exit-handler.js:171` (`this.#process.exit(exitCode)`) reacts to:
+`@npmcli/promise-spawn`'s `proc.on('close', ...)` fires with `code: 0`,
+so `run-script`'s promise resolves successfully, and npm's own CLI entry
+calls `process.exit(0)` right on schedule. **npm, the kernel's `cp-spawn`
+relay, and the shell dispatch are all faithfully reporting a real,
+premature exit of vite's own process — none of them are the bug.** Vite's
+own "ready" output (the `VITE vX.X.X ready in Yms` banner, or the `➜
+Local:   http://localhost:5173/` line every real `vite` invocation prints
+immediately after a successful listen) never appears, in any run.
 
-What runs immediately after `buildStart()` resolves, per its own source
-(`_registerInputsAsSafeModules()`), is `pluginContainer.resolveId("index.html",
-..., { isEntry: true, scan: true })` - and *that* is where it hangs.
-Patched the `resolveId` plugin loop (`PluginContainer.resolveId`, same
-file) with the same per-plugin timestamped tracing:
+**5. Ruling out several plausible explanations, each with a direct,
+live-tested repro** (technique: write a small script to `/bin/<name>.js`,
+`dwc.process.spawn()` it directly — much faster than the full multi-
+minute `npm create vite` → `npm install` cycle for testing one hypothesis
+at a time):
+   - **Not the `execFileSync`+pnpm-install-the-WASI-binding step.**
+     Reproduced standalone (both a fresh download+install and a cache-hit
+     require of the already-installed binding) — both return cleanly and
+     fast (seconds), no hang, no partial state. The binding module loads
+     and returns a fully-formed native object (`BindingDevEngine`,
+     `startAsyncRuntime`, etc. all present).
+   - **Not `drain()`'s idle-exit timeout (`DRAIN_GRACE_YIELDS`)** — the
+     mechanism that tears a process down after enough consecutive idle
+     macrotask yields with no tracked pending work. Bumped it twice, 1000x
+     then 10,000x (20 → 20,000 → 200,000) with real timestamps on both
+     sides of the gap: the process died at the *same* point and the
+     *same* ~2.6-9s mark regardless (the range reflects different patch
+     revisions' own tracing overhead, not a real change from the bump).
+     This isn't "the guest's native promise chain just needed a few more
+     yields" — proven twice, not just guessed.
+   - **Not an uncaught exception.** This runtime's own fatal-exception
+     path always writes stderr and exits with code 1; this exit is code 0
+     with zero stderr, going through a different path entirely (see the
+     root cause below).
+   - **Not a kernel-side relay bug.** Every hop of the spawn chain in #4
+     was individually traced and each is a correct, faithful forwarding
+     of what vite's own process worker actually did.
+   - **Not a hung synchronous fs call inside a nested `worker_threads.
+     Worker`** (the leading hypothesis for a while, since rolldown's own
+     WASI support needs `worker_threads.Worker` for its `thread-spawn`
+     import). A minimal repro — spawn a real nested Worker whose only job
+     is `fs.readFileSync()` and post the result back — completed in under
+     50ms. Basic worker_threads + sync-fs is fine.
+   - **Not obviously a missing `eventLoop.ref()` on `net.Server.listen()`**
+     either, on inspection — `bindings/net.ts`'s existing `recount()`
+     logic (shared by `TCP`/`Pipe`) correctly refs/unrefs based on
+     liveness. (This one is subtler — see #6.)
+
+**6. Finding that the three `listen` calls were never the real bind.**
+Real vite's own source (`npm pack vite@8.2.2` and read it directly) shows
+`httpServerStart()` calls `isPortAvailable(port)` **before** ever
+attempting the real bind — probing the port once per entry in vite's own
+`wildcardHosts` Set, which has **exactly three** entries (`"0.0.0.0"`,
+`"::"`, and the same address in a third notation — vite doesn't dedupe
+them). Each probe opens a throwaway `net.createServer()` and **closes it
+immediately** once `'listening'` fires. Those are the exact three
+`listen` events traced in #4 — all probes, all closed right away, none of
+them the real, lasting server. Only *after* all three report the port
+free does vite call the real bind — but by then, vite has already
+overridden `httpServer.listen` (in `_createServer()`) to run its own
+`initServer(true)` first: `await environments.client.pluginContainer
+.buildStart()`, then `await Promise.all(environments.map(e =>
+e.listen(server)))`, and *only then* the real, original low-level
+`listen(port, host)`. **So the real bind — and vite's own ready banner —
+are gated behind `pluginContainer.buildStart()`, a call into rolldown's
+own native/WASM machinery**, and the process reliably dies during exactly
+that gap: a fourth `listen` event (the real one) never appears, in any
+run. A direct, timed repro of this exact gap (bypassing npm and the shell
+dispatch entirely, spawning `vite/bin/vite.js` directly with
+`Date.now()`-timestamped tracing patched into the guest VFS copy of
+vite's own `node.js`) confirmed it precisely: `before buildStart <T>`
+logs, then **nothing else ever** — no `after buildStart`, no further
+trace, no error — before the process exits with code 0.
+
+**7. Finding the exact hanging call inside `buildStart()`.** Patched
+vite's own `hookParallel()` (the loop `buildStart()` uses to run every
+plugin's `buildStart` hook) with per-plugin timestamped tracing — **every
+plugin's `buildStart` hook completes in under 3ms**, all 8 of them.
+`buildStart()` itself isn't the hang. What runs immediately after it
+resolves, per vite's own source (`_registerInputsAsSafeModules()`), is
+`pluginContainer.resolveId("index.html", ..., { isEntry: true, scan:
+true })` — and *that* is where it hangs. Patched vite's `resolveId`
+plugin loop the same way:
 
 ```
 resolveId START builtin:oxc-runtime rawId=index.html <T>
 ```
 
-**...and nothing else, ever.** No `resolveId DONE`, no error, for that
-plugin - across every run. The process then exits ~2.6-2.7s later (a
-tighter, more consistent window than the earlier ~8-9s figure, which
-included the slower buildStart-hook-tracing overhead of that patch
-revision).
+...and nothing else, ever. No `resolveId DONE`, no error, for that
+plugin, across every run. The process exits ~2.6-2.7s later.
 
-`builtin:oxc-runtime` is not a JS plugin - tracing it back through
-rolldown's own real source (`npm pack rolldown@1.2.7` locally) shows
-`oxcRuntimePlugin()` (`src/builtin-plugin/constructors.ts`) constructs a
-`BuiltinPlugin` and wraps it via `makeBuiltinPluginCallable()`
-(`src/builtin-plugin/utils.ts`), which does:
+**8. Tracing `builtin:oxc-runtime` down to real native code.**
+`builtin:oxc-runtime` is not a JS plugin. Reading rolldown's own real
+source (`npm pack rolldown@1.2.7`) shows `oxcRuntimePlugin()`
+(`src/builtin-plugin/constructors.ts`) constructs a `BuiltinPlugin` and
+wraps it via `makeBuiltinPluginCallable()` (`src/builtin-plugin/utils.ts`),
+which does:
 
 ```js
 let callablePlugin = new import_binding.BindingCallableBuiltinPlugin(...);
@@ -1724,212 +1708,225 @@ const wrappedHook = async function(...args) {
 
 **So `resolveId` for this plugin is a direct call into native Rust/WASM
 code** (`BindingCallableBuiltinPlugin`, one of the native binding's own
-exported classes) via NAPI-RS bridging - not JS at all. The `await` on
-that native async method call is what never settles.
+exported classes) via NAPI-RS bridging — not JS at all. The `await` on
+that native async method call is what never settles. Tested and ruled
+out: manually calling `nativeBinding.startAsyncRuntime()` before vite
+ever runs does NOT fix it — the call itself returns successfully (no
+throw), and the exact same hang at the exact same point still happens
+right after.
 
-**Tested and ruled out: manually calling `nativeBinding.startAsyncRuntime()`
-does not fix it.** Patched rolldown's own binding loader
-(`dist/shared/binding-*.mjs`, right after `module.exports = nativeBinding`)
-to call `startAsyncRuntime()` unconditionally before vite ever runs -
-confirmed via trace that the call itself returns successfully
-(`startAsyncRuntime() returned`, no throw) - and the exact same hang at
-the exact same `resolveId START builtin:oxc-runtime` point still happened
-immediately after. Whatever native async-dispatch mechanism this
-particular call depends on either needs something startAsyncRuntime()
-alone doesn't provide, or isn't related to that mechanism at all.
+**9. Finding the real mechanism: a real Node.js API this runtime never
+implemented.** Reading the actual dependency chain, one `npm pack` at a
+time:
+   - `@rolldown/binding-wasm32-wasi`'s own loader
+     (`rolldown-binding.wasi.cjs`) instantiates via
+     `instantiateNapiModuleSync(..., { plugins: [emnapiAsyncWorkPlugin,
+     emnapiTSFNPlugin] })` — **the JS-emulated, single-threaded async-work
+     path**, not real shared-memory threads. (This is why the
+     `worker_threads`/thread-spawn angle in #5 was a dead end from the
+     start — this specific call was never going through real threads.)
+   - `@napi-rs/wasm-runtime`'s own doc comment explains why: single-
+     threaded WASI builds link an emnapi archive whose C async-work/
+     threadsafe-function implementations are unconditional
+     `napi_generic_failure` stubs, so *JS* implementations
+     (`emnapiAsyncWorkPlugin`/`emnapiTSFNPlugin`, from `@emnapi/core`)
+     provide them instead.
+   - `@emnapi/runtime`'s own source (`dist/emnapi.js`) shows exactly how
+     that JS-level implementation signals "don't let the process exit
+     while this native async call is pending": `this.refHandle = new
+     MessageChannel().port1`, then later `if (this.refHandle.ref) {
+     this.refHandle.ref() }` / the matching guarded `.unref()`. **This is
+     Node's real `MessagePort.ref()`/`.unref()` contract** — a real Node
+     `MessagePort` supports these; a real *browser* `MessagePort` does
+     not. This runtime's own `MessageChannel` was a plain, unwrapped
+     browser-native one, so every one of these calls was a silently-
+     swallowed no-op the whole time. Nothing ties emnapi's own "is native
+     async work still pending" signal to this runtime's own
+     `eventLoop.ref()`/`unref()` at all — so from `drain()`'s point of
+     view, a queued `resolveId()` call on `builtin:oxc-runtime` looks
+     exactly like "nothing happening," even while it's genuinely still in
+     flight. **This is the root cause.**
 
-**Update, same session: found the real mechanism (read napi-rs's own WASI
-async-dispatch source directly), and attempted a fix - which regressed
-into something worse. Both halves matter for whoever picks this up.**
+### Fix attempts (two so far, both reverted — read before trying a third)
 
-`npm pack`'d the real chain, one package at a time, until the actual
-host-facing contract showed up:
+**Attempt 1 — naive 1:1 wiring.** Overrode the guest-global
+`MessageChannel` (in `worker.ts`'s own `Object.assign(self, {...})`
+block, alongside where `setTimeout`/`setImmediate` already get Node-
+shaping) so its ports carry real, idempotent `.ref()`/`.unref()` wired
+straight into `eventLoop.ref()`/`unref()` — the same pattern
+`bindings/net.ts`'s `recount()` already uses for TCP/Pipe handles.
+Typechecked, all 584 unit tests passing, rebuilt clean. **Live-tested
+against the real end-to-end demo and it made things worse: the browser
+tab's own renderer froze solid** (every `javascript_exec`/screenshot call
+timed out after 45s with "the renderer may be frozen or unresponsive"),
+reproduced twice in separate fresh tabs, at roughly the point the demo
+used to cleanly (if wrongly) exit — i.e., right around `resolveId()`.
+Reverted immediately.
 
-- `@rolldown/binding-wasm32-wasi`'s own `rolldown-binding.wasi.cjs` calls
-  `instantiateNapiModuleSync(..., { plugins: [emnapiAsyncWorkPlugin,
-  emnapiTSFNPlugin] })` - **the JS-emulated, single-threaded async-work
-  path**, not real shared-memory threads. So the earlier
-  `worker_threads`/thread-spawn angle was a dead end from the start: this
-  specific native call was never going through real threads at all.
-- `@napi-rs/wasm-runtime`'s own doc comment spells this out directly:
-  single-threaded WASI builds link an emnapi archive whose C async-work/
-  threadsafe-function implementations are unconditional
-  `napi_generic_failure` stubs, so the *JS* implementations
-  (`emnapiAsyncWorkPlugin`/`emnapiTSFNPlugin`, from `@emnapi/core`) provide
-  them instead.
-- `@emnapi/runtime`'s own source (`dist/emnapi.js`) shows exactly how that
-  JS-level implementation signals "don't let the process exit while this
-  native async call is pending": `this.refHandle = new
-  MessageChannel().port1`, then later `if (this.refHandle.ref) {
-  this.refHandle.ref() }` / the matching guarded `.unref()`. **This is
-  Node's real `MessagePort.ref()`/`.unref()` contract** (a real Node
-  MessagePort supports these; a real *browser* one does not) - and this
-  runtime's own `MessageChannel` was never overridden to add them, so
-  every one of these calls was a silently-swallowed no-op the whole time.
-  Nothing ties emnapi's own "is native async work still pending" signal to
-  this runtime's `eventLoop.ref()`/`unref()` at all - so from `drain()`'s
-  point of view, a queued `resolveId()` call on `builtin:oxc-runtime`
-  looks exactly like "nothing happening," even while it's genuinely still
-  in flight.
+Leading (unconfirmed — the frozen tab couldn't be inspected further)
+theory: a livelock, not a deadlock. `eventLoop.ts`'s own `wake()` fires on
+every `ref()`/`unref()` call. If `emnapiAsyncWorkPlugin`'s own JS-emulated
+polling toggles this port's ref state at high frequency (plausible, as a
+substitute for what would otherwise be a blocking native wait), real
+ref-counting turns each toggle into a real wake-and-recheck cycle —
+something that cost nothing as a no-op could saturate the event loop once
+it actually does something.
 
-**Attempted fix:** overrode the guest-global `MessageChannel` (in
-`worker.ts`'s own `Object.assign(self, {...})` block, right where
-`setTimeout`/`setImmediate` already get the same Node-shaping treatment)
-so its ports carry real, idempotent `.ref()`/`.unref()` wired straight
-into `eventLoop.ref()`/`unref()` - the exact same pattern `bindings/
-net.ts`'s `recount()` already uses for TCP/Pipe handles. Typechecked,
-unit-tested (584 passing), and rebuilt clean.
+**Attempt 2 — debounced.** Same override, but `wrapRefPort` now debounces
+release through a real, *untracked* host timer (specifically NOT
+`eventLoop.setTimeout`, which would itself call `wake()` on every single
+`unref()` and reintroduce the same problem one level down): `.ref()`
+cancels any pending release and re-refs immediately if not already ref'd;
+`.unref()` starts (or leaves running) a `REF_PORT_DEBOUNCE_MS = 100`
+window that only calls `eventLoop.unref()` once it fires with no
+intervening `.ref()` — same shape as `worker_threads.ts`'s own
+`UNREF_DEBOUNCE_MS`. Building this also surfaced a real, independent bug
+worth keeping regardless of the rest of this fix: `eventLoop.ts`'s own
+`yieldToMicrotasks()` had a bare, uncaptured `new MessageChannel()` — the
+exact "a global override will shadow this once boot() runs" hazard its
+neighboring `nativeSetTimeout` comment already documents for `setTimeout`
+specifically, just never applied to `MessageChannel` too. Fixed alongside
+(both `eventLoop.ts` and `worker_threads.ts`'s own `DwcMessageChannel`
+now capture `nativeMessageChannel` at module load, matching
+`nativeSetTimeout`'s existing precedent) — this part is correct and safe
+independent of anything else in this section.
 
-**Live-tested it against the real end-to-end demo - and it made things
-worse, not better: the browser tab's own renderer froze solid** (every
-`javascript_exec`/screenshot call timed out after 45s with "the renderer
-may be frozen or unresponsive"), reproduced twice in a row in two
-separate fresh tabs, at roughly the same point the demo used to cleanly
-(if wrongly) exit. **Reverted immediately** (`git checkout --` on
-`worker.ts`, rebuilt) rather than leave a change in the tree that's
-strictly worse than the bug it was meant to fix - a full tab freeze is a
-worse failure mode than today's clean, silent early exit.
+Typechecked, 584 tests passing, rebuilt. **Live-tested again — this time
+polling tab responsiveness every ~10s instead of waiting blindly, which
+is exactly how this was caught: froze again, but at a DIFFERENT point** —
+not during `resolveId`/`oxc-runtime` this time, but earlier, during the
+`[rolldown] Downloading @rolldown/binding-wasm32-wasi@1.2.7 on
+WebContainer...`/`execFileSync` step, before `buildStart()` or any native
+plugin hook had even run. Reverted again.
 
-**Why the naive 1:1 wiring likely backfires (not confirmed with further
-tracing - the tab was frozen, nothing left to inspect):** the most likely
-explanation is a livelock, not a deadlock. `eventLoop.ts`'s own `wake()`
-fires on every `ref()`/`unref()` call, waking anything parked in
-`runOnce()`'s `waitForWake()` branch. If `emnapiAsyncWorkPlugin`'s own
-pending/queued-work bookkeeping calls `.ref()`/`.unref()` at a high
-frequency as part of its own internal polling (plausible, given it's a
-*JS-emulated* substitute for what would otherwise be a blocking native
-wait), real ref-counting turns each of those calls into a real wake-and-
-recheck cycle - something that cost nothing as a no-op could easily
-saturate this worker's own event loop once it actually does something,
-starving whatever else needs a turn (including, apparently, enough of the
-browser's own task queue to freeze the tab's main thread too). This is a
-guess at the mechanism, not a confirmed diagnosis - the frozen tab
-couldn't be inspected further.
+**Two different freeze locations across two different fix shapes is a
+meaningful signal**: it points away from "ref/unref frequency on one
+specific call" and toward something more structural about globally
+overriding `MessageChannel` at all — maybe how broadly a global override
+reaches (literally every `new MessageChannel()` in this worker's realm,
+including inside real vendored library code with its own assumptions),
+maybe something about the wrapped object's shape. The debounce logic
+specifically was never even exercised by the second freeze (it happened
+before any native async-work call would run), which rules out "the
+debounce math has a bug" as the explanation for *that* occurrence.
 
-**Update, same session: tried the debounced version - froze the tab again,
-at a DIFFERENT point.** Implemented exactly the fix proposed above:
+**Follow-up isolated test — clean, no freeze.** Per the plan below, wrote
+a tiny standalone script (no vite, no rolldown, no npm at all) exercising
+the override alone: one basic channel+ref/unref, 200 `MessageChannel`s
+created in a loop (mimicking `yieldToMicrotasks()`'s own repeated usage),
+5000 rapid *synchronous* `ref()`/`unref()` toggles on one port, and 500
+*async* (one microtask apart) toggles. All four levels completed in
+**~216ms total, exit code 0, no freeze, tab fully responsive
+immediately after.** This means the override's basic mechanics — channel
+creation, message passing, ref/unref bookkeeping, even under real stress
+— are NOT the problem. Whatever causes the freeze only shows up in
+combination with the real vite/rolldown/WASM pipeline specifically -
+narrower than before, but still not pinned down.
 
-- `eventLoop.ts` and `worker_threads.ts` first got their own
-  `nativeMessageChannel` captures (module-load-time, mirroring
-  `nativeSetTimeout`'s own existing precedent) so overriding the guest-
-  global `MessageChannel` couldn't shadow either's own internal usage -
-  a real, independent bug this session found while designing the retry
-  (eventLoop.ts's `yieldToMicrotasks()` had a bare, uncaptured
-  `new MessageChannel()`, exactly the "captured before boot() can shadow
-  it" hazard its own neighboring `nativeSetTimeout` comment already
-  documents for `setTimeout` specifically - it just hadn't been applied to
-  `MessageChannel` too).
-- `wrapRefPort` then debounced via a real, untracked host timer (NOT
-  `eventLoop.setTimeout`, which would itself call `wake()` on every single
-  `unref()` and reintroduce the same problem one level down):
-  `.ref()` cancels any pending release and re-refs immediately if not
-  already ref'd; `.unref()` starts (or leaves running) a
-  `REF_PORT_DEBOUNCE_MS = 100` timer that only calls `eventLoop.unref()`
-  once it actually fires with no intervening `.ref()`. Typechecked, all
-  584 tests passing, rebuilt clean.
+**Current repo state:** the debounced fix (attempt 2, plus the
+independent `nativeMessageChannel`-capture correctness fixes) was
+re-applied after the isolated test passed, and is either committed or
+sitting in the working tree as of this writing — check `git log`/`git
+status` on `eventLoop.ts`, `builtins/worker_threads.ts`, and
+`workers/process/worker.ts` to see exactly which. **It has NOT been
+re-verified against the real end-to-end demo since the isolated test was
+added.** Treat it as "passed a stress test in isolation, unknown against
+the real pipeline" — not as fixed.
 
-**Live-tested again, polling responsiveness every ~10s instead of waiting
-blindly this time - froze again, reproduced once,** but at a materially
-different point: not during `resolveId`/`oxc-runtime` (where the first,
-non-debounced attempt froze), but earlier, **during the `[rolldown]
-Downloading @rolldown/binding-wasm32-wasi@1.2.7 on WebContainer...` /
-`execFileSync` step** - before `buildStart()` or any native plugin hook
-had even run. Reverted immediately again (`git checkout --` on all three
-files, rebuilt, 584 tests still passing).
+### Concrete next steps, in order
 
-**This changes the diagnosis.** Two different freeze *locations* across
-two different fix *shapes* (naive 1:1, then debounced) both landing on
-"browser tab freezes solid" is a stronger signal that the problem is
-**structural to globally overriding `MessageChannel` itself** - something
-about wrapping the constructor's *output* (returning `port1`/`port2` off
-a plain class instance rather than the real `MessageChannel` object) or
-about how broadly a global override reaches (literally every `new
-MessageChannel()` anywhere in this worker's realm, including inside
-real, unmodified vendored library code with its own assumptions) - rather
-than specifically about ref/unref call frequency on one particular native
-plugin's async dispatch. The debounce logic itself was never actually
-exercised by the second freeze (it happened before any native async-work
-plugin call would even run), which rules out "the debounce math has a
-bug" as the culprit for *that* occurrence specifically.
+1. **Before anything else: re-run the real end-to-end demo against the
+   current code, polling tab responsiveness every ~10s** (not a blind
+   wait — that's the only reason the second freeze's different location
+   was ever caught). Three possible outcomes:
+   - It freezes again → the bug is real and still unfound; go to step 2.
+   - It doesn't freeze but still exits early without reaching `Local:` →
+     progress, but the ref-counting fix isn't sufficient by itself; look
+     at what's happening right at/after wherever it now gets to.
+   - It reaches `Local:` and the preview actually renders → **this closes
+     out items 1, 2, 3, and 7 in this file all at once** — real npm
+     install, real npm create, and a real running Vite dev server
+     previewed live, for the first time. Still fix `waitForMarker()`
+     (found in step 2 of the diagnostic chain above) regardless, and
+     separately verify HMR (item 4) still hasn't been addressed at all.
+2. **If it freezes again: grow the isolated test toward the real
+   pipeline incrementally, rather than jumping straight back to the full
+   thing.** The isolated test proved the override alone is fine; the
+   real pipeline combination isn't. Useful intermediate steps, cheapest
+   first: (a) the isolated test's `MessageChannel` stress, but running
+   *concurrently* with a real blocking `execFileSync` call (since the
+   second freeze happened right around that step); (b) requiring the
+   real WASI binding module (`rolldown-binding.wasi.cjs`) and calling a
+   *different* native async method than `resolveId` on a builtin plugin,
+   to see if the freeze is specific to that one call or general to any
+   native async dispatch; (c) only once one of these reproduces a freeze
+   should live end-to-end testing resume.
+3. Independent of all of the above: fix `waitForMarker()` regardless (see
+   step 2 of the diagnostic chain) so a future run that fails differently
+   still surfaces clearly instead of silently reaching a preview that was
+   never going to work.
 
-**Concrete next step, in order of cost - given two live freezes, the
-right next move is a MUCH more isolated test, not a third live attempt
-against the full multi-minute pipeline:**
-1. **Test the `MessageChannel` override completely alone, outside the
-   vite/rolldown pipeline entirely** - a tiny guest script that does
-   nothing but `new MessageChannel()` a few times, `.postMessage()`
-   between the ports a few times, and `.ref()`/`.unref()` a few times,
-   run via the same `dwc.process.spawn('/bin/foo.js', ...)` isolated-
-   repro technique used successfully elsewhere this session. If THIS
-   alone freezes, the bug is in the override's basic mechanics (the wrong
-   thing to have spent two live end-to-end attempts discovering). If it
-   doesn't, incrementally add complexity (many rapid `new
-   MessageChannel()` calls in a loop, matching what `yieldToMicrotasks()`
-   does every `runOnce()`; heavy message traffic between ports) until one
-   step reproduces a freeze in isolation - far cheaper to iterate on than
-   a multi-minute real npm install each time.
-2. Once reproduced in isolation: this is finally in a debuggable
-   state (a tab that freezes on a small, known script, not deep inside a
-   real WASM binary's own async dispatch) - actually inspect *why*, rather
-   than reverting again on schedule.
-3. Only once a version survives an ISOLATED stress test should it go back
-   to a live end-to-end run - and even then, poll responsiveness
-   frequently throughout (as this session's second attempt did, which is
-   how the freeze's new, earlier location was caught at all) rather than
-   waiting blindly.
-4. Independently of the above: fix `waitForMarker()` (item 1 at the top of
-   this section) regardless, so future runs surface "vite exited early"
-   as a visible, distinct failure instead of silently reaching the
-   preview step every time.
+### Diagnostic techniques learned this session (worth reusing, not
+re-discovering)
 
-**Diagnostic technique notes for whoever picks this up (all learned live
-this session, worth keeping in mind before re-inventing them):**
 - **`read_console_messages` (browser automation) only reliably captures
   the main page thread's console.** `console.log()` calls from inside a
   nested Worker (the kernel worker, a process worker, etc.) do fire, but
-  don't show up through that tool - confirmed by adding logging that
+  don't show up through that tool — confirmed by adding logging that
   never appeared no matter how it was searched for, until it was rerouted
-  through the existing `cp-event`(kind: `"stdout"`/`"stderr"`) relay
+  through the existing `cp-event` (`kind: "stdout"`/`"stderr"`) relay
   mechanism (`worker.postMessage({ type: "cp-event", payload: { id, kind:
   "stderr", chunk: ... } })`, using the same request `id` a spawn is
   already tracking, or `onEvent("stderr", { chunk }, "")` inside
-  `processClient.ts` functions that already have an `onEvent` in scope) -
+  `processClient.ts` functions that already have an `onEvent` in scope) —
   at which point it appeared immediately as ordinary stdout/stderr on
   whatever host-visible process was already being piped.
 - **The vendored guest `console.log()` (`worker.ts`) stringifies via
-  `args.map(String).join(" ")`** - passing an object logs the useless
+  `args.map(String).join(" ")`** — passing an object logs the useless
   `[object Object]`. Always `JSON.stringify()` first when relaying trace
   data through it or through the `cp-event` stderr channel above.
 - **`//# sourceURL=dwc://module<path>` was added to `moduleLoader.ts`'s
   `new Function` compilation this session** (committed separately,
-  `4d0f2b6`, kept - not reverted with the rest of this session's debug
-  code) - every guest stack trace now names the real vendored file
-  instead of `eval at loadModule (...), <anonymous>:N:M`. This is what
-  turned an unattributable `process.exit(0)` call into an immediately
-  actionable `npm/lib/cli/exit-handler.js:171`, and should make every
-  future guest-code debugging session in this runtime faster.
+  `4d0f2b6`, kept) — every guest stack trace now names the real vendored
+  file instead of `eval at loadModule (...), <anonymous>:N:M`. This is
+  what turned an unattributable `process.exit(0)` call into an
+  immediately actionable `npm/lib/cli/exit-handler.js:171`, and should
+  make every future guest-code debugging session in this runtime faster.
 - **A single-file isolated repro is much faster than the full cycle** for
   testing one hypothesis at a time: `dwc.fs.writeFile('/bin/foo.js',
   script)` then `dwc.process.spawn('/bin/foo.js', { argv: [], cwd: '/' })`
-  runs in seconds, versus several real minutes for a fresh `npm create
-  vite` → `npm install` → `npm run dev` cycle. Also: `dwc.process.spawn`
-  (the **host-facing** API) does not support the `command === "node"` +
-  script-argv special case guest-side `child_process.spawn()`/shell
-  dispatch gets via `resolveEntryPoint` - always give it a real, existing
-  file path as `command` directly, not `"node"` as the command with the
-  script as an arg.
+  runs in well under a second, versus several real minutes for a fresh
+  `npm create vite` → `npm install` → `npm run dev` cycle. This is how
+  BOTH the "basic worker_threads+sync-fs is fine" ruling-out (step 5) AND
+  the final "the override alone is fine in isolation" finding were
+  produced cheaply. Also: `dwc.process.spawn` (the **host-facing** API)
+  does not support the `command === "node"` + script-argv special case
+  guest-side `child_process.spawn()`/shell dispatch gets via
+  `resolveEntryPoint` — always give it a real, existing file path as
+  `command` directly, not `"node"` as the command with the script as an
+  arg.
 - **Patching a real npm/dependency file directly inside the guest VFS**
-  (read via `dwc.fs.readFile`, string-`replace()` in the browser to avoid
-  ever pulling a large file through the agent's own context/hitting the
-  browser tool's base64/cookie-like-data output filter, `dwc.fs.writeFile`
-  back) is a fast way to add temporary tracing to real vendored dependency
-  code (npm itself, `@npmcli/run-script`, `@npmcli/promise-spawn`, the
-  real rolldown `dist/shared/binding-*.mjs` fallback) without needing a
-  local checkout - `npm pack <pkg>@<version>` into a scratch directory
-  gives you the exact same source to diff against/copy patches from
-  first. These VFS patches don't persist across a real npm reinstall (this
+  (read via `dwc.fs.readFile`, string-`replace()` *in the browser* to
+  avoid ever pulling a large file through the agent's own context or
+  hitting the browser tool's base64/cookie-like-data output filter, then
+  `dwc.fs.writeFile` back) is a fast way to add temporary tracing to real
+  vendored dependency code (npm itself, `@npmcli/run-script`,
+  `@npmcli/promise-spawn`, real vite's own `dist/node/chunks/node.js`,
+  real rolldown's `dist/shared/binding-*.mjs`) without needing a local
+  checkout — `npm pack <pkg>@<version>` into a scratch directory first
+  gives the exact same source to diff against/copy exact patch text from.
+  These VFS patches don't persist across a real npm reinstall (this
   demo's own `npm create vite` reinstalls `/my-app` fresh on every page
   reload), so they're inherently throwaway and need no cleanup.
+- **When a live test might freeze the tab: poll responsiveness on a short
+  interval (~10s) rather than waiting blindly for the outcome.** This is
+  the only reason the second fix attempt's freeze was caught at a
+  *different, informative* location instead of just "it froze again,
+  somewhere" — a `javascript_exec` call as simple as
+  `document.readyState` timing out after 45s ("the renderer may be
+  frozen or unresponsive") is the tell; when it happens, close the tab
+  (don't keep retrying against a frozen one) and start a fresh one for
+  the next attempt.
 
 ## Reminder: no AI attribution in commits
 
