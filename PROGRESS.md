@@ -391,11 +391,14 @@ remains technically open. Practical read: the threading avenue has hit
 its limit without real WASM/Rust debugging tools this project doesn't
 have — see item 9's own "Concrete next steps" for the WASI-shim read
 still worth doing. Of the two independent, actionable bugs found along
-the way, one is now FIXED: `preview.fetch()` no longer hangs forever
-when its process crashes mid-request (root cause was `netRelay.ts`
-silently dropping a dead connection without notifying the peer - see
-item 9, commit `b42d591`). The `toHeaders`/`toUTCString` static-asset
-500 is still open and is the next concrete, self-contained fix.**
+the way: `preview.fetch()` no longer hangs forever when its process
+crashes mid-request (root cause was `netRelay.ts` silently dropping a
+dead connection without notifying the peer — commit `b42d591`). The
+`toHeaders`/`toUTCString` static-asset crash is also fixed (`fs.ts`'s
+`StatResult` now carries a real `mtime: Date` — commit `b363913`), but
+that unmasked a bigger, still-open gap right behind it: this runtime's
+`fs` builtin has no `createReadStream` at all, so static assets through
+a real dev server still 500 on a different error now.**
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2722,10 +2725,35 @@ that would corrupt memory even on one thread, is still open.
    Added two new tests in `netRelay.test.ts` covering both cleanup paths'
    peer-notification directly. Typecheck clean, full suite (586 tests)
    green, build clean. Commit `b42d591`.
-4. Fix the static-asset `toHeaders`/`toUTCString` bug (new bug above) -
-   independent, much smaller, likely a missing real `Date` value in this
-   runtime's own fs-stat/mtime emulation feeding vite's static-file
-   header synthesis.
+4. ~~Fix the static-asset `toHeaders`/`toUTCString` bug~~ — **PARTIALLY
+   DONE, and a bigger gap found underneath.** Root cause was exactly as
+   suspected: `runtime/builtins/fs.ts`'s `StatResult` only ever exposed
+   `mtimeMs` (a number) - real Vite's own static-file-serving middleware
+   builds its `Last-Modified` header via `stat.mtime.toUTCString()`, and
+   `stat.mtime` was `undefined`. Added a real `mtime: Date` field
+   (`new Date(response.mtimeMs)`) to both `statSync`/`lstatSync`'s return
+   shape (the async `stat`/`lstat`/`fs.promises` variants all delegate to
+   these, so one fix covers every entry point). New test added
+   (`fs.test.ts`) asserting `mtime` is a real `Date` whose `.toUTCString()`
+   doesn't throw and matches `mtimeMs`. Typecheck clean, full suite (587
+   tests) green, build clean. Commit `b363913`.
+   **Verified live - the original crash is gone** (`/favicon.svg` now
+   gets a real `Last-Modified` header), **but the request still 500s, on
+   a NEW, later error: `fs$2.createReadStream is not a function`.** Real
+   Vite's static-file-serving code goes on to stream the file via
+   `fs.createReadStream(...)`, which this runtime's own `fs` builtin
+   doesn't implement at all (grepped - zero references). This is a
+   materially bigger gap than the one-field `mtime` fix (a real Node
+   `fs.createReadStream` returns an actual `stream.Readable`, and real
+   `send`/`serve-static`-shaped middleware typically also expects
+   `{start, end}` range support for HTTP range requests) - left
+   unimplemented for now rather than scope-creeping this fix; worth
+   picking up as its own follow-up whenever static-asset serving through
+   a real dev server is the priority again. Until then, static assets
+   through a real `vite`/`rolldown` server still don't fully work, though
+   the underlying process no longer has any reason to be affected either
+   way (this bug was always independent of the item 9 WASM crash - the
+   process survives it regardless).
 5. Independent of all of the above: `waitForMarker()`'s own masking bug
    (found early in item 8, still unfixed) means the demo currently can't
    tell "reached Local: and crashed shortly after" apart from any other
