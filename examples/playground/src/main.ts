@@ -25,6 +25,14 @@ function pipeToTerminal(
 // Pipes a stream into the terminal (like pipeToTerminal) while resolving as
 // soon as a marker substring appears in it, so callers can wait for a guest
 // server to report "listening" instead of guessing a fixed delay.
+//
+// Rejects (rather than silently resolving) if the stream closes without the
+// marker ever appearing - a process that dies before printing its own ready
+// banner (a crash, a startup error) is a real failure, not "done waiting."
+// A caller can't otherwise tell "reached Local: and is actually listening"
+// apart from any other way the process might have stopped producing output -
+// see PROGRESS.md's own item 9 for a concrete case this masked (the dev
+// server crashing shortly after startup looked identical to it succeeding).
 function waitForMarker(
   stream: ReadableStream<Uint8Array>,
   terminal: Terminal,
@@ -33,8 +41,10 @@ function waitForMarker(
   const decoder = new TextDecoder();
   const reader = stream.getReader();
   let resolveFound!: () => void;
-  const found = new Promise<void>((resolve) => {
+  let rejectFound!: (error: Error) => void;
+  const found = new Promise<void>((resolve, reject) => {
     resolveFound = resolve;
+    rejectFound = reject;
   });
   let seen = false;
 
@@ -42,7 +52,7 @@ function waitForMarker(
     for (;;) {
       const { done, value } = await reader.read();
       if (done) {
-        if (!seen) resolveFound();
+        if (!seen) rejectFound(new Error(`stream closed before ${JSON.stringify(marker)} ever appeared`));
         return;
       }
       const text = decoder.decode(value, { stream: true });
@@ -146,7 +156,14 @@ async function main() {
       cwd: "/my-app",
     });
     pipeToTerminal(devProc.stderr, terminal);
-    await waitForMarker(devProc.stdout, terminal, "Local:");
+    try {
+      await waitForMarker(devProc.stdout, terminal, "Local:");
+    } catch (error) {
+      const devExit = await devProc.exit;
+      console.error("[dwc] npm run dev never reached its ready banner:", error);
+      terminal.writeln(`\r\n[npm run dev] failed before reaching "Local:" (exit=${devExit}): ${String(error)}`);
+      return;
+    }
 
     // 5) Preview it live: Service Worker relay + <iframe id="preview">.
     // Vite's own default dev-server port.
