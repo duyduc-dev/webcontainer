@@ -97,6 +97,31 @@ async function main() {
     terminal.writeln(`\r\n[npm create vite] exit=${createExit}`);
     if (createExit !== 0) return;
 
+    // 2.5) Pin the scaffolded project to Vite 7 instead of latest (Vite 8
+    // defaults to rolldown, which hits a confirmed upstream bug - a Rust
+    // static left torn down after the first native call panics on a later
+    // one - that crashes the dev server on essentially any real request;
+    // see PROGRESS.md item 9, and item 10 for this workaround's own
+    // history). Vite 7 uses esbuild instead, but plain esbuild/rollup each
+    // ship a native binary this environment can't run - `overrides`
+    // aliases both to their real WASM builds (the same technique
+    // StackBlitz-style demos use for this), verified live end-to-end:
+    // a real, interactive Vite dev server preview, no crash, dozens of
+    // repeated requests all serving correctly.
+    const packageJsonPath = "/my-app/package.json";
+    const scaffoldedPkg = JSON.parse(new TextDecoder().decode(await dwc.fs.readFile(packageJsonPath))) as {
+      devDependencies?: Record<string, string>;
+      overrides?: Record<string, string>;
+    };
+    scaffoldedPkg.devDependencies = { ...scaffoldedPkg.devDependencies, vite: "^7.0.0" };
+    scaffoldedPkg.overrides = {
+      ...scaffoldedPkg.overrides,
+      esbuild: "npm:esbuild-wasm@^0.25.0",
+      rollup: "npm:@rollup/wasm-node@^4.43.0",
+    };
+    await dwc.fs.writeFile(packageJsonPath, JSON.stringify(scaffoldedPkg, null, 2));
+    terminal.writeln("[dwc] pinned vite to ^7.0.0 (esbuild-wasm/@rollup/wasm-node overrides) to avoid item 9's rolldown crash");
+
     // 3) Real `npm install` inside the scaffolded project - installs vite
     // itself plus every real dependency the vanilla template's own
     // package.json lists.
