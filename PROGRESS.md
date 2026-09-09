@@ -375,21 +375,20 @@ unverified steps together.
 
 **Pick up here (updated):** item 7's own "browser-profile-artifact" theory
 for the `npm run dev` preview failure is now DISPROVEN - see item 8 at the
-very end of this file. It's a real, 100%-reproducible bug, narrowed down
-precisely: the three `net.Server.listen()` calls traced on port 5173 are
-all vite's own **port-availability probes** (opened and closed
-immediately) - the real bind, and vite's own ready banner, are gated
-behind `await environments.client.pluginContainer.buildStart()` (real
-rolldown/WASM code), and the process reliably dies ~8-9 seconds into that
-call, every time, before it ever returns. Proven (via a 10,000x bump to
-`drain()`'s own idle-exit grace period, no change in outcome) that this is
-**not** an eventLoop-yield-budget issue. A plain `worker_threads.Worker` +
-synchronous `fs.readFileSync()` repro completed in under 50ms, ruling out
-the leading hypothesis (a hung sync-fs bridge call inside rolldown's own
-WASI thread pool) in its simplest form. What's next: find out exactly what
-`pluginContainer.buildStart()` calls for a bare vanilla template, and
-narrow the ~8-9s gap to one specific call. Item 8 has the complete
-diagnostic trail, what's been ruled out, and the concrete next step.
+very end of this file. It's a real, 100%-reproducible bug, and now
+narrowed down to one specific native call: **`builtin:oxc-runtime`'s
+`resolveId` hook - a direct call into native Rust/WASM code via NAPI-RS
+bridging (`BindingCallableBuiltinPlugin`), not JS - never resolves or
+rejects.** Every plugin's `buildStart` hook completes in milliseconds; the
+very next step, `pluginContainer.resolveId("index.html", ...)`, reaches
+that one native plugin and just hangs, every run, until the process is
+torn down ~2.6-2.7s later. Manually calling
+`nativeBinding.startAsyncRuntime()` before running vite does NOT fix it -
+tested directly. What's next: this needs napi-rs/`@napi-rs/wasm-runtime`'s
+own WASI-threads async-dispatch source read directly (real, published
+package - `npm pack` it), since no more JS-level tracing can see inside
+the native call itself. Item 8 has the complete diagnostic trail, what's
+been ruled out, and the concrete next step.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -1680,27 +1679,80 @@ real low-level `listen()` call - see technique notes below):
   whatever's actually slow/hanging inside `buildStart()` is something more
   specific than that.
 
-**Concrete next step, in order of cost - the search space is now much
-narrower than "somewhere in vite's dev-server startup":**
-1. **Find out what `pluginContainer.buildStart()` actually calls.** It's
-   real, unmodified vite/rolldown code (`npm pack vite@8.2.2` locally
-   already has it) - read `environments.client.pluginContainer
-   .buildStart` and whatever plugin hooks it invokes for a bare vanilla
-   template (dep optimizer warm-up? a first call into
-   `nativeBinding.startAsyncRuntime()` or `BindingDevEngine`? a
-   `worker_threads.Worker` spawn for rolldown's own thread pool that looks
-   different from the minimal repro above - e.g. spawning *multiple*
-   workers, or one that itself calls back into more native code before
-   its first message?). The goal is a *specific* call to try in isolation
-   the same way the plain-`fs.readFileSync`-in-a-Worker repro was tried.
-2. Once the specific slow/hung call is identified, patch temporarily
-   *inside its own worker_threads.Worker child script* (if it is one) or
-   at the calling site with the same `Date.now()`-timestamped
-   `console.log` technique used above, to see exactly where the ~8-9s
-   goes: waiting on a message that never arrives, `Atomics.wait` timing
-   out, or something else in `worker_threads.ts`'s own `ready`/spawn
-   machinery.
-3. Once root-caused: fix `waitForMarker()` (item 1 at the top of this
+**Update, same session: found the exact hanging call.** Patched
+`hookParallel()` (the loop `buildStart()` uses to run every plugin's
+`buildStart` hook) with per-plugin `Date.now()`-timestamped tracing -
+**every plugin's `buildStart` hook completes in under 3ms**, all 8 of them
+(`vite:watch-package-data`, `alias`, `vite:resolve-builtin:get-environment`,
+`vite:css`, `vite:worker`, `vite:asset`, `vite:import-glob`,
+`vite:client-inject`). `buildStart()` itself isn't the hang.
+
+What runs immediately after `buildStart()` resolves, per its own source
+(`_registerInputsAsSafeModules()`), is `pluginContainer.resolveId("index.html",
+..., { isEntry: true, scan: true })` - and *that* is where it hangs.
+Patched the `resolveId` plugin loop (`PluginContainer.resolveId`, same
+file) with the same per-plugin timestamped tracing:
+
+```
+resolveId START builtin:oxc-runtime rawId=index.html <T>
+```
+
+**...and nothing else, ever.** No `resolveId DONE`, no error, for that
+plugin - across every run. The process then exits ~2.6-2.7s later (a
+tighter, more consistent window than the earlier ~8-9s figure, which
+included the slower buildStart-hook-tracing overhead of that patch
+revision).
+
+`builtin:oxc-runtime` is not a JS plugin - tracing it back through
+rolldown's own real source (`npm pack rolldown@1.2.7` locally) shows
+`oxcRuntimePlugin()` (`src/builtin-plugin/constructors.ts`) constructs a
+`BuiltinPlugin` and wraps it via `makeBuiltinPluginCallable()`
+(`src/builtin-plugin/utils.ts`), which does:
+
+```js
+let callablePlugin = new import_binding.BindingCallableBuiltinPlugin(...);
+const wrappedHook = async function(...args) {
+  return await callablePlugin[key](...args);   // key = "resolveId" here
+};
+```
+
+**So `resolveId` for this plugin is a direct call into native Rust/WASM
+code** (`BindingCallableBuiltinPlugin`, one of the native binding's own
+exported classes) via NAPI-RS bridging - not JS at all. The `await` on
+that native async method call is what never settles.
+
+**Tested and ruled out: manually calling `nativeBinding.startAsyncRuntime()`
+does not fix it.** Patched rolldown's own binding loader
+(`dist/shared/binding-*.mjs`, right after `module.exports = nativeBinding`)
+to call `startAsyncRuntime()` unconditionally before vite ever runs -
+confirmed via trace that the call itself returns successfully
+(`startAsyncRuntime() returned`, no throw) - and the exact same hang at
+the exact same `resolveId START builtin:oxc-runtime` point still happened
+immediately after. Whatever native async-dispatch mechanism this
+particular call depends on either needs something startAsyncRuntime()
+alone doesn't provide, or isn't related to that mechanism at all.
+
+**Concrete next step, in order of cost - now narrowed to one specific
+native async call, not "somewhere in vite's dev server":**
+1. **Understand what makes a `BindingCallableBuiltinPlugin`'s native async
+   hook actually resolve, at the napi-rs/WASI level.** In real Node, a
+   napi-rs native addon's async methods typically ride on libuv's thread
+   pool (or a `ThreadsafeFunction`/tokio bridge) to run the Rust future to
+   completion and wake the JS Promise - none of which this WASM-in-browser
+   runtime has a real equivalent for today. `startAsyncRuntime()` not
+   fixing it suggests either a *second*, undiscovered initialization step,
+   or that this specific native call's completion signal needs to reach JS
+   through a channel this runtime doesn't yet bridge (a `worker_threads`
+   message in a shape the minimal repro didn't exercise, a `wasi_thread_spawn`
+   call this runtime's `thread-spawn` import doesn't handle the same way,
+   or a native timer/poll primitive with no JS-visible counterpart at
+   all). Given no further JS-level tracing can see *inside* the WASM call
+   itself, the next productive step is almost certainly reading napi-rs's
+   own WASI-threads runtime source (`@napi-rs/wasm-runtime`, real published
+   package - `npm pack` it the same way rolldown/vite were pulled this
+   session) for what its async dispatch actually requires from the host,
+   rather than more guess-and-check tracing from the vite/rolldown side.
+2. Once root-caused: fix `waitForMarker()` (item 1 at the top of this
    section) regardless, so future runs surface "vite exited early" as a
    visible, distinct failure instead of silently reaching the preview step
    every time.
