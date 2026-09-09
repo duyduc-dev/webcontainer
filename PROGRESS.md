@@ -375,14 +375,21 @@ unverified steps together.
 
 **Pick up here (updated):** item 7's own "browser-profile-artifact" theory
 for the `npm run dev` preview failure is now DISPROVEN - see item 8 at the
-very end of this file. It's a real, 100%-reproducible bug: vite's own
-process genuinely calls `net.Server.listen()` on the correct port (5173)
-and then exits cleanly (`code: 0`, no error) before ever printing its own
-ready banner. The full call chain from `cp-spawn` through vite's own exit
-is traced end-to-end; what's NOT yet identified is the exact reason vite's
-process considers itself done right after (or during) binding that
-listener. Item 8 has the complete diagnostic trail, what's been ruled out,
-and the concrete next step.
+very end of this file. It's a real, 100%-reproducible bug, narrowed down
+precisely: the three `net.Server.listen()` calls traced on port 5173 are
+all vite's own **port-availability probes** (opened and closed
+immediately) - the real bind, and vite's own ready banner, are gated
+behind `await environments.client.pluginContainer.buildStart()` (real
+rolldown/WASM code), and the process reliably dies ~8-9 seconds into that
+call, every time, before it ever returns. Proven (via a 10,000x bump to
+`drain()`'s own idle-exit grace period, no change in outcome) that this is
+**not** an eventLoop-yield-budget issue. A plain `worker_threads.Worker` +
+synchronous `fs.readFileSync()` repro completed in under 50ms, ruling out
+the leading hypothesis (a hung sync-fs bridge call inside rolldown's own
+WASI thread pool) in its simplest form. What's next: find out exactly what
+`pluginContainer.buildStart()` calls for a bare vanilla template, and
+narrow the ~8-9s gap to one specific call. Item 8 has the complete
+diagnostic trail, what's been ruled out, and the concrete next step.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -1603,31 +1610,100 @@ for testing one hypothesis at a time):**
   real bind would produce), or (b) something else entirely is going on
   that hasn't been isolated yet. Not yet distinguished - see next step.
 
-**Concrete next step, in order of cost:**
-1. Trace `net-close-server`/`net-pipe-close-server` messages the same way
-   the `listen` events were traced this session (relay through the
-   existing `cp-event`(kind: `"stderr"`) mechanism on the SAME child's
-   `id` - see technique notes below) to see whether any of the three
-   listeners get closed again before the process's own `exit` event fires.
-   If yes, that's a live ref/unref race worth root-causing directly in
-   `net.ts`. If no listener ever closes and `activeHandles` should
-   therefore still be > 0, the bug is elsewhere (mismatched ref/unref
-   pairing, or the low-level `TCP`/`Pipe` handles that got `.listen()`
-   called on them aren't the SAME handle objects `drain()`'s eventLoop
-   instance is tracking - e.g. a handle created in a context whose
-   `eventLoop.ref()` doesn't reach the actual polling `drain()` loop).
-2. Read real vite's own `dist/node/*.js` (or `npm pack vite@8.2.2`
-   locally, same technique used for rolldown - see below) to find exactly
-   what runs between its dev server's `httpServer.listen()` call and its
-   own `printUrls()`/ready-banner code - there may be a real async step in
-   between (a port-conflict retry probe, an `optimizeDeps` warm-up, a
-   `require('node:tls')`-adjacent check, etc.) that depends on something
-   this runtime doesn't fully back, and which - critically - *also* isn't
-   visible to `drain()`'s own ref-counting the way a genuinely pending
-   fs/network operation would be.
-3. Once root-caused: fix `waitForMarker()` (item 1 above) regardless, so
-   future runs surface "vite exited early" as a visible, distinct failure
-   instead of silently reaching the preview step every time.
+**Update, same investigation, next device: the three `listen` events were
+never the real bind at all.** Read real vite's own `dist/node/chunks/
+node.js` (`npm pack vite@8.2.2` locally, same technique as below) to find
+exactly what runs between `httpServer.listen()` and `printUrls()` -
+answering the "next step" question above directly:
+
+- `httpServerStart()` calls `isPortAvailable(port)` **before** ever
+  attempting the real bind. `isPortAvailable` probes the port once per
+  entry in vite's own `wildcardHosts` Set - which has **exactly three**
+  entries (`"0.0.0.0"`, `"::"`, and `"0000:0000:0000:0000:0000:0000:0000:0000"`,
+  the same address in two notations - vite doesn't dedupe them). Each
+  probe (`tryListen()`) does `net.createServer().listen(port, host)`, then
+  **immediately closes it again** the instant `'listening'` fires. **This
+  is exactly the three `listen` events traced above - all three are
+  probes, all three get closed right away, and none of them is the real,
+  lasting server.** The user's own live "maybe it's a different port?"
+  question, asked mid-session, prompted re-checking this exact detail -
+  confirmed still the right port (5173) throughout, just never the real
+  bind.
+- Only *after* all three probes report the port free does
+  `httpServerStart()` call `tryBindServer()`, which calls
+  `httpServer.listen(port, host)` - and vite has **already overridden**
+  `httpServer.listen` earlier in `_createServer()` to run its own
+  `initServer(true)` first: `await environments.client.pluginContainer
+  .buildStart()`, then `await Promise.all(environments.map(e =>
+  e.listen(server)))`, and only *then* does it call through to the real,
+  original low-level `listen(port, host)`.
+- **This means the real bind - and vite's own ready banner - are gated
+  behind `pluginContainer.buildStart()`, a call into rolldown's own
+  native/WASM machinery. And the process reliably dies during exactly
+  that gap: a fourth `listen` event (the real one) never appears, in any
+  run.**
+
+**This session's own direct, timed repro of that exact gap** (bypass npm
+and the shell dispatch entirely - `dwc.process.spawn('.../vite/bin/
+vite.js', { cwd: '/my-app' })` directly, with the three lines above
+patched in the guest VFS copy of `node.js` to `console.log(Date.now())`
+immediately before/after `buildStart()`, `environments.listen()`, and the
+real low-level `listen()` call - see technique notes below):
+
+- Every run logs `[dwctrace] before buildStart <T>` and then **nothing
+  else at all** - no `after buildStart`, no `environments.listen`, no
+  `REAL low-level listen`, no error, no stderr - before the process exits
+  with code 0, **consistently ~8-9.2 seconds later** (8000ms, 8153ms,
+  9229ms across three separate runs).
+- **That ~8s delay is independent of `drain()`'s own idle-exit grace
+  period - the "not `DRAIN_GRACE_YIELDS`" finding above is now proven
+  twice over, precisely.** Bumped `DRAIN_GRACE_YIELDS` a second time, this
+  time 10,000x (20 → 200,000) with real timestamps on both sides: the
+  process still died at the same ~8-9s mark, not later. Whatever's
+  happening inside `buildStart()`, the eventLoop's own yield-count budget
+  has nothing to do with when it gives up - ruling out "the guest's native
+  promise chain just needed a few more yields" as an explanation
+  entirely, not just as a guess.
+- The ~8-9s isn't obviously a single hardcoded constant in this codebase
+  (grepped for `8000`/`_MS`/`_TIMEOUT` project-wide: the closest matches
+  are `SYNC_TIMEOUT_MS = 5000` in `syncFsClient.ts` and
+  `UNREF_DEBOUNCE_MS = 3000` in `worker_threads.ts` - suggestively close
+  to summing to ~8000 if they fired back-to-back, which was the leading
+  hypothesis picked up next - but not an exact, reproducible-to-the-ms
+  match either, so treat it as a lead, not a conclusion).
+- **That specific hypothesis (a synchronous fs call from inside a nested
+  `worker_threads.Worker`, as rolldown's own WASI thread pool would use,
+  hanging until `SYNC_TIMEOUT_MS` fires) was tested directly and
+  disproven**: a minimal repro - `new Worker('/bin/child.js')` where the
+  child does a plain `fs.readFileSync()` and posts back - completed in
+  under 50ms, no hang, no timeout. Basic worker_threads + sync-fs is fine;
+  whatever's actually slow/hanging inside `buildStart()` is something more
+  specific than that.
+
+**Concrete next step, in order of cost - the search space is now much
+narrower than "somewhere in vite's dev-server startup":**
+1. **Find out what `pluginContainer.buildStart()` actually calls.** It's
+   real, unmodified vite/rolldown code (`npm pack vite@8.2.2` locally
+   already has it) - read `environments.client.pluginContainer
+   .buildStart` and whatever plugin hooks it invokes for a bare vanilla
+   template (dep optimizer warm-up? a first call into
+   `nativeBinding.startAsyncRuntime()` or `BindingDevEngine`? a
+   `worker_threads.Worker` spawn for rolldown's own thread pool that looks
+   different from the minimal repro above - e.g. spawning *multiple*
+   workers, or one that itself calls back into more native code before
+   its first message?). The goal is a *specific* call to try in isolation
+   the same way the plain-`fs.readFileSync`-in-a-Worker repro was tried.
+2. Once the specific slow/hung call is identified, patch temporarily
+   *inside its own worker_threads.Worker child script* (if it is one) or
+   at the calling site with the same `Date.now()`-timestamped
+   `console.log` technique used above, to see exactly where the ~8-9s
+   goes: waiting on a message that never arrives, `Atomics.wait` timing
+   out, or something else in `worker_threads.ts`'s own `ready`/spawn
+   machinery.
+3. Once root-caused: fix `waitForMarker()` (item 1 at the top of this
+   section) regardless, so future runs surface "vite exited early" as a
+   visible, distinct failure instead of silently reaching the preview step
+   every time.
 
 **Diagnostic technique notes for whoever picks this up (all learned live
 this session, worth keeping in mind before re-inventing them):**
