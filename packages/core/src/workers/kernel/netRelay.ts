@@ -59,12 +59,26 @@ const createNetRelay = (): NetRelay => {
     workers.set(processId, worker);
   };
 
+  // Notifies whichever end of `connId` did NOT go away, mirroring relay()'s
+  // own pipe-close forwarding below — without this, a peer mid-request
+  // (e.g. previewRelay.ts's fetchFromGuestServer, awaiting a response via
+  // registerVirtualClient) never learns its connection died and its promise
+  // hangs forever. Confirmed live: a process worker crashing mid-request
+  // (a WASM trap - see PROGRESS.md item 9) left a pending dwc.preview.fetch()
+  // call unsettled indefinitely, not merely slow.
+  const notifyPeerOfDeath = (connId: number, deadId: string, conn: { clientProcessId: string; serverProcessId: string }): void => {
+    const peerId = conn.clientProcessId === deadId ? conn.serverProcessId : conn.clientProcessId;
+    send(peerId, { type: "net-pipe-message", payload: { type: "pipe-close", connId } satisfies PipeRelayMessage });
+  };
+
   const unregisterWorker = (processId: string): void => {
     workers.delete(processId);
     for (const [port, owner] of listeners) if (owner === processId) listeners.delete(port);
     for (const [key, owner] of pipeListeners) if (owner === processId) pipeListeners.delete(key);
     for (const [connId, conn] of pipeConns) {
-      if (conn.clientProcessId === processId || conn.serverProcessId === processId) pipeConns.delete(connId);
+      if (conn.clientProcessId !== processId && conn.serverProcessId !== processId) continue;
+      pipeConns.delete(connId);
+      notifyPeerOfDeath(connId, processId, conn);
     }
   };
 
@@ -75,7 +89,9 @@ const createNetRelay = (): NetRelay => {
   const unregisterVirtualClient = (clientId: string): void => {
     virtualClients.delete(clientId);
     for (const [connId, conn] of pipeConns) {
-      if (conn.clientProcessId === clientId || conn.serverProcessId === clientId) pipeConns.delete(connId);
+      if (conn.clientProcessId !== clientId && conn.serverProcessId !== clientId) continue;
+      pipeConns.delete(connId);
+      notifyPeerOfDeath(connId, clientId, conn);
     }
   };
 

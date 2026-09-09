@@ -101,6 +101,26 @@ describe("createNetRelay", () => {
     expect(client.postMessage).not.toHaveBeenCalled();
   });
 
+  // A worker crashing (worker.onerror, e.g. a WASM trap - see PROGRESS.md
+  // item 9) tears down mid-request with no graceful pipe-close of its own.
+  // Without this, the other end of an in-flight connection (a real Process
+  // Worker, or previewRelay.ts's virtual client) never learns the
+  // connection died and hangs forever awaiting a reply that will never come.
+  it("unregisterWorker notifies the OTHER end of each live connection with a pipe-close", () => {
+    const relay = createNetRelay();
+    const server = fakeWorker();
+    const client = fakeWorker();
+    relay.registerWorker("server-1", server);
+    relay.registerWorker("client-1", client);
+    relay.pipeListen("server-1", "key");
+    const connId = relay.pipeConnect("client-1", "key");
+    client.postMessage.mockClear();
+
+    relay.unregisterWorker("server-1");
+
+    expect(client.postMessage).toHaveBeenCalledWith({ type: "net-pipe-message", payload: { type: "pipe-close", connId } });
+  });
+
   // Traced need: the dev-server preview feature has the KERNEL itself dial
   // into a guest's listening port on the host page's behalf - it isn't a
   // real Process Worker, so it can't be `registerWorker()`'d the normal way.
@@ -169,6 +189,21 @@ describe("createNetRelay", () => {
 
       relay.relay("server-1", { type: "pipe-data", connId, chunk: new Uint8Array() });
       expect(server.postMessage).not.toHaveBeenCalled();
+    });
+
+    it("the server's own crash (unregisterWorker) notifies a still-waiting virtual client with a pipe-close, not silence", () => {
+      const relay = createNetRelay();
+      const server = fakeWorker();
+      relay.registerWorker("server-1", server);
+      relay.pipeListen("server-1", "key");
+
+      const received: unknown[] = [];
+      relay.registerVirtualClient("preview-1", (message) => received.push(message));
+      const connId = relay.pipeConnect("preview-1", "key");
+
+      relay.unregisterWorker("server-1");
+
+      expect(received).toEqual([{ type: "pipe-close", connId }]);
     });
   });
 
