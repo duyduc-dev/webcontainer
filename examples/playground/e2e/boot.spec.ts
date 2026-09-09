@@ -1,264 +1,66 @@
 import { expect, test } from "@playwright/test";
 
-test("bootDWC() completes a real PING/PONG handshake against the kernel worker", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
+// The whole flow (a real `npm create vite@latest`, pinning the scaffold to
+// Vite 7 + the esbuild-wasm/@rollup/wasm-node overrides, a real `npm
+// install` against the real registry, `npm run dev`, then a real request
+// the guest server actually serves) is a genuine end-to-end run - several
+// minutes, not seconds, dominated by the real npm install. See PROGRESS.md
+// items 9/10 for why Vite 7 (not latest/8) is pinned: Vite 8 defaults to
+// rolldown, which hits a confirmed upstream bug (a Rust static torn down
+// after the first native call panics on a later one) that crashes the dev
+// server on almost any real request - not fixable from this project's
+// side, so the demo routes around it instead.
+test.setTimeout(10 * 60 * 1000);
 
-  page.on("console", (message) => consoleMessages.push(message.text()));
+test("the playground demo scaffolds a real Vite project, installs it, and shows a real, crash-free, interactive dev-server preview (images included)", async ({
+  page,
+}) => {
+  const pageErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
 
   await page.goto("/");
 
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("[dwc]") && text.includes("reply")))
-    .toBe(true);
+  // Scaffolding itself is fast; the real npm install (against the real
+  // registry, now also pulling vite@7 + the two WASM-build overrides) is
+  // the slow part.
+  await expect(page.locator("#terminal")).toContainText("[npm create vite] exit=0", { timeout: 60_000 });
+  await expect(page.locator("#terminal")).toContainText("[npm install] exit=0", { timeout: 5 * 60_000 });
+  await expect(page.locator("#terminal")).toContainText("[preview] iframe.src ->", { timeout: 3 * 60_000 });
 
-  expect(pageErrors).toEqual([]);
-});
-
-test("dwc.process.spawn runs a script through the process worker and streams its output", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect.poll(() => consoleMessages.some((text) => text.includes("process exited with code 0"))).toBe(true);
-
+  // Regression guard for item 9's own rolldown crash: if the Vite 7 pin
+  // (or either override) ever gets reverted, this is exactly the text
+  // that comes back - fail loud and specifically here, not just with a
+  // blank iframe further down.
   const terminalText = await page.locator("#terminal").innerText();
-  expect(terminalText).toContain("hello from the process worker");
-  expect(terminalText).toContain("argv: node /run.js --flag");
-  expect(terminalText).toContain("readFileSync /hello.txt -> Hello, duck-webcontainer!");
+  expect(terminalText).not.toContain("RuntimeError");
+  expect(terminalText).not.toContain("Cannot find module");
 
-  expect(pageErrors).toEqual([]);
-});
-
-test("dwc.shell.exec runs a chained shell line through /bin coreutils resolved on PATH", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
+  // The preview iframe is same-origin (both on the Vite dev server's own
+  // origin - see previewProtocol.ts), so its document is directly
+  // inspectable: real Vite content, not a blank or crashed page.
   await expect
-    .poll(() => consoleMessages.some((text) => text.includes("shell.exec short-circuit result")))
-    .toBe(true);
+    .poll(async () => page.frame({ url: /__dwc_preview__/ })?.title() ?? null, { timeout: 30_000 })
+    .toBe("my-app");
 
-  const terminalText = await page.locator("#terminal").innerText();
-  // mkdir/echo/cat all resolve to real /bin/<name>.js programs run as spawned
-  // processes (kernel/fs/coreutils.ts), not the old hardcoded builtin table.
-  expect(terminalText).toContain('mkdir -p /x && echo hi > /x/f && cat /x/f -> "hi\\n"');
-  // `node` is no longer restricted to being the line's sole command — it can
-  // chain with && into a PATH-resolved coreutil like any other command.
-  expect(terminalText).toContain('node /shell-chain.js && echo done -> "from node\\ndone\\n"');
-  // && short-circuits on a non-zero exit: "nope" must never run.
-  expect(terminalText).toContain('false && echo nope -> ""');
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("real vendored events/stream/crypto run, and https reaches the real npm registry", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
+  // At least one real image asset loads correctly - the exact regression
+  // this guards against (fs.createReadStream, see PROGRESS.md item 10's
+  // own follow-up): before that fix, any image served over HTTP (as
+  // opposed to inlined by Vite as a data: URL) 500'd and never rendered.
   await expect
-    .poll(() => consoleMessages.some((text) => text.includes("shell.exec('node /shell-node.js')")), { timeout: 15000 })
-    .toBe(true);
-
-  // xterm.js visually wraps long lines at the terminal's column width, so
-  // innerText() can insert a newline mid-string (e.g. inside the sha256 hex
-  // digest) - strip newlines before substring checks rather than assert on
-  // the raw wrapped text.
-  const terminalText = (await page.locator("#terminal").innerText()).replace(/\n/g, "");
-  expect(terminalText).toContain("[events] hello, world");
-  expect(terminalText).toContain('[crypto] sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824');
-  expect(terminalText).toMatch(/\[crypto] randomUUID\(\) = [0-9a-f-]{36}/);
-  expect(terminalText).toContain("[stream] piped: abc");
-  // node <script> reachable from dwc.shell.exec(), not just dwc.process.spawn().
-  expect(terminalText).toContain('[shell] node /shell-node.js -> "[shell-node] ran via dwc.shell.exec\\n"');
-  expect(terminalText).toContain("[https] fetched from registry.npmjs.org: name= left-pad latest=");
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("real vendored net: a script talks to its own server over the loopback binding", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("net-demo process exited with code 0")), { timeout: 15000 })
-    .toBe(true);
-
-  const terminalText = await page.locator("#terminal").innerText();
-  expect(terminalText).toContain("[net] server got: hello from client");
-  expect(terminalText).toContain("[net] client got: hello from server");
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("real vendored net: two separate process workers talk over the kernel's cross-process relay", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("net-xproc-server exited with code 0")), { timeout: 15000 })
-    .toBe(true);
-
-  const terminalText = await page.locator("#terminal").innerText();
-  expect(terminalText).toContain("[net-xproc] server got: hello from cross-process client");
-  expect(terminalText).toContain("[net-xproc] client got: hello from cross-process server");
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("real vendored child_process: spawn() streams a PATH-resolved coreutil, exec() delegates to the shell, and an unresolvable command reports a clean error", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("child-process-demo exited with code 0")), { timeout: 15000 })
-    .toBe(true);
-
-  const terminalText = await page.locator("#terminal").innerText();
-  expect(terminalText).toContain("[child_process] spawn stdout: hi-from-spawn");
-  expect(terminalText).toContain("[child_process] spawn exited with code 0");
-  expect(terminalText).toContain("[child_process] spawn error: nope-cmd: command not found");
-  expect(terminalText).toContain('[child_process] exec output: "z\\n"');
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("node_modules require() resolution: a bare specifier resolves through package.json's \"main\" field", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("require-node-modules-demo exited with code 0")), { timeout: 15000 })
-    .toBe(true);
-
-  const terminalText = await page.locator("#terminal").innerText();
-  // Proves both the "main" field lookup AND that the package's own relative
-  // require('./pad-char') resolved against itself, not the requiring script.
-  expect(terminalText).toContain('[require] left-pad("5", 3, "0") -> 005');
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("VFS symlink support: readFile follows a symlink, and lstat/stat correctly distinguish the link from its target", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("symlink-demo exited with code 0")), { timeout: 15000 })
-    .toBe(true);
-
-  const terminalText = await page.locator("#terminal").innerText();
-  expect(terminalText).toContain("[symlink] readFile -> hello through a symlink");
-  expect(terminalText).toContain("[symlink] lstat.isSymbolicLink -> true");
-  expect(terminalText).toContain("[symlink] stat.isSymbolicLink -> false");
-  expect(terminalText).toContain("[symlink] readlink -> /symlink-target.txt");
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("real-npm-boot gaps: os module, \"node:\"/absolute-path require(), fs.chmod, and process as an EventEmitter", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("gaps-demo exited with code 42")), { timeout: 15000 })
-    .toBe(true);
-
-  const terminalText = await page.locator("#terminal").innerText();
-  expect(terminalText).toContain("[os] platform -> linux");
-  expect(terminalText).toContain("[os] homedir -> /home/user");
-  expect(terminalText).toContain("[os] availableParallelism >= 1 -> true");
-  expect(terminalText).toContain("[require] node: prefix -> true");
-  expect(terminalText).toContain("[require] absolute path -> absolute-ok");
-  expect(terminalText).toContain("[fs] chmod mode -> 755");
-  // The exit code (42, asserted above via the console message) came from the
-  // guest's OWN 'uncaughtException' listener calling process.exit(42) -
-  // proof process is a real EventEmitter, not just that a message printed.
-  expect(terminalText).toContain("[process] caught uncaughtException: boom");
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("real vendored npm@10.9.2 boots through its own bin/npm-cli.js and `npm --version` prints the real version", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("npm --version exited with code")), { timeout: 15000 })
-    .toBe(true);
-
-  const terminalText = await page.locator("#terminal").innerText();
-  expect(terminalText).toContain('[npm --version] exit=0 stdout="10.9.2\\n"');
-  expect(terminalText).toContain('[npm --version] stderr=""');
-
-  expect(pageErrors).toEqual([]);
-});
-
-test("dwc.fs mounts a declarative tree and reads it back through the FS worker", async ({ page }) => {
-  const consoleMessages: string[] = [];
-  const pageErrors: string[] = [];
-
-  page.on("console", (message) => consoleMessages.push(message.text()));
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-
-  await page.goto("/");
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("readFile /hello.txt") && text.includes("Hello, duck-webcontainer!")))
-    .toBe(true);
-
-  await expect
-    .poll(() => consoleMessages.some((text) => text.includes("readdir /src") && text.includes("index.js")))
-    .toBe(true);
+    .poll(
+      async () => {
+        const frame = page.frame({ url: /__dwc_preview__/ });
+        if (!frame) return 0;
+        return frame.evaluate(
+          () =>
+            Array.from(document.querySelectorAll("img")).filter(
+              (img) => !img.src.startsWith("data:") && img.complete && img.naturalWidth > 0,
+            ).length,
+        );
+      },
+      { timeout: 30_000 },
+    )
+    .toBeGreaterThan(0);
 
   expect(pageErrors).toEqual([]);
 });
