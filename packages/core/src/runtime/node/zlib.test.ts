@@ -35,6 +35,8 @@ interface SyncZlibHandle {
 interface ZlibModule {
   createGzip(): unknown;
   createGunzip(): unknown;
+  gzip(buffer: unknown, callback: (error: unknown, result?: unknown) => void): void;
+  gunzip(buffer: unknown, callback: (error: unknown, result?: unknown) => void): void;
   Unzip: new () => SyncZlibHandle;
   Gunzip: new () => SyncZlibHandle;
   Gzip: new () => SyncZlibHandle;
@@ -120,6 +122,22 @@ describe("vendored 'zlib' (stream-based gzip/gunzip over CompressionStream)", ()
     });
 
     expect(error).toBeTruthy();
+  });
+
+  // Real @rollup/wasm-node does `import { gzip } from 'zlib'` at its own top
+  // level - traced need, see zlib.js's own doc comment on gzip/gunzip.
+  it("gzip()/gunzip() round-trip through the callback API (real @rollup/wasm-node's own top-level `import { gzip } from 'zlib'`)", async () => {
+    const { Buffer, zlib } = setup();
+
+    const original = "gzip callback round-trip\n".repeat(10);
+    const compressed = await new Promise<{ toString(): string }>((resolve, reject) => {
+      zlib.gzip(Buffer.from(original), (error, result) => (error ? reject(error) : resolve(result as { toString(): string })));
+    });
+    const decompressed = await new Promise<{ toString(): string }>((resolve, reject) => {
+      zlib.gunzip(compressed, (error, result) => (error ? reject(error) : resolve(result as { toString(): string })));
+    });
+
+    expect(decompressed.toString()).toBe(original);
   });
 });
 

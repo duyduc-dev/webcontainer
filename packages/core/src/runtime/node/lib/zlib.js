@@ -91,6 +91,46 @@ export default function (exports, require, module) {
   const createGzip = () => new CodecStream("gzip", CompressionStream);
   const createGunzip = () => new CodecStream("gzip", DecompressionStream);
 
+  // The one-shot callback API (as opposed to the streaming createGzip()/
+  // createGunzip() above) - traced need: real @rollup/wasm-node (the wasm
+  // rollup build this project's own npm `overrides` alias substitutes for
+  // native rollup - see PROGRESS.md item 10) does `import { gzip } from
+  // 'zlib'` at its own top level, which our own zlib shim didn't export at
+  // all, throwing "does not provide an export named 'gzip'" before rollup
+  // ever got a chance to run. Built on the SAME CompressionStream/
+  // DecompressionStream-backed transform this file already has - a
+  // one-shot call is just "pipe the whole buffer through, collect
+  // everything back out," no new decompression primitive needed the way
+  // SyncZlibHandle's *synchronous* contract required one. `gunzip`'s
+  // natural pairing is included too, even though only `gzip` was the
+  // actual import that broke - a real caller compressing something has an
+  // obvious reason to also want to decompress it, and this needs no more
+  // machinery than gzip already does.
+  const runThroughCodec = (createCodec, chunk, encoding) =>
+    new Promise((resolve, reject) => {
+      const codec = createCodec();
+      const chunks = [];
+      codec.on("data", (part) => chunks.push(part));
+      codec.on("end", () => resolve(Buffer.concat(chunks)));
+      codec.on("error", reject);
+      codec.end(toBytes(chunk, encoding));
+    });
+
+  const oneShot = (createCodec) => (buffer, optionsOrCallback, maybeCallback) => {
+    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+    runThroughCodec(createCodec, buffer).then(
+      (result) => callback(null, result),
+      (error) => callback(error),
+    );
+  };
+
+  // Named `gunzipOneShot` (not `gunzip`) to avoid colliding with the
+  // lower-level `gunzip` byte-decoder already destructured from
+  // internal/inflate above (used by DECODERS.gunzip for the SyncZlibHandle
+  // contract) - exported below under the real public name.
+  const gzip = oneShot(createGzip);
+  const gunzipOneShot = oneShot(createGunzip);
+
   const Z_FINISH = 4;
 
   const DECODERS = {
@@ -175,5 +215,17 @@ export default function (exports, require, module) {
     }
   }
 
-  module.exports = { createGzip, createGunzip, Gzip, Gunzip, Unzip, Deflate, Inflate, DeflateRaw, InflateRaw };
+  module.exports = {
+    createGzip,
+    createGunzip,
+    gzip,
+    gunzip: gunzipOneShot,
+    Gzip,
+    Gunzip,
+    Unzip,
+    Deflate,
+    Inflate,
+    DeflateRaw,
+    InflateRaw,
+  };
 }
