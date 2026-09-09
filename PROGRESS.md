@@ -390,10 +390,12 @@ needed), but a race specific to the 2 threads that can't be eliminated
 remains technically open. Practical read: the threading avenue has hit
 its limit without real WASM/Rust debugging tools this project doesn't
 have — see item 9's own "Concrete next steps" for the WASI-shim read
-still worth doing and the two independent, actionable bugs (a
-`toHeaders`/`toUTCString` static-asset 500, and `preview.fetch()` never
-rejecting when its process crashes mid-request) that are now the more
-productive use of effort.**
+still worth doing. Of the two independent, actionable bugs found along
+the way, one is now FIXED: `preview.fetch()` no longer hangs forever
+when its process crashes mid-request (root cause was `netRelay.ts`
+silently dropping a dead connection without notifying the peer - see
+item 9, commit `b42d591`). The `toHeaders`/`toUTCString` static-asset
+500 is still open and is the next concrete, self-contained fix.**
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2703,10 +2705,23 @@ that would corrupt memory even on one thread, is still open.
    the code directly), and the FS Worker's own single JS thread
    naturally serializes all channels' requests via normal run-to-
    completion semantics. Not worth re-checking without new evidence.
-3. Fix the `dwc.preview.fetch()` never-rejects-on-crash gap (new bug
-   above) - independent value regardless of the WASM crash's own root
-   cause, and arguably higher-value right now given the threading avenue
-   has hit its practical limit.
+3. ~~Fix the `dwc.preview.fetch()` never-rejects-on-crash gap~~ — **DONE.**
+   Root cause: `netRelay.ts`'s `unregisterWorker`/`unregisterVirtualClient`
+   silently deleted a dead connection from `pipeConns` without ever
+   telling the OTHER end - unlike `relay()`'s own graceful `pipe-close`
+   handling, which forwards to whichever side didn't send it. A crashed
+   process's peer (e.g. `previewRelay.ts`'s `fetchFromGuestServer`,
+   registered as a virtual client) never received any further message,
+   so its promise never settled. Fixed by having both cleanup paths send
+   a `pipe-close` to the peer before dropping the connection, mirroring
+   `relay()`. Verified live: respawned vite directly, triggered the
+   known WASM crash via `/src/main.js`, then called
+   `dwc.preview.fetch(5173, '/src/main.js')` - before the fix this hung
+   until an external timeout; after, it rejects in ~35ms with
+   `"connection to port 5173 closed before a full response arrived"`.
+   Added two new tests in `netRelay.test.ts` covering both cleanup paths'
+   peer-notification directly. Typecheck clean, full suite (586 tests)
+   green, build clean. Commit `b42d591`.
 4. Fix the static-asset `toHeaders`/`toUTCString` bug (new bug above) -
    independent, much smaller, likely a missing real `Date` value in this
    runtime's own fs-stat/mtime emulation feeding vite's static-file
