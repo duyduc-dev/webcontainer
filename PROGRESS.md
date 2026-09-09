@@ -373,34 +373,31 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated, latest session): the `npm run dev` hang's REAL
-root cause is found and fixed — `resolveId()` now genuinely returns.**
-Read item 8's "FINAL ROOT CAUSE — found and fixed" subsection at the very
-end of this file first. Short version: it was never really about
-ref-counting/keep-alive at all (that theory, and both fix attempts under
-it, are now superseded, though the direct/non-debounced ref-count rewrite
-they left behind in `workers/process/worker.ts` is still a real
-improvement, kept). The actual bug: `workers/workerThreads/worker.ts`'s
-own `parentPort.postMessage()` called the *live* `self.postMessage`
-reference instead of one captured before any guest code could run — real
-`@napi-rs/wasm-runtime`'s own `wasi-worker.mjs` legitimately overrides
-`globalThis.postMessage` to forward to `parentPort.postMessage`, and once
-that landed, the next call to `self.postMessage` recursed forever
-(`self.postMessage` → guest's wrapper → `parentPort.postMessage` → same
-`self.postMessage` → …) — a silent, unrecoverable hang with no error, on
-the exact call path this whole investigation was chasing. Fixed by
-capturing `nativePostMessage` at module load (same pattern as this file's
-own `nativeSetTimeout`/`nativeMessageChannel` precedents). **Verified
-live, twice**, with heavy diagnostic instrumentation (see item 8): the
-native `resolveId()` call that had NEVER once returned across the entire
-multi-session investigation now completes cleanly, the WASI worker's
-`handle()` returns, multiple worker threads spin up and complete
-correctly. Real Vite then gets past `buildStart()`/`resolveId()` entirely
-and into genuine dependency-scan logic — where it hits a **new, much
-smaller, unrelated** bug (`TypeError: Expected pattern to be a
-non-empty string` in `picomatch`, during Vite's own dependency
-pre-bundling scan) - see item 8's own final section for exactly where
-this was left off and the concrete next step.
+**Pick up here (updated, latest session): read item 9 at the very end of
+this file first — MAJOR MILESTONE, real Vite dev server now serves a
+real HTTP 200 response, for the first time in this project's history,
+but crashes ~0-1s later with a non-deterministic WASM-level trap
+(different trap type each run — the signature of memory corruption or a
+race condition, not a deterministic logic bug).** This is the new
+frontier; everything below (item 8's own hang investigation) is now
+resolved background. Short version of item 8's own resolution: the
+`npm run dev` hang was never really about ref-counting/keep-alive (that
+theory, and both fix attempts under it, are superseded, though the
+direct/non-debounced ref-count rewrite left behind in `workers/process/
+worker.ts` is a real, separate improvement, kept). The actual bug:
+`workers/workerThreads/worker.ts`'s own `parentPort.postMessage()` called
+the *live* `self.postMessage` reference instead of one captured before
+guest code could run — real `@napi-rs/wasm-runtime`'s own `wasi-
+worker.mjs` legitimately overrides `globalThis.postMessage`, and once
+that landed, every call recursed forever, a silent unrecoverable hang.
+Fixed by capturing `nativePostMessage` at module load (same pattern as
+`nativeSetTimeout`/`nativeMessageChannel`). That fix is what unblocked
+real, concurrent multi-threaded WASM execution for the first time — which
+is very likely *also* what item 9's new crash is downstream of (see its
+own "leading hypothesis"). The `picomatch` dependency-scan error found
+right after the postMessage fix turned out to be a non-blocker — Vite's
+own resilience swallows it exactly as designed, matching item 8's own
+"or shown to be harmless" outcome.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -2400,6 +2397,117 @@ console.log calls choke an automated console reader... don't buffer
    afterward - a working `vite dev` server is not the same as
    live-reload-on-edit, which remains its own, entirely unstarted
    question.
+
+## 9. MAJOR MILESTONE — real Vite dev server serves a real HTTP 200 response for the first time ever; new frontier found, a non-deterministic WASM trap right after
+
+**Update, picking item 8 back up on yet another device, right after step
+1/3 above: the `picomatch` bug turned out to be a non-blocker (matches
+step 3's own "or shown to be harmless" clause) - the dependency scan
+failure is genuinely swallowed, exactly as Vite's own resilience is
+supposed to work, and the server goes on to bind and print its own real
+ready banner:**
+
+```
+[vite] connected.
+
+  VITE v8.2.2  ready in ~17s
+
+  ➜  Local:   http://localhost:5173/
+  ➜  Network: use --host to expose
+```
+
+Confirmed via a direct, isolated repro (spawn `/my-app/node_modules/
+vite/bin/vite.js` directly, bypassing npm/the shell dispatch, same
+technique as the rest of this investigation) - **and then confirmed the
+actual thing this whole file has been chasing since item 2: a real
+`dwc.preview.fetch(5173, '/')` call from the host page returns a real,
+successful HTTP response - `{ status: 200, statusMessage, headers, body
+}` - from the real, running Vite dev server, for the first time in this
+project's entire history.** Reproduced twice, independently, in two
+separate fresh spawns.
+
+**But the server doesn't stay up: somewhere between ~0ms and ~1s after
+that first successful response, the WHOLE PROCESS crashes with a genuine
+WASM-level trap** - `worker sent an error! Uncaught RuntimeError:
+unreachable` in one run, `Uncaught RuntimeError: operation does not
+support unaligned accesses` in another, for the exact same test repeated
+back-to-back. **The trap TYPE varies between otherwise-identical runs -
+that's the important tell.** A deterministic logic bug in the Rust/WASM
+code would trap the same way every time; a trap type that changes run to
+run, for the same inputs, is the classic signature of memory corruption
+or a data race - something writing to (or reading from) WASM linear
+memory at a moment or in a shape the code didn't expect, so the SPECIFIC
+invariant that ends up violated depends on the exact interleaving/memory
+state at the time, not just the code path taken.
+
+**Isolated and confirmed request-triggered, not a background timer:**
+spawned fresh, waited 30+ seconds with zero requests made - stayed
+completely stable, zero crash, zero stderr. Only once an actual
+`dwc.preview.fetch()` call reaches the server does the crash follow,
+within about a second. (The `picomatch`/tinyglobby dependency-scan code
+patched with tracing in step 1 above never fired in either crash run -
+confirmed by checking the patched file was still in place afterward -
+so whatever's crashing is a DIFFERENT code path than the scan; that
+tracing can be removed/ignored by whoever picks this up next, it's not
+wired to this bug.)
+
+**Leading hypothesis (not yet confirmed - needs its own investigation):**
+this is very likely connected to the `resolveId()`/`parentPort.
+postMessage` fix earlier in this same item - that fix is what first let
+rolldown's own multi-threaded WASI code path actually run to completion
+("multiple worker threads spin up, load, and complete in sequence," per
+that entry) instead of hanging forever before ever reaching real,
+concurrent WASM execution. A real HTTP request against a real Vite dev
+server backed by rolldown very plausibly dispatches work across more than
+one of those threads (transform requests, module resolution, etc., all
+sharing the same WASM linear memory via `SharedArrayBuffer` under the
+`wasi-threads` model this project's own `worker_threads.Worker`
+implementation backs). If there's a race or a synchronization gap
+somewhere in how this runtime bridges that shared memory between threads
+(as opposed to real Node/libuv's own battle-tested thread-safety
+guarantees for the equivalent native addon), this exact "different trap
+each time, only on real concurrent work, never at idle" symptom is
+what you'd expect to see. Not confirmed - genuinely the next thing to dig
+into, not a guess dressed up as a finding.
+
+**Concrete next steps, in order:**
+1. **Try to get a real WASM-level stack trace, not just the JS-level
+   `Worker.<anonymous>` catch-all** (`workers/process/worker.js:20641:48`
+   in this build - just this project's own top-level `worker.onerror`
+   handler, not the actual Rust panic site). Chrome DevTools can
+   sometimes resolve WASM traps to source locations if the `.wasm` binary
+   carries DWARF debug info and the inspector is attached at the moment
+   of the trap (not just reading a post-hoc error message) - worth
+   checking whether `@rolldown/binding-wasm32-wasi`'s shipped `.wasm` has
+   any debug sections at all (`wasm-objdump -h` or similar) before
+   assuming this path is a dead end.
+2. **Reproduce with request variety** to see whether the crash depends on
+   which request is made or just "any real request at all": try fetching
+   something other than `/` (a JS module, a CSS file, something HMR-
+   related) and see if the trap still happens, and whether the delay/trap
+   type correlates with what's being requested.
+3. **Check whether this reproduces with a SINGLE-THREADED-forced run** -
+   if `@napi-rs/wasm-runtime`/`@emnapi/core` expose any way to force the
+   JS-emulated single-threaded async-work path even when shared memory IS
+   available (worth checking, since the WebContainer-fallback loader
+   already conditionally picks a path based on environment), forcing
+   single-threaded execution and confirming the crash DISAPPEARS would be
+   strong, direct confirmation of the race-condition hypothesis above,
+   independent of finding the exact race itself.
+4. Given how deep this is (a genuine multi-threaded-WASM memory-safety
+   bug, not a JS-level logic gap like everything else fixed in this
+   file), this may be the point where root-causing it further requires
+   either much more specialized WASM/Rust-runtime tooling than this
+   project has used so far, or accepting a workaround (e.g., finding a
+   way to force the single-threaded fallback path permanently for this
+   runtime, trading real thread-parallelism for stability, if step 3
+   above confirms that actually avoids the crash) rather than a true fix.
+5. Independent of all of the above: `waitForMarker()`'s own masking bug
+   (found early in item 8, still unfixed) means the demo currently can't
+   tell "reached Local: and crashed 1s later" apart from any other
+   failure mode - worth fixing now that there's a concrete, reproducible
+   "starts working, then crashes" case to make visible instead of hidden
+   behind a silent preview failure.
 
 ## Reminder: no AI attribution in commits
 
