@@ -82,6 +82,22 @@ describe("createFsBuiltin", () => {
     }
   });
 
+  // Real Vite 7's own dist/node/chunks/logger.js finds its own package.json
+  // via `readFileSync(new URL("../../package.json", new URL("../../../src/
+  // node/constants.ts", import.meta.url)))` - a real URL OBJECT, not a
+  // string. Left unconverted, a URL stringifies to the full "file:///..."
+  // URL wherever this reaches the wire format, which every VFS op then
+  // treats as a literal (and bogus) path. Confirmed live: this crashed real
+  // Vite 7 on startup with `ENOENT: /file:/my-app/node_modules/vite/
+  // package.json` before call() converted it (see its own doc comment).
+  it("readFileSync accepts a real URL object (not just a string), converting it via its .pathname", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.mkdirSync("/a/b", { recursive: true });
+    fs.writeFileSync("/a/b/package.json", '{"version":"1.2.3"}');
+    const url = new URL("./package.json", "file:///a/b/index.js");
+    expect(new TextDecoder().decode(fs.readFileSync(url))).toBe('{"version":"1.2.3"}');
+  });
+
   it("existsSync, rmSync, renameSync", () => {
     const fs = createFsBuiltin(makeIO());
     fs.writeFileSync("/a.txt", "x");

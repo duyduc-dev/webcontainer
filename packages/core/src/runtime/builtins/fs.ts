@@ -68,8 +68,11 @@ interface FsBuiltinCore {
   // (encoding argument, then a String.prototype method call on the result)
   // recurs constantly across the wider npm dependency tree, so it's worth
   // supporting both call shapes now rather than only the one traced site.
-  readFileSync(path: string): Uint8Array;
-  readFileSync(path: string, options: { encoding: string; flag?: string } | string): string;
+  // Also accepts a `URL` (typically `file://`) - traced need: real Vite 7's
+  // own logger.js does `readFileSync(new URL("../../package.json", ...))`
+  // to find its own package.json (see call()'s own doc comment on PATH_LIKE_FIELDS).
+  readFileSync(path: string | URL): Uint8Array;
+  readFileSync(path: string | URL, options: { encoding: string; flag?: string } | string): string;
   writeFileSync(path: string, contents: string | Uint8Array): void;
   // Real Node's fs.appendFileSync(path, data) creates the file if missing,
   // otherwise appends - traced need: real npm's own cacache appends each new
@@ -240,7 +243,27 @@ const createFsBuiltin = (
   // unchanged; worker.ts wires this to the real vendored `Buffer.from`.
   wrapBuffer: (bytes: Uint8Array) => Uint8Array = (bytes) => bytes,
 ): FsBuiltin => {
-  const call = (request: FsRequest): FsResponseOk => requireSyncChannel(io)(request);
+  // Real Node's fs functions accept a `URL` (typically `file://`, from an
+  // `import.meta.url`-relative read) anywhere they accept a path string -
+  // traced need: real Vite 7's own dist/node/chunks/logger.js does
+  // `readFileSync(new URL("../../package.json", new URL(...)))` to find its
+  // own package.json. Left as-is, a URL object reaching the wire format's
+  // own `writeString` gets silently coerced via its OWN `.toString()` (the
+  // full "file:///..." string), which every op here would then treat as a
+  // literal, bogus (doesn't start with "/") VFS path. `.pathname` is the
+  // real absolute path a `file:` URL encodes - decoded once for any percent-
+  // escaped characters, matching what real Node's own `fileURLToPath` does
+  // for this VFS's POSIX-only paths. Every current op's own path-shaped
+  // field is covered generically here rather than in each function
+  // individually, so a future op needs no special-casing to inherit this.
+  const PATH_LIKE_FIELDS = ["path", "from", "to", "target"] as const;
+  const call = (request: FsRequest): FsResponseOk => {
+    for (const field of PATH_LIKE_FIELDS) {
+      const value = (request as Record<string, unknown>)[field];
+      if (value instanceof URL) (request as Record<string, unknown>)[field] = decodeURIComponent(value.pathname);
+    }
+    return requireSyncChannel(io)(request);
+  };
 
   // Real Node's fs.realpathSync ALSO carries a `.native` property (the OS-
   // native resolver variant, distinct from its own pure-JS fallback) - real
@@ -254,10 +277,12 @@ const createFsBuiltin = (
   };
   (realpathSync as { native?: typeof realpathSync }).native = realpathSync;
 
-  function readFileSync(path: string): Uint8Array;
-  function readFileSync(path: string, options: { encoding: string; flag?: string } | string): string;
-  function readFileSync(path: string, options?: { encoding: string; flag?: string } | string): Uint8Array | string {
-    const response = call({ op: FsOp.READ_FILE, path }) as Extract<FsResponseOk, { op: FsOp.READ_FILE }>;
+  function readFileSync(path: string | URL): Uint8Array;
+  function readFileSync(path: string | URL, options: { encoding: string; flag?: string } | string): string;
+  function readFileSync(path: string | URL, options?: { encoding: string; flag?: string } | string): Uint8Array | string {
+    // call() converts a URL to a real VFS path before this ever reaches the
+    // wire format - the cast just reflects that runtime guarantee to TS.
+    const response = call({ op: FsOp.READ_FILE, path: path as string }) as Extract<FsResponseOk, { op: FsOp.READ_FILE }>;
     const encoding = typeof options === "string" ? options : options?.encoding;
     // Real Node's fs.readFileSync(path) with NO encoding still returns a
     // Buffer, not a bare Uint8Array - traced need: real npm's own cacache
