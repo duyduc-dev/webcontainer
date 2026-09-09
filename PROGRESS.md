@@ -2470,44 +2470,128 @@ each time, only on real concurrent work, never at idle" symptom is
 what you'd expect to see. Not confirmed - genuinely the next thing to dig
 into, not a guess dressed up as a finding.
 
+**Update, same session, continuing the "concrete next steps" above -
+step 1 done (dead end, confirmed not assumed), step 2 done (request
+variety tested directly, narrows the bug precisely), one new bug found
+along the way:**
+
+**Step 1 - DWARF debug info: confirmed absent, not just assumed.**
+Installed `wabt` (`npm install wabt`, the same package this project
+already used once before for a hand-compiled WAT test module - see
+item 3's own `node:wasi` work) and ran `wasm-objdump -h` on the real,
+installed `.wasm` binary. Section list: `Type`, `Import`, `Function`,
+`Table`, `Global`, `Export`, `Start`, `Elem`, `DataCount`, `Code`,
+`Data`, and exactly one `Custom` section - `"target_features"`. **No
+`.debug_info`/`.debug_line`/etc. at all** - a real, stripped production
+release build (10.8MB; an unstripped debug build of a bundler this size
+would typically be far larger). This path is a genuine dead end, not
+just unexplored - there is no DWARF for any tool to resolve a trap
+address against.
+
+**Step 2 - request variety: the crash is real, reproducible, and
+*specific to native transform work*, not "any real request."** Ran
+three separate fresh spawns, one request type each, all against a real,
+live vite/rolldown dev server:
+
+- `GET /favicon.svg` (a real static asset the vanilla template ships,
+  served straight off disk with no rolldown transform involved at all) -
+  **does NOT crash the process.** Instead hits a different, much
+  smaller, genuinely fixable bug: `vite Internal server error: Cannot
+  read properties of undefined (reading 'toUTCString')` at a `toHeaders`
+  call (inside vite's own static-file-serving header synthesis, real
+  ESM-loaded vite code) - returned as a clean HTTP 500, server stays up
+  and serves further requests fine afterward. This is almost certainly a
+  missing/undefined value (most likely a file `mtime`) where vite's own
+  static-serving code expects a real `Date`-shaped value to call
+  `.toUTCString()` on for a `Last-Modified`-style header - this
+  runtime's own fs-stat emulation is the prime suspect, not vite/
+  rolldown. **A real, separate, much easier bug - worth fixing on its
+  own, unrelated to the WASM crash.**
+- `GET /` (the HTML entry, needs HTML parsing + entry-script resolution
+  + rolldown's own native `transform()`/`resolveId()` for the entry
+  module) - **crashes**, same as item 9's own original finding:
+  `RuntimeError: unreachable`.
+- `GET /src/main.js` (a plain real JS module - no HTML involved at all,
+  but STILL needs rolldown's own native `transform()` to process it) -
+  **also crashes**, this time `RuntimeError: operation does not support
+  unaligned accesses` - a *different* trap type than the `/` run, for a
+  *different* request, reconfirming the "trap type varies, not
+  deterministic" signature from the original finding.
+
+**This precisely narrows the bug: it's not "any real HTTP request," and
+it's not HTML-specific either - it's specifically any request that
+requires rolldown's own native transform/resolve machinery to actually
+run**, vs. a plain static-file read (no native code touched at all),
+which is completely safe. Strengthens the leading hypothesis from the
+original finding (a race/memory-safety issue in this runtime's own
+shared-WASM-memory bridging across the real worker threads doing that
+native work) rather than weakening it - every request that reproduces
+the crash is one that dispatches real work into that native path; the
+one that doesn't, doesn't.
+
+**New, separate robustness bug found while testing this: a
+`dwc.preview.fetch()` call whose underlying process crashes mid-request
+never rejects - it hangs forever.** Requesting `/src/main.js` this way,
+the call was still pending when the browser tooling's own 45-second
+timeout fired ("the renderer may be frozen or unresponsive"; the tab
+itself was fine afterward, just that one call never settled). The
+kernel/`netRelay`/preview-relay path has no handling today for "the
+worker serving this connection just terminated" - a caller has no way
+to know the request will never complete short of an external timeout of
+their own. Worth fixing independently of the WASM crash itself, since
+even a fully-working single-threaded fallback (if step 3 below pans out)
+would still leave a REAL failure (a script error, an actual crash for
+some other reason) hanging a caller forever today.
+
 **Concrete next steps, in order:**
-1. **Try to get a real WASM-level stack trace, not just the JS-level
-   `Worker.<anonymous>` catch-all** (`workers/process/worker.js:20641:48`
-   in this build - just this project's own top-level `worker.onerror`
-   handler, not the actual Rust panic site). Chrome DevTools can
-   sometimes resolve WASM traps to source locations if the `.wasm` binary
-   carries DWARF debug info and the inspector is attached at the moment
-   of the trap (not just reading a post-hoc error message) - worth
-   checking whether `@rolldown/binding-wasm32-wasi`'s shipped `.wasm` has
-   any debug sections at all (`wasm-objdump -h` or similar) before
-   assuming this path is a dead end.
-2. **Reproduce with request variety** to see whether the crash depends on
-   which request is made or just "any real request at all": try fetching
-   something other than `/` (a JS module, a CSS file, something HMR-
-   related) and see if the trap still happens, and whether the delay/trap
-   type correlates with what's being requested.
-3. **Check whether this reproduces with a SINGLE-THREADED-forced run** -
-   if `@napi-rs/wasm-runtime`/`@emnapi/core` expose any way to force the
-   JS-emulated single-threaded async-work path even when shared memory IS
-   available (worth checking, since the WebContainer-fallback loader
-   already conditionally picks a path based on environment), forcing
-   single-threaded execution and confirming the crash DISAPPEARS would be
-   strong, direct confirmation of the race-condition hypothesis above,
-   independent of finding the exact race itself.
-4. Given how deep this is (a genuine multi-threaded-WASM memory-safety
-   bug, not a JS-level logic gap like everything else fixed in this
-   file), this may be the point where root-causing it further requires
-   either much more specialized WASM/Rust-runtime tooling than this
-   project has used so far, or accepting a workaround (e.g., finding a
-   way to force the single-threaded fallback path permanently for this
-   runtime, trading real thread-parallelism for stability, if step 3
-   above confirms that actually avoids the crash) rather than a true fix.
+1. **Step 3 from before, still open: check whether forcing single-
+   threaded execution avoids the crash.** Given step 2 now shows the
+   crash requires real native transform work specifically, the search
+   for an env var/flag (`@napi-rs/wasm-runtime`/`@emnapi/core`/rolldown
+   itself - a `RAYON_NUM_THREADS`-shaped variable is a common pattern
+   for Rust bundlers using internal parallelism, worth checking rolldown
+   and its native binding's own docs/source for a real equivalent) is
+   now the highest-value next step: if forcing one thread makes the
+   crash disappear entirely across all three request types above, that's
+   strong, direct, actionable confirmation of the race-condition
+   hypothesis - and potentially an immediate, real workaround (trading
+   rolldown's internal thread-parallelism for stability) even before the
+   exact race is found.
+2. Fix the `dwc.preview.fetch()` never-rejects-on-crash gap (new bug
+   above) - independent value regardless of the WASM crash's own root
+   cause.
+3. Fix the static-asset `toHeaders`/`toUTCString` bug (new bug above) -
+   independent, much smaller, likely a missing real `Date` value in this
+   runtime's own fs-stat/mtime emulation feeding vite's static-file
+   header synthesis.
+4. Given how deep the WASM crash itself is (a genuine multi-threaded-
+   WASM memory-safety bug, not a JS-level logic gap like everything else
+   fixed in this file), root-causing the exact race likely requires more
+   specialized WASM/Rust-runtime tooling than this project has used so
+   far - step 1's workaround (force single-threaded, if it works) may be
+   the practical endpoint rather than a true fix at the shared-memory-
+   bridging level.
 5. Independent of all of the above: `waitForMarker()`'s own masking bug
    (found early in item 8, still unfixed) means the demo currently can't
-   tell "reached Local: and crashed 1s later" apart from any other
+   tell "reached Local: and crashed shortly after" apart from any other
    failure mode - worth fixing now that there's a concrete, reproducible
    "starts working, then crashes" case to make visible instead of hidden
    behind a silent preview failure.
+
+**Technique note, worth keeping:** when capturing a spawned process's
+stdout/stderr for diagnosis, truncate each chunk to a small size (a few
+hundred chars) in the pump loop itself, not just when displaying it -
+one run this session buffered a single ~163MB stderr chunk (a crash's
+own JS-level stack trace, referencing an ESM module by its full
+base64-encoded `data:` URL - the same class of issue this file's own
+"Diagnostic techniques" section already documented once) into a plain
+array, which briefly destabilized the tab and blocked normal
+`javascript_exec` calls returning it until it was cleared. Decoding a
+short slice of a huge captured string as character codes (`Array.from
+(str.slice(0,150)).map(c => c.charCodeAt(0))`, then decoded outside the
+browser) is a reliable way to safely inspect the START of a
+too-large-to-return string without pulling the whole thing through the
+browser tool's own content filters or the agent's own context.
 
 ## Reminder: no AI attribution in commits
 
