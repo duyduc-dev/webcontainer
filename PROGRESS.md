@@ -373,57 +373,36 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated, latest session): read item 9 at the very end of
-this file first — MAJOR MILESTONE, real Vite dev server now serves a
-real HTTP 200 response, for the first time in this project's history,
-but crashes ~0-1s later with a non-deterministic WASM-level trap
-(different trap type each run). The threading hypothesis is DROPPED as
-the lead cause — read the new "found a working reference implementation"
-section near the end of item 9 first. `~/workspace/vivari` (a sibling
-WebContainer-clone project) hit the exact same `unreachable` trap
-running real Vite 8/rolldown, root-caused it as a CONFIRMED UPSTREAM BUG
-in rolldown itself (`napi::tokio_runtime::RT`, a static Rust `Option
-<Runtime>` in shared wasm memory, gets torn down after the first native
-bundle call and never reinitialized — a second native call's
-`tokio::spawn` unwraps `None` and panics, which traps as `unreachable`;
-real GitHub issues rolldown#8747/#9134, napi-rs#2847/#2850/#3028; also
-confirmed to hit real StackBlitz/WebContainer) — and explicitly confirmed
-it is NOT a threading/worker-spawn race. This matches everything this
-project independently found (thread-count knobs didn't help). Live
-re-testing this session found genuine non-determinism consistent with
-this theory (same pristine binary: one run crashed on the first request
-as always, another survived five requests in a row), and found that
-adding synchronous JS overhead in the native call path changes the
-outcome — a real timing-sensitivity signal. **Fixed both config-loading
-bugs that were blocking the actual `noDiscovery` test** (a real gap in
-this runtime's own dynamic-`import()` handling for computed specifiers
-— commit `b04b0b4`, with two false-positive traps found and fixed along
-the way, both in real Vite's own `module-runner.js`) **and ran it: a
-served request confirmed as the process's first-ever native rolldown
-call (no dependency-scan messages at all) still crashed on the very
-first request.** This refutes the simple "avoid a second native call"
-framing — either something else still makes an earlier native call, or
-this runtime's instance of the bug isn't purely about call count. **Now
-read item 10, right after item 9: trying `vite@7` (esbuild, not
-rolldown - the same workaround Vivari uses for this exact upstream bug)
-as a path AROUND the crash entirely, rather than fixing it. IN
-PROGRESS - two more real bugs found and fixed along the way
-(`esbuild`'s own postinstall needs an `overrides` alias to
-`esbuild-wasm`, not a runtime fix; `fs.*Sync` didn't accept a real `URL`
-object - commit `ceedb53`), one more (a well-known real npm/rollup
-optional-dependency bug, unrelated to this runtime) found but not yet
-confirmed fixed, and the actual "does vite@7 dev serve a page without
-crashing" question still unanswered.** Of the four independent bugs
-fixed across this whole investigation: `preview.fetch()` no longer
-hangs forever when its process crashes mid-request (commit `b42d591`);
-the `toHeaders`/`toUTCString` static-asset crash is fixed (`fs.ts`'s
-`StatResult` now carries a real `mtime: Date` — commit `b363913`),
-though that unmasked a bigger, still-open gap (`fs.createReadStream`
-isn't implemented at all — Vivari's own roadmap independently confirms
-this exact gap was necessary for their own static-asset serving to
-work); the ESM loader now correctly handles a computed dynamic
-`import()` specifier (commit `b04b0b4`); and `fs.*Sync` now accepts a
-real `URL` object, not just a string (commit `ceedb53`).**
+**Pick up here (updated, latest session): read item 10 at the very end
+of this file first — MAJOR MILESTONE, DONE: the playground demo now
+shows a real, working, crash-free live preview of a real Vite dev
+server.** This is the actual end goal of the whole multi-session item
+8/9/10 investigation, finally reached. Short version: item 9's crash
+(a real HTTP 200 followed ~0-1s later by a non-deterministic WASM
+trap) turned out to be a confirmed UPSTREAM bug in rolldown itself
+(`napi::tokio_runtime::RT`, a Rust static torn down after the first
+native call, panics on a later one - real GitHub issues
+rolldown#8747/#9134, napi-rs#2847/#2850/#3028; also hits real
+StackBlitz/WebContainer), found by reading `~/workspace/vivari` (a
+sibling WebContainer-clone project)'s own build log, which hit and
+root-caused the exact same trap. Not fixable from this project's side
+(would need patching rolldown's own Rust) - so, matching Vivari's own
+proven workaround, item 10 pins the demo to **Vite 7 (esbuild) instead
+of Vite 8 (rolldown)**, routing around the bug entirely rather than
+fixing it. Getting there surfaced and fixed three real, general Node-
+compatibility gaps in this runtime (a computed-specifier gap in dynamic
+`import()` handling, `fs.*Sync` not accepting a `URL` object, `zlib`
+missing its one-shot `gzip`/`gunzip` callback API - commits `b04b0b4`,
+`ceedb53`, `6fd49ab`) plus two real npm ecosystem quirks worked around
+via `package.json` `overrides` (`esbuild`/`rollup` each need aliasing to
+their real WASM builds, `esbuild-wasm`/`@rollup/wasm-node`, since this
+runtime reports a normal-looking platform that makes npm select a
+native binary neither can run). The recipe is now baked into
+`examples/playground/src/main.ts` itself (commit `26e61c5`) - verified
+live, repeatedly: the real demo scaffolds, installs, and serves a real,
+interactive Vite dev server preview with zero crashes across dozens of
+requests, confirmed via the preview iframe's own `document.title`/
+`body.innerText` surviving a full page reload.
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2958,19 +2937,36 @@ browser) is a reliable way to safely inspect the START of a
 too-large-to-return string without pulling the whole thing through the
 browser tool's own content filters or the agent's own context.
 
-## 10. Trying Vite 7 (esbuild, not rolldown) as a workaround for item 9's crash — IN PROGRESS, two real bugs found and fixed, a third (unrelated) blocker still open
+## 10. MAJOR MILESTONE — a real, working, crash-free live Vite dev server preview, via Vite 7 (esbuild) instead of Vite 8 (rolldown) — DONE
+
+**This is the actual working outcome the whole multi-session
+investigation (items 8 and 9) was chasing.** `examples/playground`'s
+own demo now scaffolds a real `npm create vite@latest` project, pins it
+to `vite@^7` with two npm `overrides`, installs, runs `npm run dev`,
+and shows a real, interactive, correctly-rendered Vite dev server
+preview in the page's `<iframe id="preview">` - verified live,
+repeatedly, with zero crashes: the iframe's own `document.title`
+(`"my-app"`) and `document.body.innerText` (the real vanilla template's
+"Get started" / "Edit src/main.js and save to test HMR" / "Count is 0"
+/ documentation-links content) both confirmed correct across a full
+page reload and dozens of direct `preview.fetch()` requests to `/`,
+`/src/main.js`, `/src/counter.js`, `/src/style.css`, and the ~175KB
+`/@vite/client`. Commit `26e61c5` wires this into the real demo;
+commits `ceedb53` and `6fd49ab` are the two general runtime fixes this
+work uncovered along the way.
 
 Given item 9's crash is a confirmed upstream rolldown bug, and Vivari's
 own proven workaround for the exact same bug is to route the affected
 path through **esbuild instead of rolldown** (Vite 7 uses esbuild for
 dev-time transforms; Vite 8 is what pulled in rolldown in the first
-place), tried pinning the demo to `vite@^7` instead of latest. Not
-finished yet, but has already surfaced two real, independent,
-now-fixed bugs and found (not yet worked around) a third, unrelated one
-- all found by scaffolding a SEPARATE `/my-app-v7` project by hand
-(`npm create vite@latest my-app-v7`, then editing `package.json` to pin
-`vite: "^7.0.0"` before `npm install`, to avoid racing the playground's
-own automatic `/my-app` demo flow).
+place), pinned the demo to `vite@^7` instead of latest. Getting there
+surfaced three real, independent bugs (two now fixed in this runtime,
+one a well-known real npm/rollup quirk worked around the same way
+StackBlitz-style demos do) - all found by scaffolding a SEPARATE
+`/my-app-v7` project by hand (`npm create vite@latest my-app-v7`, then
+editing `package.json` to pin `vite: "^7.0.0"` + the `overrides` before
+`npm install`, to avoid racing the playground's own automatic `/my-app`
+demo flow) before folding the working recipe into `main.ts` itself.
 
 1. **`esbuild`'s own postinstall script can't run at all - fixed via a
    standard npm mechanism, not a runtime patch.** Plain `esbuild`
@@ -3012,34 +3008,57 @@ own automatic `/my-app` demo flow).
    fs op's path-shaped field, not just `readFileSync`, since this is a
    completely standard, common real-Node pattern (any `import.meta.url`-
    relative file access) likely to recur.
-3. **Still open, unrelated to anything above**: with both bugs above
-   fixed, `vite@7` gets further but now fails with
-   `Error: Cannot find module @rollup/rollup-linux-x64-musl. npm has a
-   bug related to optional dependencies (https://github.com/npm/cli/
-   issues/4828)`. This is a well-known, REAL npm bug that affects actual
-   users on real machines too (not something specific to this runtime) -
-   npm's optionalDependencies resolution sometimes fails to correctly
-   select/skip a platform-specific package, and the community's own
-   standard fix is exactly what the error message itself suggests:
-   delete `package-lock.json` and `node_modules`, then reinstall clean.
-   Attempted this session but not yet confirmed fixed - live testing was
-   interrupted repeatedly by Chrome extension disconnects (transient,
-   unrelated to this bug) before a full clean reinstall could finish and
-   get retested. Next step: retry the clean-reinstall, and if that alone
-   doesn't clear it, check whether an `overrides` entry aliasing the
-   musl variant to the real glibc one (or vice versa - whichever this
-   environment's own libc-detection heuristic gets wrong) works the same
-   way the esbuild-wasm alias did above.
+3. ~~`Error: Cannot find module @rollup/rollup-linux-x64-musl`~~ -
+   **WORKED AROUND, same technique as the esbuild fix above, not a
+   runtime patch.** This is a well-known, REAL npm bug that affects
+   actual users on real machines too (npm's optionalDependencies
+   resolution sometimes fails to correctly select/skip a platform-
+   specific package - referenced directly in the error message:
+   https://github.com/npm/cli/issues/4828), not something specific to
+   this runtime. Rather than chasing npm's own bug, added a second
+   `overrides` entry aliasing `rollup` itself to `@rollup/wasm-node` (a
+   real, actively-published WASM build of rollup, the same "alias the
+   dependency" trick as `esbuild` -> `esbuild-wasm` above):
+   `"overrides": { "esbuild": "npm:esbuild-wasm@^0.25.0", "rollup":
+   "npm:@rollup/wasm-node@^4.43.0" }`. This ALSO surfaced one more real,
+   independent runtime bug on the way - `@rollup/wasm-node` does
+   `import { gzip } from 'zlib'` at its own top level, which this
+   runtime's `zlib` shim didn't export at all (only the streaming
+   `createGzip`/`createGunzip` factories existed, no one-shot callback
+   API) - see zlib.js's own doc comment and commit `6fd49ab` for the
+   fix (built on the same `CompressionStream`/`DecompressionStream`
+   transform the streaming factories already use).
+4. **Confirmed: `vite@7 dev` serves a page without hitting item 9's
+   rolldown crash at all** - the actual question this whole detour was
+   chasing. With all three bugs above resolved, `vite@7` reaches
+   `VITE v7.3.6 ready` cleanly and serves real, repeated requests (`/`,
+   `/src/main.js`, `/src/counter.js`, `/src/style.css`,
+   `/@vite/client`) with consistent 200s and correct content sizes
+   across multiple full rounds - no crash, not even once, across
+   dozens of requests (compare to item 9's rolldown path, which crashed
+   on nearly every first real request). Folded the whole recipe into
+   `examples/playground/src/main.ts` itself (commit `26e61c5`) as the
+   demo's new default, rather than leaving it as a hand-scaffolded
+   side experiment.
 
-**Not yet reached**: whether `vite@7 dev` actually serves a page without
-hitting item 9's own rolldown crash at all (the whole point of this
-detour) - blocked on resolving step 3 first. If it works, this becomes
-the recommended path for the playground demo (pin to Vite 7 + the
-esbuild-wasm override) until rolldown's own upstream bug is fixed;
-either way, the two fixes already landed (`b04b0b4`'s dynamic-import
-support, `ceedb53`'s URL-accepting fs) have value independent of how
-this specific detour concludes - both are common, general Node patterns
-this runtime now handles that it didn't before.
+**Net result**: this is the recommended path for real Vite dev-server
+support in this runtime until rolldown's own upstream tokio-lifecycle
+bug is fixed - pin to Vite 7, alias `esbuild`/`rollup` to their real
+WASM builds via `overrides`. All three fixes landed this round
+(`ceedb53`'s URL-accepting `fs`, `6fd49ab`'s zlib `gzip`/`gunzip`, plus
+item 9's own `b04b0b4` dynamic-import support) have value independent
+of Vite specifically - all are common, general Node patterns this
+runtime now handles correctly that it didn't before this investigation
+started.
+
+**Not yet checked, worth a future look:** whether this project's own
+dedicated-real-Worker-per-process architecture needs an equivalent to
+Vivari's `esbuild-inproc-patch.js` (their single-threaded cooperative
+kernel deadlocks when esbuild-wasm's Node build spawns a real child
+process and talks over stdio) - live testing this session never
+observed a hang or deadlock from this, suggesting this project's
+different process architecture may not share that specific problem,
+but it wasn't deliberately stress-tested for it either.
 
 ## Reminder: no AI attribution in commits
 
