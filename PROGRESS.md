@@ -375,26 +375,26 @@ unverified steps together.
 
 **Pick up here (updated):** item 7's own "browser-profile-artifact" theory
 for the `npm run dev` preview failure is now DISPROVEN - see item 8 at the
-very end of this file. Root cause is now KNOWN precisely: `builtin:oxc-
+very end of this file. Root cause is KNOWN precisely: `builtin:oxc-
 runtime`'s native `resolveId()` hook (real rolldown, running its non-
 shared-memory WASI async-work path via `@emnapi/core`'s JS-emulated
 `emnapiAsyncWorkPlugin`) signals "keep the process alive while I'm
 pending" via `messagePort.ref()`/`.unref()` - the real Node.js
 `MessagePort` contract - but this runtime's guest-global `MessageChannel`
 was a plain, unwrapped browser-native one with no such methods, so every
-call was a silent no-op invisible to `drain()`. **A fix was attempted
-(wire `MessageChannel`'s ports into `eventLoop.ref()`/`unref()`, mirroring
-`net.ts`'s own `recount()` precedent) and REVERTED**: it typechecked and
-passed all unit tests, but froze the browser tab's renderer solid on a
-live end-to-end run, reproduced twice. Leading theory (unconfirmed - the
-frozen tab couldn't be inspected further): a high-frequency ref/unref
-cycle inside emnapi's own JS-emulated async-work polling turns a
-previously-free no-op into a real livelock. The fix path is very likely
-right in spirit but needs debouncing (the same shape as `worker_threads.
-ts`'s own `UNREF_DEBOUNCE_MS`) before it's safe to try again - do NOT
-just re-apply the naive 1:1 version. Item 8 has the complete diagnostic
-trail, the reverted fix's exact diff (in git history if not reapplied),
-and the concrete next step.
+call was a silent no-op invisible to `drain()`. **Two fix attempts, both
+REVERTED**: a naive 1:1 wire-up into `eventLoop.ref()`/`unref()` froze the
+browser tab's renderer solid during `resolveId()`; a debounced version
+(`REF_PORT_DEBOUNCE_MS`, matching `worker_threads.ts`'s own
+`UNREF_DEBOUNCE_MS` shape) froze it again, at a DIFFERENT point (during
+the `execFileSync`/binding-download step, before any native plugin hook
+even ran). Two different freeze locations across two different fix shapes
+points at something structural to overriding `MessageChannel` globally at
+all - not specifically a ref/unref frequency problem. **Do not attempt a
+third live end-to-end fix without first reproducing the freeze in
+isolation** (a tiny standalone script exercising the override alone,
+outside the vite/rolldown pipeline) - item 8 has the complete diagnostic
+trail from both attempts and the concrete, cheaper next step.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -1806,26 +1806,77 @@ browser's own task queue to freeze the tab's main thread too). This is a
 guess at the mechanism, not a confirmed diagnosis - the frozen tab
 couldn't be inspected further.
 
-**Concrete next step, in order of cost - the root mechanism is now known;
-what's missing is a *safe* way to wire it up:**
-1. **Before touching this again: reproduce the freeze with much lighter
-   instrumentation active**, so it can actually be diagnosed instead of
-   just reverted - e.g. count `ref()`/`unref()` calls per second (a
-   counter incremented in `wrapRefPort`, read by polling from the *host*
-   page rather than the frozen worker) to confirm or refute the livelock
-   theory above before trying another fix.
-2. **If it's a high-frequency ref/unref cycle, debounce it** the same way
-   `worker_threads.ts`'s own `UNREF_DEBOUNCE_MS = 3000` already does for
-   exactly this class of problem (a real napi-rs async primitive that
-   legitimately toggles liveness signals faster than this runtime's own
-   event loop should react to) - don't call `eventLoop.unref()` on every
-   single `.unref()`, only after a short quiet window with no matching
-   `.ref()`.
-3. Once a *safe* version of this fix lands and is verified not to
-   regress (a full live end-to-end run, watched for both a hang *and* a
-   freeze, not just checked once and walked away from): confirm the real
-   dev server actually reaches `printUrls()`/`Local:` and a working
-   preview - this would close out items 1, 2, 3, and 7 all at once.
+**Update, same session: tried the debounced version - froze the tab again,
+at a DIFFERENT point.** Implemented exactly the fix proposed above:
+
+- `eventLoop.ts` and `worker_threads.ts` first got their own
+  `nativeMessageChannel` captures (module-load-time, mirroring
+  `nativeSetTimeout`'s own existing precedent) so overriding the guest-
+  global `MessageChannel` couldn't shadow either's own internal usage -
+  a real, independent bug this session found while designing the retry
+  (eventLoop.ts's `yieldToMicrotasks()` had a bare, uncaptured
+  `new MessageChannel()`, exactly the "captured before boot() can shadow
+  it" hazard its own neighboring `nativeSetTimeout` comment already
+  documents for `setTimeout` specifically - it just hadn't been applied to
+  `MessageChannel` too).
+- `wrapRefPort` then debounced via a real, untracked host timer (NOT
+  `eventLoop.setTimeout`, which would itself call `wake()` on every single
+  `unref()` and reintroduce the same problem one level down):
+  `.ref()` cancels any pending release and re-refs immediately if not
+  already ref'd; `.unref()` starts (or leaves running) a
+  `REF_PORT_DEBOUNCE_MS = 100` timer that only calls `eventLoop.unref()`
+  once it actually fires with no intervening `.ref()`. Typechecked, all
+  584 tests passing, rebuilt clean.
+
+**Live-tested again, polling responsiveness every ~10s instead of waiting
+blindly this time - froze again, reproduced once,** but at a materially
+different point: not during `resolveId`/`oxc-runtime` (where the first,
+non-debounced attempt froze), but earlier, **during the `[rolldown]
+Downloading @rolldown/binding-wasm32-wasi@1.2.7 on WebContainer...` /
+`execFileSync` step** - before `buildStart()` or any native plugin hook
+had even run. Reverted immediately again (`git checkout --` on all three
+files, rebuilt, 584 tests still passing).
+
+**This changes the diagnosis.** Two different freeze *locations* across
+two different fix *shapes* (naive 1:1, then debounced) both landing on
+"browser tab freezes solid" is a stronger signal that the problem is
+**structural to globally overriding `MessageChannel` itself** - something
+about wrapping the constructor's *output* (returning `port1`/`port2` off
+a plain class instance rather than the real `MessageChannel` object) or
+about how broadly a global override reaches (literally every `new
+MessageChannel()` anywhere in this worker's realm, including inside
+real, unmodified vendored library code with its own assumptions) - rather
+than specifically about ref/unref call frequency on one particular native
+plugin's async dispatch. The debounce logic itself was never actually
+exercised by the second freeze (it happened before any native async-work
+plugin call would even run), which rules out "the debounce math has a
+bug" as the culprit for *that* occurrence specifically.
+
+**Concrete next step, in order of cost - given two live freezes, the
+right next move is a MUCH more isolated test, not a third live attempt
+against the full multi-minute pipeline:**
+1. **Test the `MessageChannel` override completely alone, outside the
+   vite/rolldown pipeline entirely** - a tiny guest script that does
+   nothing but `new MessageChannel()` a few times, `.postMessage()`
+   between the ports a few times, and `.ref()`/`.unref()` a few times,
+   run via the same `dwc.process.spawn('/bin/foo.js', ...)` isolated-
+   repro technique used successfully elsewhere this session. If THIS
+   alone freezes, the bug is in the override's basic mechanics (the wrong
+   thing to have spent two live end-to-end attempts discovering). If it
+   doesn't, incrementally add complexity (many rapid `new
+   MessageChannel()` calls in a loop, matching what `yieldToMicrotasks()`
+   does every `runOnce()`; heavy message traffic between ports) until one
+   step reproduces a freeze in isolation - far cheaper to iterate on than
+   a multi-minute real npm install each time.
+2. Once reproduced in isolation: this is finally in a debuggable
+   state (a tab that freezes on a small, known script, not deep inside a
+   real WASM binary's own async dispatch) - actually inspect *why*, rather
+   than reverting again on schedule.
+3. Only once a version survives an ISOLATED stress test should it go back
+   to a live end-to-end run - and even then, poll responsiveness
+   frequently throughout (as this session's second attempt did, which is
+   how the freeze's new, earlier location was caught at all) rather than
+   waiting blindly.
 4. Independently of the above: fix `waitForMarker()` (item 1 at the top of
    this section) regardless, so future runs surface "vite exited early"
    as a visible, distinct failure instead of silently reaching the
