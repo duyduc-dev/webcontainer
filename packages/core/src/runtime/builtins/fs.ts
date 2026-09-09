@@ -14,6 +14,14 @@ interface StatResult {
   size: number;
   mode: number;
   mtimeMs: number;
+  // Real Node's fs.Stats carries both - traced need: real Vite's own
+  // static-file-serving middleware builds a Last-Modified header via
+  // `stat.mtime.toUTCString()`, not `mtimeMs`. Without this, `stat.mtime`
+  // is undefined and that throws "Cannot read properties of undefined
+  // (reading 'toUTCString')" - confirmed live via a real GET of a static
+  // asset (favicon.svg) through a real vite dev server (500, though the
+  // process itself survives - see PROGRESS.md item 9).
+  mtime: Date;
 }
 
 // Real Node's fs.Dirent (returned by readdir(path, { withFileTypes: true }))
@@ -317,6 +325,7 @@ const createFsBuiltin = (
         size: response.size,
         mode: response.mode,
         mtimeMs: response.mtimeMs,
+        mtime: new Date(response.mtimeMs),
       };
     },
     lstatSync(path) {
@@ -328,6 +337,7 @@ const createFsBuiltin = (
         size: response.size,
         mode: response.mode,
         mtimeMs: response.mtimeMs,
+        mtime: new Date(response.mtimeMs),
       };
     },
     chmodSync(path, mode) {

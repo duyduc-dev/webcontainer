@@ -64,6 +64,24 @@ describe("createFsBuiltin", () => {
     expect(stat.size).toBe(5);
   });
 
+  // Real Vite's own static-file-serving middleware builds a Last-Modified
+  // header via `stat.mtime.toUTCString()` - a bare `mtimeMs` number isn't
+  // enough (see fs.ts's own doc comment on StatResult.mtime). Confirmed
+  // live: a real GET of a static asset through a real vite dev server 500'd
+  // with "Cannot read properties of undefined (reading 'toUTCString')"
+  // before this field existed.
+  it("statSync/lstatSync's mtime is a real Date, not just mtimeMs", () => {
+    const fs = createFsBuiltin(makeIO());
+    fs.writeFileSync("/a.txt", "hello");
+    fs.symlinkSync("/a.txt", "/link.txt");
+
+    for (const stat of [fs.statSync("/a.txt"), fs.lstatSync("/link.txt")]) {
+      expect(stat.mtime).toBeInstanceOf(Date);
+      expect(stat.mtime.getTime()).toBe(stat.mtimeMs);
+      expect(() => stat.mtime.toUTCString()).not.toThrow();
+    }
+  });
+
   it("existsSync, rmSync, renameSync", () => {
     const fs = createFsBuiltin(makeIO());
     fs.writeFileSync("/a.txt", "x");
