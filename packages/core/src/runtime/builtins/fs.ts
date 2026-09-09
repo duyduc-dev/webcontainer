@@ -186,6 +186,21 @@ interface FsBuiltin extends FsBuiltinCore {
   // still-open, separately-tracked design question (see PROGRESS.md).
   watch(path: string, listener?: FSWatchListener): FSWatcher;
   watch(path: string, options: { persistent?: boolean; recursive?: boolean } | string, listener?: FSWatchListener): FSWatcher;
+  // Real Node's fs.createReadStream(path[, options]) - traced need: real
+  // Vite's own static-file-serving middleware (sirv, used for `/public`
+  // assets - the img/logo files a real scaffolded template ships) does
+  // `fs.createReadStream(file, opts).pipe(res)`, `opts` optionally carrying
+  // `{start, end}` for an HTTP Range request. This VFS has no real
+  // incremental-disk-read primitive to back genuine chunked streaming (see
+  // fs.watch's own doc comment on the same limitation) - it reads the
+  // whole (possibly range-sliced) file eagerly via readFileSync and hands
+  // it to the injected `createReadableFromBytes` factory as one chunk, a
+  // real `stream.Readable` from the caller's own `require('stream')` (fs.ts
+  // itself has no `require()` to reach that module directly - same
+  // externally-injected-factory pattern `wrapBuffer` already uses for
+  // `Buffer`). `end` is INCLUSIVE, matching real Node's own contract (byte
+  // `end` IS part of the returned range).
+  createReadStream(path: string, options?: { start?: number; end?: number }): unknown;
 }
 
 const requireSyncChannel = (io: FsBuiltinIO): NonNullable<FsBuiltinIO["callSync"]> => {
@@ -242,6 +257,17 @@ const createFsBuiltin = (
   // existing/test call sites that don't care about Buffer-ness keep working
   // unchanged; worker.ts wires this to the real vendored `Buffer.from`.
   wrapBuffer: (bytes: Uint8Array) => Uint8Array = (bytes) => bytes,
+  // Backs createReadStream() - fs.ts has no require() of its own to reach
+  // the real `stream` module's Readable class (same reason wrapBuffer is
+  // injected rather than importing Buffer directly), so a caller that
+  // wants real `.pipe()`/`.on()` semantics (worker.ts, wired to the real
+  // vendored `Readable`) passes a factory in. Defaults to a chainable
+  // no-op stand-in (ignores `bytes` entirely) so existing/test call sites
+  // that don't exercise piping keep working unchanged.
+  createReadableFromBytes: (bytes: Uint8Array) => unknown = () => {
+    const stub = { pipe: (dest: unknown) => dest, on: () => stub };
+    return stub;
+  },
 ): FsBuiltin => {
   // Real Node's fs functions accept a `URL` (typically `file://`, from an
   // `import.meta.url`-relative read) anywhere they accept a path string -
@@ -688,6 +714,18 @@ const createFsBuiltin = (
     return watcher;
   };
 
+  // See FsBuiltin's own doc comment on createReadStream for the traced
+  // need and this VFS's "read the whole thing eagerly, hand it to the
+  // injected Readable factory as one chunk" scope. `end` is INCLUSIVE
+  // (real Node's own contract) - Uint8Array.prototype.slice's own end
+  // argument is exclusive, hence the `+ 1`.
+  const createReadStream: FsBuiltin["createReadStream"] = (path, options = {}) => {
+    const bytes = core.readFileSync(path);
+    const { start, end } = options;
+    const sliced = start !== undefined || end !== undefined ? bytes.slice(start ?? 0, end !== undefined ? end + 1 : undefined) : bytes;
+    return createReadableFromBytes(sliced);
+  };
+
   return {
     ...core,
     readFile,
@@ -714,6 +752,7 @@ const createFsBuiltin = (
     closeSync,
     close,
     watch,
+    createReadStream,
   };
 };
 

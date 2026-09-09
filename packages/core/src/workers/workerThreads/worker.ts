@@ -237,7 +237,21 @@ const boot = async (payload: WorkerThreadsBootPayload): Promise<void> => {
   const BufferCtor = (vendoredBuiltins.buffer as { Buffer: { from(bytes: Uint8Array): Uint8Array } }).Buffer;
   const io: FsBuiltinIO = {};
   if (syncFsChannel) io.callSync = (request) => callSyncFs(syncFsChannel, request);
-  const fsBuiltin = createFsBuiltin(io, eventLoop.nextTick, (bytes) => BufferCtor.from(bytes));
+  // Backs fs.createReadStream() with a real vendored Readable - see
+  // workers/process/worker.ts's own doc comment on the identical wiring.
+  const { Readable: ReadableForFs } = vendoredBuiltins.stream as { Readable: new (opts: { read(this: { push(chunk: unknown): boolean }): void }) => unknown };
+  const createReadableFromBytes = (bytes: Uint8Array): unknown => {
+    let sent = false;
+    return new ReadableForFs({
+      read() {
+        if (sent) return;
+        sent = true;
+        this.push(BufferCtor.from(bytes));
+        this.push(null);
+      },
+    });
+  };
+  const fsBuiltin = createFsBuiltin(io, eventLoop.nextTick, (bytes) => BufferCtor.from(bytes), createReadableFromBytes);
   fsBuiltinForWasi = fsBuiltin;
   const fsPromisesBuiltin = createFsPromisesBuiltin(fsBuiltin, eventLoop.nextTick);
 

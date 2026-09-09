@@ -1,3 +1,4 @@
+import { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { createVirtualFileSystem } from "../../kernel/fs/VirtualFileSystem";
 import { createSyncFsServerState, executeFsRequest } from "../../kernel/fs/syncServer";
@@ -9,6 +10,29 @@ const makeIO = (): FsBuiltinIO => {
   const state = createSyncFsServerState();
   return { callSync: (request) => executeFsRequest(vfs, state, request) };
 };
+
+// Exercises createReadStream() against a REAL node:stream Readable, the
+// same class worker.ts wires in for real - see fs.ts's own doc comment on
+// why this is an injected factory (fs.ts has no require() of its own).
+const makeReadableFromBytes = () => (bytes: Uint8Array) => {
+  let sent = false;
+  return new Readable({
+    read() {
+      if (sent) return;
+      sent = true;
+      this.push(Buffer.from(bytes));
+      this.push(null);
+    },
+  });
+};
+
+const collectReadable = (stream: Readable): Promise<Buffer> =>
+  new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", reject);
+  });
 
 describe("createFsBuiltin", () => {
   it("writes and reads a file back synchronously", () => {
@@ -96,6 +120,31 @@ describe("createFsBuiltin", () => {
     fs.writeFileSync("/a/b/package.json", '{"version":"1.2.3"}');
     const url = new URL("./package.json", "file:///a/b/index.js");
     expect(new TextDecoder().decode(fs.readFileSync(url))).toBe('{"version":"1.2.3"}');
+  });
+
+  // Real Vite's own static-file-serving middleware (sirv, used for a real
+  // scaffolded template's `/public` image/logo assets) does
+  // `fs.createReadStream(file, opts).pipe(res)` - traced need, see fs.ts's
+  // own doc comment on createReadStream. Confirmed live: a real GET of an
+  // image asset through a real vite dev server 500'd before this existed.
+  it("createReadStream() reads the whole file and pipes it through a real Readable", async () => {
+    const fs = createFsBuiltin(makeIO(), undefined, undefined, makeReadableFromBytes());
+    fs.writeFileSync("/logo.svg", "<svg>hello</svg>");
+
+    const stream = fs.createReadStream("/logo.svg") as Readable;
+    const result = await collectReadable(stream);
+
+    expect(result.toString()).toBe("<svg>hello</svg>");
+  });
+
+  it("createReadStream() honors {start, end} for an HTTP Range request - end is INCLUSIVE, matching real Node", async () => {
+    const fs = createFsBuiltin(makeIO(), undefined, undefined, makeReadableFromBytes());
+    fs.writeFileSync("/a.txt", "hello world");
+
+    const stream = fs.createReadStream("/a.txt", { start: 6, end: 10 }) as Readable;
+    const result = await collectReadable(stream);
+
+    expect(result.toString()).toBe("world");
   });
 
   it("existsSync, rmSync, renameSync", () => {

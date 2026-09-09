@@ -436,10 +436,11 @@ const createFsBuiltinFromChannel = (
   channel: SyncFsChannel | null,
   nextTick: (callback: () => void) => void,
   wrapBuffer: (bytes: Uint8Array) => Uint8Array,
+  createReadableFromBytes?: (bytes: Uint8Array) => unknown,
 ): FsBuiltin => {
   const io: FsBuiltinIO = {};
   if (channel) io.callSync = (request) => callSyncFs(channel, request);
-  return createFsBuiltin(io, nextTick, wrapBuffer);
+  return createFsBuiltin(io, nextTick, wrapBuffer, createReadableFromBytes);
 };
 
 const decoder = new TextDecoder();
@@ -688,7 +689,25 @@ const boot = async (payload: BootPayload): Promise<void> => {
   // `pipeServers` map nothing ever populated and gets closed immediately.
   const syncFsChannel = createSyncFsChannel(payload.syncFs);
   const BufferCtor = (vendoredBuiltins.buffer as { Buffer: { from(bytes: Uint8Array): Uint8Array } }).Buffer;
-  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel, eventLoop.nextTick, (bytes) => BufferCtor.from(bytes));
+  // Backs fs.createReadStream() - a real vendored Readable (the same class
+  // require('stream') hands guest code), not a hand-rolled stand-in, so
+  // `.pipe(res)` (real Vite's own static-asset-serving middleware) works
+  // exactly as it would against real Node's own ReadStream. This VFS reads
+  // the whole file eagerly (see fs.ts's own doc comment on createReadStream),
+  // so there's only ever one chunk to push before signaling EOF.
+  const { Readable: ReadableForFs } = vendoredBuiltins.stream as { Readable: new (opts: { read(this: { push(chunk: unknown): boolean }): void }) => unknown };
+  const createReadableFromBytes = (bytes: Uint8Array): unknown => {
+    let sent = false;
+    return new ReadableForFs({
+      read() {
+        if (sent) return;
+        sent = true;
+        this.push(BufferCtor.from(bytes));
+        this.push(null);
+      },
+    });
+  };
+  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel, eventLoop.nextTick, (bytes) => BufferCtor.from(bytes), createReadableFromBytes);
   fsBuiltinForWasi = fsBuiltin;
   // Real Node's `fs` module also carries a `.promises` namespace, the same
   // object `require('fs/promises')` returns directly - both point at the
