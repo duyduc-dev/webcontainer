@@ -402,7 +402,12 @@ native binary neither can run). The recipe is now baked into
 live, repeatedly: the real demo scaffolds, installs, and serves a real,
 interactive Vite dev server preview with zero crashes across dozens of
 requests, confirmed via the preview iframe's own `document.title`/
-`body.innerText` surviving a full page reload.
+`body.innerText` surviving a full page reload. **Follow-up in the same
+item**: the user then reported broken images in the now-working preview
+- `fs.createReadStream` (a gap item 9 had already flagged but left
+unimplemented) was the cause, now implemented and verified against the
+real preview iframe's own `<img>` elements (`complete: true`, real
+non-zero dimensions) - commit `d79baf3`.
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2746,18 +2751,11 @@ that would corrupt memory even on one thread, is still open.
    a NEW, later error: `fs$2.createReadStream is not a function`.** Real
    Vite's static-file-serving code goes on to stream the file via
    `fs.createReadStream(...)`, which this runtime's own `fs` builtin
-   doesn't implement at all (grepped - zero references). This is a
-   materially bigger gap than the one-field `mtime` fix (a real Node
-   `fs.createReadStream` returns an actual `stream.Readable`, and real
-   `send`/`serve-static`-shaped middleware typically also expects
-   `{start, end}` range support for HTTP range requests) - left
-   unimplemented for now rather than scope-creeping this fix; worth
-   picking up as its own follow-up whenever static-asset serving through
-   a real dev server is the priority again. Until then, static assets
-   through a real `vite`/`rolldown` server still don't fully work, though
-   the underlying process no longer has any reason to be affected either
-   way (this bug was always independent of the item 9 WASM crash - the
-   process survives it regardless).
+   doesn't implement at all (grepped - zero references). ~~This is a
+   materially bigger gap than the one-field `mtime` fix~~ - **FIXED**,
+   see item 10's own follow-up entry below (`createReadStream` implemented
+   after the user reported broken images in the now-working Vite 7
+   preview) - commit `d79baf3`.
 5. Independent of all of the above: `waitForMarker()`'s own masking bug
    (found early in item 8, still unfixed) means the demo currently can't
    tell "reached Local: and crashed shortly after" apart from any other
@@ -3059,6 +3057,41 @@ process and talks over stdio) - live testing this session never
 observed a hang or deadlock from this, suggesting this project's
 different process architecture may not share that specific problem,
 but it wasn't deliberately stress-tested for it either.
+
+**Follow-up, same milestone: user reported "the asset like img seem not
+show correctly" in the now-working preview - `fs.createReadStream`
+implemented, fixing it.** This is the SAME gap item 9 already flagged
+as "still open" (`fs$2.createReadStream is not a function`, found while
+fixing the `toHeaders`/`toUTCString` static-asset crash, left
+unimplemented at the time as a bigger, separate follow-up) - it just
+took until a real, rendering preview existed for a real user to
+actually SEE the symptom (broken image icons) rather than read about it
+in a 500 response.
+
+Implemented as an eagerly-read (not truly incrementally streamed - this
+VFS has no real disk to stream FROM a chunk at a time) `stream.Readable`
+factory, injected into `createFsBuiltin` the same way `wrapBuffer`
+already is for `Buffer` (`fs.ts` has no `require()` of its own to reach
+`stream` directly). `{start, end}` is supported for HTTP Range requests
+(`end` inclusive, matching real Node). Both real worker entry points
+(`workers/process/worker.ts`, `workers/workerThreads/worker.ts`) wire in
+the SAME real vendored `Readable` class guest code's own `require
+('stream')` returns, not a hand-rolled stand-in, so `.pipe(res)` (real
+Vite's own static-serving middleware) works unmodified. Two new tests
+(whole-file read, byte-range read) exercise it against a genuine
+`node:stream` `Readable` in the test itself. Typecheck clean, full
+suite (596 tests) green, build clean. Commit `d79baf3`.
+
+**Verified live, precisely** (not just "looks fine in a screenshot"):
+checked the actual rendered preview iframe's own `<img>` elements'
+`.complete`/`.naturalWidth`/`.naturalHeight` properties directly - all
+5 images on the vanilla template's real "Get started" page (an 8.7KB
+`vite.svg` fetched twice, a real `hero.png`, two inlined `data:` URL
+SVGs unaffected by this fix either way) report `complete: true` with
+real, non-zero dimensions (e.g. the PNG: `343×361`). Before this fix,
+any image actually served over HTTP (not inlined as a `data:` URL)
+would have 500'd exactly like `/favicon.svg` did in item 9's own
+original finding.
 
 ## Reminder: no AI attribution in commits
 
