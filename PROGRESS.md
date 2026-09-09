@@ -375,20 +375,26 @@ unverified steps together.
 
 **Pick up here (updated):** item 7's own "browser-profile-artifact" theory
 for the `npm run dev` preview failure is now DISPROVEN - see item 8 at the
-very end of this file. It's a real, 100%-reproducible bug, and now
-narrowed down to one specific native call: **`builtin:oxc-runtime`'s
-`resolveId` hook - a direct call into native Rust/WASM code via NAPI-RS
-bridging (`BindingCallableBuiltinPlugin`), not JS - never resolves or
-rejects.** Every plugin's `buildStart` hook completes in milliseconds; the
-very next step, `pluginContainer.resolveId("index.html", ...)`, reaches
-that one native plugin and just hangs, every run, until the process is
-torn down ~2.6-2.7s later. Manually calling
-`nativeBinding.startAsyncRuntime()` before running vite does NOT fix it -
-tested directly. What's next: this needs napi-rs/`@napi-rs/wasm-runtime`'s
-own WASI-threads async-dispatch source read directly (real, published
-package - `npm pack` it), since no more JS-level tracing can see inside
-the native call itself. Item 8 has the complete diagnostic trail, what's
-been ruled out, and the concrete next step.
+very end of this file. Root cause is now KNOWN precisely: `builtin:oxc-
+runtime`'s native `resolveId()` hook (real rolldown, running its non-
+shared-memory WASI async-work path via `@emnapi/core`'s JS-emulated
+`emnapiAsyncWorkPlugin`) signals "keep the process alive while I'm
+pending" via `messagePort.ref()`/`.unref()` - the real Node.js
+`MessagePort` contract - but this runtime's guest-global `MessageChannel`
+was a plain, unwrapped browser-native one with no such methods, so every
+call was a silent no-op invisible to `drain()`. **A fix was attempted
+(wire `MessageChannel`'s ports into `eventLoop.ref()`/`unref()`, mirroring
+`net.ts`'s own `recount()` precedent) and REVERTED**: it typechecked and
+passed all unit tests, but froze the browser tab's renderer solid on a
+live end-to-end run, reproduced twice. Leading theory (unconfirmed - the
+frozen tab couldn't be inspected further): a high-frequency ref/unref
+cycle inside emnapi's own JS-emulated async-work polling turns a
+previously-free no-op into a real livelock. The fix path is very likely
+right in spirit but needs debouncing (the same shape as `worker_threads.
+ts`'s own `UNREF_DEBOUNCE_MS`) before it's safe to try again - do NOT
+just re-apply the naive 1:1 version. Item 8 has the complete diagnostic
+trail, the reverted fix's exact diff (in git history if not reapplied),
+and the concrete next step.
 
 1. ~~Resolve the Phase 3 iframe bug~~ — **DONE.** See above: it was two
    unrelated bugs (a `process.stdout`/`stderr.write()` callback drop hanging
@@ -1732,30 +1738,98 @@ immediately after. Whatever native async-dispatch mechanism this
 particular call depends on either needs something startAsyncRuntime()
 alone doesn't provide, or isn't related to that mechanism at all.
 
-**Concrete next step, in order of cost - now narrowed to one specific
-native async call, not "somewhere in vite's dev server":**
-1. **Understand what makes a `BindingCallableBuiltinPlugin`'s native async
-   hook actually resolve, at the napi-rs/WASI level.** In real Node, a
-   napi-rs native addon's async methods typically ride on libuv's thread
-   pool (or a `ThreadsafeFunction`/tokio bridge) to run the Rust future to
-   completion and wake the JS Promise - none of which this WASM-in-browser
-   runtime has a real equivalent for today. `startAsyncRuntime()` not
-   fixing it suggests either a *second*, undiscovered initialization step,
-   or that this specific native call's completion signal needs to reach JS
-   through a channel this runtime doesn't yet bridge (a `worker_threads`
-   message in a shape the minimal repro didn't exercise, a `wasi_thread_spawn`
-   call this runtime's `thread-spawn` import doesn't handle the same way,
-   or a native timer/poll primitive with no JS-visible counterpart at
-   all). Given no further JS-level tracing can see *inside* the WASM call
-   itself, the next productive step is almost certainly reading napi-rs's
-   own WASI-threads runtime source (`@napi-rs/wasm-runtime`, real published
-   package - `npm pack` it the same way rolldown/vite were pulled this
-   session) for what its async dispatch actually requires from the host,
-   rather than more guess-and-check tracing from the vite/rolldown side.
-2. Once root-caused: fix `waitForMarker()` (item 1 at the top of this
-   section) regardless, so future runs surface "vite exited early" as a
-   visible, distinct failure instead of silently reaching the preview step
-   every time.
+**Update, same session: found the real mechanism (read napi-rs's own WASI
+async-dispatch source directly), and attempted a fix - which regressed
+into something worse. Both halves matter for whoever picks this up.**
+
+`npm pack`'d the real chain, one package at a time, until the actual
+host-facing contract showed up:
+
+- `@rolldown/binding-wasm32-wasi`'s own `rolldown-binding.wasi.cjs` calls
+  `instantiateNapiModuleSync(..., { plugins: [emnapiAsyncWorkPlugin,
+  emnapiTSFNPlugin] })` - **the JS-emulated, single-threaded async-work
+  path**, not real shared-memory threads. So the earlier
+  `worker_threads`/thread-spawn angle was a dead end from the start: this
+  specific native call was never going through real threads at all.
+- `@napi-rs/wasm-runtime`'s own doc comment spells this out directly:
+  single-threaded WASI builds link an emnapi archive whose C async-work/
+  threadsafe-function implementations are unconditional
+  `napi_generic_failure` stubs, so the *JS* implementations
+  (`emnapiAsyncWorkPlugin`/`emnapiTSFNPlugin`, from `@emnapi/core`) provide
+  them instead.
+- `@emnapi/runtime`'s own source (`dist/emnapi.js`) shows exactly how that
+  JS-level implementation signals "don't let the process exit while this
+  native async call is pending": `this.refHandle = new
+  MessageChannel().port1`, then later `if (this.refHandle.ref) {
+  this.refHandle.ref() }` / the matching guarded `.unref()`. **This is
+  Node's real `MessagePort.ref()`/`.unref()` contract** (a real Node
+  MessagePort supports these; a real *browser* one does not) - and this
+  runtime's own `MessageChannel` was never overridden to add them, so
+  every one of these calls was a silently-swallowed no-op the whole time.
+  Nothing ties emnapi's own "is native async work still pending" signal to
+  this runtime's `eventLoop.ref()`/`unref()` at all - so from `drain()`'s
+  point of view, a queued `resolveId()` call on `builtin:oxc-runtime`
+  looks exactly like "nothing happening," even while it's genuinely still
+  in flight.
+
+**Attempted fix:** overrode the guest-global `MessageChannel` (in
+`worker.ts`'s own `Object.assign(self, {...})` block, right where
+`setTimeout`/`setImmediate` already get the same Node-shaping treatment)
+so its ports carry real, idempotent `.ref()`/`.unref()` wired straight
+into `eventLoop.ref()`/`unref()` - the exact same pattern `bindings/
+net.ts`'s `recount()` already uses for TCP/Pipe handles. Typechecked,
+unit-tested (584 passing), and rebuilt clean.
+
+**Live-tested it against the real end-to-end demo - and it made things
+worse, not better: the browser tab's own renderer froze solid** (every
+`javascript_exec`/screenshot call timed out after 45s with "the renderer
+may be frozen or unresponsive"), reproduced twice in a row in two
+separate fresh tabs, at roughly the same point the demo used to cleanly
+(if wrongly) exit. **Reverted immediately** (`git checkout --` on
+`worker.ts`, rebuilt) rather than leave a change in the tree that's
+strictly worse than the bug it was meant to fix - a full tab freeze is a
+worse failure mode than today's clean, silent early exit.
+
+**Why the naive 1:1 wiring likely backfires (not confirmed with further
+tracing - the tab was frozen, nothing left to inspect):** the most likely
+explanation is a livelock, not a deadlock. `eventLoop.ts`'s own `wake()`
+fires on every `ref()`/`unref()` call, waking anything parked in
+`runOnce()`'s `waitForWake()` branch. If `emnapiAsyncWorkPlugin`'s own
+pending/queued-work bookkeeping calls `.ref()`/`.unref()` at a high
+frequency as part of its own internal polling (plausible, given it's a
+*JS-emulated* substitute for what would otherwise be a blocking native
+wait), real ref-counting turns each of those calls into a real wake-and-
+recheck cycle - something that cost nothing as a no-op could easily
+saturate this worker's own event loop once it actually does something,
+starving whatever else needs a turn (including, apparently, enough of the
+browser's own task queue to freeze the tab's main thread too). This is a
+guess at the mechanism, not a confirmed diagnosis - the frozen tab
+couldn't be inspected further.
+
+**Concrete next step, in order of cost - the root mechanism is now known;
+what's missing is a *safe* way to wire it up:**
+1. **Before touching this again: reproduce the freeze with much lighter
+   instrumentation active**, so it can actually be diagnosed instead of
+   just reverted - e.g. count `ref()`/`unref()` calls per second (a
+   counter incremented in `wrapRefPort`, read by polling from the *host*
+   page rather than the frozen worker) to confirm or refute the livelock
+   theory above before trying another fix.
+2. **If it's a high-frequency ref/unref cycle, debounce it** the same way
+   `worker_threads.ts`'s own `UNREF_DEBOUNCE_MS = 3000` already does for
+   exactly this class of problem (a real napi-rs async primitive that
+   legitimately toggles liveness signals faster than this runtime's own
+   event loop should react to) - don't call `eventLoop.unref()` on every
+   single `.unref()`, only after a short quiet window with no matching
+   `.ref()`.
+3. Once a *safe* version of this fix lands and is verified not to
+   regress (a full live end-to-end run, watched for both a hang *and* a
+   freeze, not just checked once and walked away from): confirm the real
+   dev server actually reaches `printUrls()`/`Local:` and a working
+   preview - this would close out items 1, 2, 3, and 7 all at once.
+4. Independently of the above: fix `waitForMarker()` (item 1 at the top of
+   this section) regardless, so future runs surface "vite exited early"
+   as a visible, distinct failure instead of silently reaching the
+   preview step every time.
 
 **Diagnostic technique notes for whoever picks this up (all learned live
 this session, worth keeping in mind before re-inventing them):**
