@@ -377,10 +377,18 @@ unverified steps together.
 this file first — MAJOR MILESTONE, real Vite dev server now serves a
 real HTTP 200 response, for the first time in this project's history,
 but crashes ~0-1s later with a non-deterministic WASM-level trap
-(different trap type each run — the signature of memory corruption or a
-race condition, not a deterministic logic bug).** This is the new
-frontier; everything below (item 8's own hang investigation) is now
-resolved background. Short version of item 8's own resolution: the
+(different trap type each run — the signature of memory corruption).
+Forcing both known thread-count knobs (`RAYON_NUM_THREADS`,
+`NAPI_RS_ASYNC_WORK_POOL_SIZE`) to 1 does NOT stop the crash — the
+"race among several worker threads" hypothesis is refuted in its
+original form. Leading hypothesis is now a memory-safety bug in this
+project's OWN WASI host-function shims (`fd_write`/`fd_read`/
+`path_open`/etc. — wherever they read/write the guest's linear memory
+at a computed address), not necessarily a cross-thread race at all —
+see item 9's own "Concrete next steps" for exactly where to look.**
+This is the new frontier; everything below (item 8's own hang
+investigation) is now resolved background. Short version of item 8's own
+resolution: the
 `npm run dev` hang was never really about ref-counting/keep-alive (that
 theory, and both fix attempts under it, are superseded, though the
 direct/non-debounced ref-count rewrite left behind in `workers/process/
@@ -2543,34 +2551,95 @@ even a fully-working single-threaded fallback (if step 3 below pans out)
 would still leave a REAL failure (a script error, an actual crash for
 some other reason) hanging a caller forever today.
 
+**Update, same session: step 3 (force single-threaded) tested directly -
+crash SURVIVES, refuting the leading hypothesis as originally stated.**
+
+Confirmed via `strings` on the real `.wasm` binary that rolldown genuinely
+ships with `rayon`/`rayon-core` (real Rust data-parallelism), and the
+binary literally contains the env var names it reads: `RAYON_NUM_THREADS`,
+`RAYON_RS_NUM_CPUS`. Separately, `rolldown-binding.wasi.cjs` itself reads
+`NAPI_RS_ASYNC_WORK_POOL_SIZE` (falling back to `UV_THREADPOOL_SIZE`,
+defaulting to 4) to size the emnapi async-work-dispatch worker pool - a
+real, distinct knob from rayon's own, each controlling a different kind of
+internal parallelism.
+
+Spawned a fresh `vite` process directly (`dwc.process.spawn(".../vite.js",
+{cwd: "/my-app", env: {RAYON_NUM_THREADS: "1", NAPI_RS_ASYNC_WORK_POOL_SIZE:
+"1"}})`, bypassing npm dispatch same as the original milestone repro) with
+both knobs forced to their minimum, confirmed it reached `VITE ... ready`
+normally, then issued the same repeated `/` and `/src/main.js` requests
+that reliably crash the default (unconstrained) instance.
+
+**The crash still happened, on the very first native-transform-requiring
+request, with the trap type still varying run to run** (`operation does
+not support unaligned accesses` this run, vs `unreachable` in the
+unconstrained runs) - forcing both documented thread-count knobs to 1 did
+NOT make the crash disappear.
+
+This refutes the *original form* of the race-condition hypothesis (a race
+among *multiple* rayon workers, or among *multiple* async-work-pool
+workers). It does NOT fully close the door on threading as the cause,
+because `asyncWorkPoolSize` is read as `threadsSizeFromEnv > 0 ? that : 4`
+- there is no way to request pool size 0 through this knob, so even this
+"minimum" run still had two real threads touching the shared
+`WebAssembly.Memory`: the main WASI thread plus the one always-present
+pool worker. A race specifically between those two (rather than among
+several peers) remains untested and can't be ruled out this way.
+
+That said, `operation does not support unaligned accesses` is specifically
+the trap V8 throws for a misaligned *atomic* WASM instruction (ordinary
+non-atomic loads/stores don't trap on misalignment in wasm32) - and
+emnapi's synchronous-looking cross-thread dispatch (the same
+`Atomics.wait`/`notify`-style bridging item 8's own `postMessage` fix
+unblocked) is exactly the kind of code that issues atomic ops against
+computed addresses in shared memory. Combined with the trap type varying
+run to run on otherwise-identical requests, the more precise reading now
+is: **something is writing through a bad/stale pointer into the shared
+linear memory buffer**, and depending on what that clobbers, execution
+either hits a Rust `unreachable!()`/panic path or a misaligned atomic
+access soon after. That pointer bug doesn't have to be a race between
+independent threads racing for the same resource - it's just as
+consistent with a bug in this project's OWN WASI host-function shims (the
+functions implementing `fd_write`/`fd_read`/`path_open`/etc., which write
+into and read out of the guest's linear memory at computed offsets on
+every real file-touching call) miscomputing an address or a length
+somewhere, corrupting memory adjacent to whatever rolldown/rayon then
+reads next. This fits the "only native-transform/resolve requests crash"
+finding just as well as the multi-thread-race hypothesis did (those are
+exactly the requests that make real WASI file-read syscalls), and doesn't
+require a race at all - worth checking this project's own WASI syscall
+implementations for exactly this class of bug before spending further
+effort on the threading angle.
+
 **Concrete next steps, in order:**
-1. **Step 3 from before, still open: check whether forcing single-
-   threaded execution avoids the crash.** Given step 2 now shows the
-   crash requires real native transform work specifically, the search
-   for an env var/flag (`@napi-rs/wasm-runtime`/`@emnapi/core`/rolldown
-   itself - a `RAYON_NUM_THREADS`-shaped variable is a common pattern
-   for Rust bundlers using internal parallelism, worth checking rolldown
-   and its native binding's own docs/source for a real equivalent) is
-   now the highest-value next step: if forcing one thread makes the
-   crash disappear entirely across all three request types above, that's
-   strong, direct, actionable confirmation of the race-condition
-   hypothesis - and potentially an immediate, real workaround (trading
-   rolldown's internal thread-parallelism for stability) even before the
-   exact race is found.
-2. Fix the `dwc.preview.fetch()` never-rejects-on-crash gap (new bug
+1. **New leading hypothesis: audit this project's own WASI host-function
+   shims (`fd_write`/`fd_read`/`path_open`/`fd_seek`/etc. - wherever they
+   read a pointer+length pair out of the guest's `WebAssembly.Memory` and
+   write into or read out of it) for an address/length computation bug**,
+   focusing on the real file-read path a transform/resolve call actually
+   exercises (reading a real source file's real bytes into WASM memory
+   for rolldown to parse) - since that's the exact code shared by every
+   request type that crashes and absent from the one (`/favicon.svg`)
+   that doesn't reach rolldown's native code at all. A single off-by-one
+   or wrong-buffer-view bug here would produce exactly the "corrupts
+   something nearby, trap type varies by what got clobbered" signature
+   observed, without needing multiple real threads to race at all.
+2. If (1) doesn't turn up anything, the remaining, narrower threading
+   question is whether the ONE always-present async-work-pool worker
+   (unavoidable via `asyncWorkPoolSize`, since the knob floors at 4 and
+   never goes below 1) races with the main WASI thread specifically -
+   worth checking whether `@napi-rs/wasm-runtime` exposes any way to
+   disable the async-work pool entirely (pool size truly 0, forcing
+   emnapi's async dispatch onto the main thread with no second thread at
+   all) as a cleaner test than what's achievable via the documented env
+   vars alone.
+3. Fix the `dwc.preview.fetch()` never-rejects-on-crash gap (new bug
    above) - independent value regardless of the WASM crash's own root
    cause.
-3. Fix the static-asset `toHeaders`/`toUTCString` bug (new bug above) -
+4. Fix the static-asset `toHeaders`/`toUTCString` bug (new bug above) -
    independent, much smaller, likely a missing real `Date` value in this
    runtime's own fs-stat/mtime emulation feeding vite's static-file
    header synthesis.
-4. Given how deep the WASM crash itself is (a genuine multi-threaded-
-   WASM memory-safety bug, not a JS-level logic gap like everything else
-   fixed in this file), root-causing the exact race likely requires more
-   specialized WASM/Rust-runtime tooling than this project has used so
-   far - step 1's workaround (force single-threaded, if it works) may be
-   the practical endpoint rather than a true fix at the shared-memory-
-   bridging level.
 5. Independent of all of the above: `waitForMarker()`'s own masking bug
    (found early in item 8, still unfixed) means the demo currently can't
    tell "reached Local: and crashed shortly after" apart from any other
