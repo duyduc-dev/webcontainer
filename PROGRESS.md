@@ -407,7 +407,13 @@ item**: the user then reported broken images in the now-working preview
 - `fs.createReadStream` (a gap item 9 had already flagged but left
 unimplemented) was the cause, now implemented and verified against the
 real preview iframe's own `<img>` elements (`complete: true`, real
-non-zero dimensions) - commit `d79baf3`.
+non-zero dimensions) - commit `d79baf3`. Two more follow-ups in the
+same item: the old e2e suite tested demo content that no longer
+existed anywhere in `main.ts` (a full rewrite, now a real test of the
+working flow - commit `e1373a9`), and `waitForMarker()`'s own
+long-standing masking bug (flagged since item 8) is fixed - it now
+rejects instead of silently resolving when a process dies before
+printing its ready banner (commit `933a635`).
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2756,12 +2762,9 @@ that would corrupt memory even on one thread, is still open.
    see item 10's own follow-up entry below (`createReadStream` implemented
    after the user reported broken images in the now-working Vite 7
    preview) - commit `d79baf3`.
-5. Independent of all of the above: `waitForMarker()`'s own masking bug
-   (found early in item 8, still unfixed) means the demo currently can't
-   tell "reached Local: and crashed shortly after" apart from any other
-   failure mode - worth fixing now that there's a concrete, reproducible
-   "starts working, then crashes" case to make visible instead of hidden
-   behind a silent preview failure.
+5. ~~Independent of all of the above: `waitForMarker()`'s own masking
+   bug~~ - **FIXED**, see item 10's own follow-up entry below - commit
+   `933a635`.
 6. ~~Given the threading angle has now been pushed about as far as this
    project's own tooling allows...~~ **SUPERSEDED - see the new section
    below.** A working reference implementation (`~/workspace/vivari`, a
@@ -3112,7 +3115,18 @@ loading with real dimensions - directly exercising the
 each (fast - real npm's own registry-response caching, not a cold
 install each time). Commit `e1373a9`.
 
-## Reminder: no AI attribution in commits
+**Follow-up, same milestone: fixed `waitForMarker()`'s own masking
+bug** (flagged unfixed since item 8, repeated again in item 9's own
+next-steps list). It resolved whenever its stream closed, whether or
+not the marker text had actually appeared - so a process crashing or
+exiting before ever printing its own ready banner looked identical to
+one that started successfully. Now rejects instead, with `main()`
+catching that specifically and reporting the real exit code (same
+early-return pattern already used for a nonzero npm create/install
+exit code) rather than silently proceeding to preview a server that
+was never actually running. Verified the happy path is unaffected: the
+e2e test above still passes end to end after this change. Commit
+`933a635`.
 
 Per standing preference, commit messages for this project should not
 include `Co-Authored-By`/session-link footers.
