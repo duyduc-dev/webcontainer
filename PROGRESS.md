@@ -377,28 +377,40 @@ unverified steps together.
 this file first — MAJOR MILESTONE, real Vite dev server now serves a
 real HTTP 200 response, for the first time in this project's history,
 but crashes ~0-1s later with a non-deterministic WASM-level trap
-(different trap type each run — the signature of memory corruption).
-Pushed the threading angle as far as this project's own tools allow:
-env vars (`RAYON_NUM_THREADS=1`, `NAPI_RS_ASYNC_WORK_POOL_SIZE=1`) AND a
-direct guest-VFS patch of the loader's `asyncWorkPoolSize` to a literal
-`0` all still crash identically — and a trace confirmed the patch still
-leaves 2 real worker threads running (`onCreateWorker` fires regardless
-of that setting), so true zero-extra-thread execution isn't reachable
-from the JS side at all. The "race among several worker threads"
-hypothesis is refuted in ITS ORIGINAL form (more than 2 threads isn't
-needed), but a race specific to the 2 threads that can't be eliminated
-remains technically open. Practical read: the threading avenue has hit
-its limit without real WASM/Rust debugging tools this project doesn't
-have — see item 9's own "Concrete next steps" for the WASI-shim read
-still worth doing. Of the two independent, actionable bugs found along
-the way: `preview.fetch()` no longer hangs forever when its process
-crashes mid-request (root cause was `netRelay.ts` silently dropping a
-dead connection without notifying the peer — commit `b42d591`). The
-`toHeaders`/`toUTCString` static-asset crash is also fixed (`fs.ts`'s
-`StatResult` now carries a real `mtime: Date` — commit `b363913`), but
-that unmasked a bigger, still-open gap right behind it: this runtime's
-`fs` builtin has no `createReadStream` at all, so static assets through
-a real dev server still 500 on a different error now.**
+(different trap type each run). The threading hypothesis is DROPPED as
+the lead cause — read the new "found a working reference implementation"
+section near the end of item 9 first. `~/workspace/vivari` (a sibling
+WebContainer-clone project) hit the exact same `unreachable` trap
+running real Vite 8/rolldown, root-caused it as a CONFIRMED UPSTREAM BUG
+in rolldown itself (`napi::tokio_runtime::RT`, a static Rust `Option
+<Runtime>` in shared wasm memory, gets torn down after the first native
+bundle call and never reinitialized — a second native call's
+`tokio::spawn` unwraps `None` and panics, which traps as `unreachable`;
+real GitHub issues rolldown#8747/#9134, napi-rs#2847/#2850/#3028; also
+confirmed to hit real StackBlitz/WebContainer) — and explicitly confirmed
+it is NOT a threading/worker-spawn race. This matches everything this
+project independently found (thread-count knobs didn't help). Live
+re-testing this session found genuine non-determinism consistent with
+this theory (same pristine binary: one run crashed on the first request
+as always, another survived five requests in a row), and found that
+adding synchronous JS overhead in the native call path changes the
+outcome — a real timing-sensitivity signal. The concrete next step
+(not yet done): get Vite's dependency-scan to skip entirely
+(`optimizeDeps.noDiscovery`) via a real `vite.config.js`, so a served
+request becomes the FIRST native rolldown call in the process instead of
+a probable second one — blocked by two separate, unrelated, likely-
+fixable config-loading bugs found along the way (rolldown's native
+config loader throws `Invalid URL`; the `--configLoader native`
+workaround's dynamic `import()` of a `file://` URL doesn't resolve
+through the VFS). Of the two independent bugs found earlier in this same
+investigation: `preview.fetch()` no longer hangs forever when its
+process crashes mid-request (commit `b42d591`). The `toHeaders`/
+`toUTCString` static-asset crash is also fixed (`fs.ts`'s `StatResult`
+now carries a real `mtime: Date` — commit `b363913`), but that unmasked
+a bigger, still-open gap: this runtime's `fs` builtin has no
+`createReadStream` at all (Vivari's own roadmap independently confirms
+this exact gap was necessary for their own static-asset serving to
+work — a real, correctly-scoped fix, not overkill).**
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2760,15 +2772,151 @@ that would corrupt memory even on one thread, is still open.
    failure mode - worth fixing now that there's a concrete, reproducible
    "starts working, then crashes" case to make visible instead of hidden
    behind a silent preview failure.
-6. Given the threading angle has now been pushed about as far as this
-   project's own tooling allows (item 4 from the original next-steps
-   list, upgraded from "may" to "does": root-causing the exact
-   mechanism now clearly requires real WASM/Rust-level debugging
-   tooling this project doesn't have), the pragmatic path forward is
-   likely accepting the crash as a known limitation for now and
-   prioritizing 3/4/5 above, rather than continuing to sink further
-   effort into a fix at the shared-memory-bridging level without better
-   tools.
+6. ~~Given the threading angle has now been pushed about as far as this
+   project's own tooling allows...~~ **SUPERSEDED - see the new section
+   below.** A working reference implementation (`~/workspace/vivari`, a
+   sibling WebContainer-clone project - already the source of the
+   ref-counting fix ported into `workers/process/worker.ts`) has hit and
+   root-caused the SAME crash class, with a concrete, confirmed-upstream
+   explanation and a real workaround strategy. Re-read before assuming
+   "needs better tools than this project has" - that conclusion turned
+   out to be wrong.
+
+**MAJOR UPDATE, next session: found and read a working reference
+implementation of this exact feature (`~/workspace/vivari`) - it hit and
+root-caused the same crash, and the cause is a confirmed, real UPSTREAM
+BUG in rolldown itself, not a bug in either project's own sandbox.**
+
+`~/workspace/vivari` is a separate, more mature WebContainer-clone
+project (Node/Bun/Python-in-the-browser) that this project has already
+borrowed from once (the direct/non-debounced MessageChannel ref-count
+rewrite in `workers/process/worker.ts`, see item 8). It runs real Vite 8
++ rolldown too, and its own `roadmap.md` (an 853KB, extremely detailed
+build log this project doesn't have an equivalent of) documents hitting
+the exact same symptom:
+
+> "...the second **rolldown-wasm** bundle panics - `Rolldown panicked
+> ... napi-3.10.3/src/tokio_runtime.rs: Access tokio runtime failed in
+> spawn` - which traps the wasm (`unreachable`) and crashes the whole
+> dev server (server unbinds -> 502). Root cause ... is a known upstream
+> rolldown-on-wasi bug, not a Vivari-specific gap."
+
+And, more precisely, from their follow-up root-cause entry:
+
+> "`napi::tokio_runtime::RT` is a Rust `static Option<Runtime>` in the
+> (shared) wasm linear memory; it is shut down after the first bundle
+> and never re-initialized under wasi, so **the second bundle's
+> `tokio::spawn` unwraps `None` -> panic -> wasm `unreachable`** -> the
+> dev-server process dies. This is a **known upstream rolldown-on-wasi
+> bug that also hits StackBlitz/WebContainer** (rolldown#8747,
+> rolldown#9134; napi-rs#2847/#2850, napi-rs#3028) - not something a
+> template config can dodge ... and not fixable in our runtime without
+> touching rolldown's Rust ... **Confirmed both bundles' pool workers
+> boot fine, so it is not a nested-worker spawn deadlock.**"
+
+That last sentence directly refutes the entire multi-thread-race
+framing this file spent the last several sessions on: Vivari's own team
+explicitly checked and ruled out a threading/worker-spawn cause for
+their instance of this exact trap. This is consistent with (not
+contradicted by) this project's own finding that forcing every
+reachable thread-count knob to its minimum didn't stop the crash - both
+projects independently arrived at "it's not really about thread count."
+
+**Does duck-webcontainer-api's crash match this exactly?** Not
+confirmed byte-for-byte yet - a live re-test this session, capturing
+full (untruncated-before-search) stderr and grepping for `"tokio"`/
+`"panicked"`, found neither string before the trap. That's inconclusive,
+not disconfirming: a Rust panic hook's own `eprintln!` output goes
+through the same WASI `fd_write` path as everything else, and may
+simply not survive being flushed before the trap tears the worker down
+(this project's own stdout/stderr piping has already been shown fragile
+around large/abrupt output more than once this investigation). What
+newly-observed evidence DOES support the same underlying class of bug
+(a lifecycle/static-state issue tied to "which native call number is
+this", not a deterministic per-request logic bug):
+
+- **Confirmed non-deterministic even holding the request constant.**
+  Same pristine binary, same request (`/`), back-to-back sessions: one
+  run got a clean 200 and then survived FOUR more requests (three
+  `/src/main.js` 500s that did NOT crash the process, two more `/`
+  200s) with the process still alive throughout; a follow-up run against
+  a freshly-redownloaded, byte-identical binary crashed on the very
+  first `/` request, same as every prior session's baseline. This is
+  exactly the shape of a lifecycle/timing bug, not a deterministic one.
+- **The "extra JS overhead changes the outcome" result.** Patching the
+  guest's copy of `rolldown-binding.wasi.cjs` to wrap every exported
+  function AND every `BindingDevEngine`/`BindingBundler`/`BindingWatcher`/
+  `BindingWatcherBundler` prototype method in a counting `console.error`
+  wrapper (pure diagnostic instrumentation, meant to count how many
+  native calls happen before the crash) changed the observed outcome
+  from "crashes reliably" to "doesn't crash across 5 requests" in the
+  same session - re-confirmed by immediately reverting to a pristine
+  binary and seeing the crash return on the very next run. Inserting
+  synchronous JS overhead directly in the native call path measurably
+  changing crash-vs-no-crash is a strong, if circumstantial, timing-
+  sensitivity signal - consistent with a lifecycle race (e.g. one
+  operation's cleanup racing another's use of the same static Rust
+  state), not conclusive on its own.
+- The call-counting instrumentation itself didn't get far enough to
+  directly confirm "native call #2 is what panics" - the trace only
+  covers plain exported functions and prototype-own-enumerable methods
+  on four class names guessed from the export list; nothing fired
+  between `initTraceSubscriber`/`BindingCallableBuiltinPlugin` (setup,
+  before "ready") and the point where the (differently-timed) run
+  stopped crashing, meaning the actual bundle/transform work happens
+  through a call surface this trace didn't reach (likely instance
+  methods obtained some other way, e.g. off a returned handle rather
+  than the class's own prototype). Worth a more targeted trace if this
+  is picked up again - the current one changed the outcome instead of
+  just observing it, which is a confound to fix, not a result to trust.
+
+**What Vivari actually does about it (a workaround, not a fix - they say
+so explicitly): avoid ever making a second problematic native rolldown
+call in the same process**, since patching rolldown's own Rust is out of
+scope for either project. Concretely: they pin frameworks that would
+otherwise force a second rolldown-driven optimize pass (e.g. Svelte's
+SSR dep-optimize) to Vite 7 + esbuild instead of Vite 8 + rolldown for
+that specific path (esbuild runs in-process via their own
+`esbuild-inproc-patch.js`, sidestepping rolldown/wasi entirely there),
+and mark the remaining Vite-8-SSR-required cases (SvelteKit/Nuxt/Astro)
+"experimental" rather than claiming they work. For our own demo (a
+plain vanilla, non-SSR Vite 8 project), there's no obvious *second*
+top-level bundle operation the way Vivari's SSR case has one - but Vite's
+own startup dependency-scan step plausibly already makes one internal
+native call before "ready" ever prints, which would make any real
+request afterward the *second* native call overall, matching the "first
+succeeds, second panics" pattern even for a single-optimize-pass demo
+like ours.
+
+**A concrete, not-yet-completed next step this points to:** get Vite to
+skip its own dependency-scan/pre-bundle step entirely (`optimizeDeps:
+{noDiscovery: true, include: []}` in a real `vite.config.js`), so a
+served page request becomes the first native rolldown call ever made in
+that process, and see whether that changes the crash rate the way the
+"first bundle succeeds" theory predicts. Attempted this session and
+blocked by two SEPARATE, unrelated compatibility gaps before ever
+reaching the real test:
+- Vite 8's default (`bundle`) config loader itself uses rolldown
+  natively to process `vite.config.js`, and that failed here with
+  `Error: Failed to construct 'URL': Invalid URL` inside
+  `napi_create_error` - a different bug in the native config-loading
+  path, not yet root-caused.
+- Vivari's own docs flag this exact problem and work around it with
+  `--configLoader native` (a real, documented Vite 8 CLI flag - confirmed
+  present in this project's own vendored vite's `--help` output too).
+  Trying that here instead hit a second, different failure:
+  `TypeError: Failed to fetch dynamically imported module: file:///my-
+  app/vite.config.js?t=...` - this runtime's dynamic `import()` of a
+  `file://`-shaped URL isn't wired up to actually resolve through the
+  VFS the way `require()` is.
+Both are real, fixable-looking gaps (the second one especially - sounds
+like the same class of gap the ESM-interop plan already on file for this
+project touches), but neither is fixed yet, so the `noDiscovery` test
+itself remains unrun. This is the highest-value concrete next step:
+fixing either config-loading path is a normal, scoped bug fix (not a
+"need better WASM tools" wall), and would finally let the actual
+"does avoiding a second native call fix it" prediction get tested
+directly.
 
 **Technique note, worth keeping:** when capturing a spawned process's
 stdout/stderr for diagnosis, truncate each chunk to a small size (a few
