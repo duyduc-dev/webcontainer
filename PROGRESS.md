@@ -403,18 +403,27 @@ served request confirmed as the process's first-ever native rolldown
 call (no dependency-scan messages at all) still crashed on the very
 first request.** This refutes the simple "avoid a second native call"
 framing — either something else still makes an earlier native call, or
-this runtime's instance of the bug isn't purely about call count. The
-underlying crash itself remains open; see item 9's own next steps for
-where this leaves it. Of the three independent bugs fixed this
-investigation: `preview.fetch()` no longer hangs forever when its
-process crashes mid-request (commit `b42d591`); the `toHeaders`/
-`toUTCString` static-asset crash is fixed (`fs.ts`'s `StatResult` now
-carries a real `mtime: Date` — commit `b363913`), though that unmasked
-a bigger, still-open gap (`fs.createReadStream` isn't implemented at
-all — Vivari's own roadmap independently confirms this exact gap was
-necessary for their own static-asset serving to work, a real,
-correctly-scoped fix); and the ESM loader now correctly handles a
-computed dynamic `import()` specifier (commit `b04b0b4`).**
+this runtime's instance of the bug isn't purely about call count. **Now
+read item 10, right after item 9: trying `vite@7` (esbuild, not
+rolldown - the same workaround Vivari uses for this exact upstream bug)
+as a path AROUND the crash entirely, rather than fixing it. IN
+PROGRESS - two more real bugs found and fixed along the way
+(`esbuild`'s own postinstall needs an `overrides` alias to
+`esbuild-wasm`, not a runtime fix; `fs.*Sync` didn't accept a real `URL`
+object - commit `ceedb53`), one more (a well-known real npm/rollup
+optional-dependency bug, unrelated to this runtime) found but not yet
+confirmed fixed, and the actual "does vite@7 dev serve a page without
+crashing" question still unanswered.** Of the four independent bugs
+fixed across this whole investigation: `preview.fetch()` no longer
+hangs forever when its process crashes mid-request (commit `b42d591`);
+the `toHeaders`/`toUTCString` static-asset crash is fixed (`fs.ts`'s
+`StatResult` now carries a real `mtime: Date` — commit `b363913`),
+though that unmasked a bigger, still-open gap (`fs.createReadStream`
+isn't implemented at all — Vivari's own roadmap independently confirms
+this exact gap was necessary for their own static-asset serving to
+work); the ESM loader now correctly handles a computed dynamic
+`import()` specifier (commit `b04b0b4`); and `fs.*Sync` now accepts a
+real `URL` object, not just a string (commit `ceedb53`).**
 This is the new frontier; everything below (item 8's own hang
 investigation) is now resolved background. Short version of item 8's own
 resolution: the
@@ -2948,6 +2957,89 @@ short slice of a huge captured string as character codes (`Array.from
 browser) is a reliable way to safely inspect the START of a
 too-large-to-return string without pulling the whole thing through the
 browser tool's own content filters or the agent's own context.
+
+## 10. Trying Vite 7 (esbuild, not rolldown) as a workaround for item 9's crash — IN PROGRESS, two real bugs found and fixed, a third (unrelated) blocker still open
+
+Given item 9's crash is a confirmed upstream rolldown bug, and Vivari's
+own proven workaround for the exact same bug is to route the affected
+path through **esbuild instead of rolldown** (Vite 7 uses esbuild for
+dev-time transforms; Vite 8 is what pulled in rolldown in the first
+place), tried pinning the demo to `vite@^7` instead of latest. Not
+finished yet, but has already surfaced two real, independent,
+now-fixed bugs and found (not yet worked around) a third, unrelated one
+- all found by scaffolding a SEPARATE `/my-app-v7` project by hand
+(`npm create vite@latest my-app-v7`, then editing `package.json` to pin
+`vite: "^7.0.0"` before `npm install`, to avoid racing the playground's
+own automatic `/my-app` demo flow).
+
+1. **`esbuild`'s own postinstall script can't run at all - fixed via a
+   standard npm mechanism, not a runtime patch.** Plain `esbuild`
+   (a real dependency of Vite 7) ships a native binary per platform,
+   selected via `optionalDependencies`; this runtime reports a normal-
+   looking `process.platform`/`process.arch` ("linux"/"x64", NOT the
+   `process.versions.webcontainer`-based fallback rolldown itself
+   relies on - see item 9), so npm's own platform-matching selects a
+   REAL, non-runnable native binary, and esbuild's own `install.js`
+   falls back to validating a JS/WASM path via `execFileSync
+   (process.execPath, [toPath, '--version'])` - which fails outright,
+   since `process.execPath` here is a fixed string (`/usr/bin/node`)
+   with no real file at that VFS path to execute. Rather than patching
+   this runtime's own `child_process`/`execFileSync` to somehow support
+   self-reinvocation (a much bigger undertaking), used the SAME real
+   npm feature StackBlitz-style demos commonly use for exactly this:
+   an `overrides` field aliasing the dependency itself -
+   `"overrides": { "esbuild": "npm:esbuild-wasm@^0.25.0" }` - so every
+   transitive `require('esbuild')` in the tree actually resolves to
+   `esbuild-wasm`'s own content, whose postinstall doesn't need this
+   native-binary dance at all. **Confirmed working**: `npm install`
+   succeeded cleanly afterward. Unlike Vivari (whose single-threaded
+   cooperative kernel needs `esbuild-inproc-patch.js` to avoid a real
+   deadlock when esbuild-wasm's Node build spawns a child process and
+   talks over stdio), this project's dedicated-real-Worker-per-process
+   architecture may not need an equivalent in-process patch at all -
+   worth confirming once further along, but not yet hit as a problem.
+2. ~~`readFileSync(url)` with a real `URL` object crashed on startup~~ -
+   **FIXED**, see the dedicated commit (`ceedb53`) and its own message
+   for the full root cause: real Vite 7's `dist/node/chunks/logger.js`
+   finds its own `package.json` via a doubly-nested
+   `readFileSync(new URL("../../package.json", new URL(...)))`, and
+   this runtime's `fs.*Sync` functions only ever accepted a `string`
+   path - a `URL` object silently stringified to a bogus VFS path
+   somewhere downstream, producing `ENOENT: /file:/my-app-v7/
+   node_modules/vite/package.json` (note the collapsed/malformed
+   slashes - not just an un-stripped `file://` prefix, something further
+   downstream also mishandled the string). Fixed generically for every
+   fs op's path-shaped field, not just `readFileSync`, since this is a
+   completely standard, common real-Node pattern (any `import.meta.url`-
+   relative file access) likely to recur.
+3. **Still open, unrelated to anything above**: with both bugs above
+   fixed, `vite@7` gets further but now fails with
+   `Error: Cannot find module @rollup/rollup-linux-x64-musl. npm has a
+   bug related to optional dependencies (https://github.com/npm/cli/
+   issues/4828)`. This is a well-known, REAL npm bug that affects actual
+   users on real machines too (not something specific to this runtime) -
+   npm's optionalDependencies resolution sometimes fails to correctly
+   select/skip a platform-specific package, and the community's own
+   standard fix is exactly what the error message itself suggests:
+   delete `package-lock.json` and `node_modules`, then reinstall clean.
+   Attempted this session but not yet confirmed fixed - live testing was
+   interrupted repeatedly by Chrome extension disconnects (transient,
+   unrelated to this bug) before a full clean reinstall could finish and
+   get retested. Next step: retry the clean-reinstall, and if that alone
+   doesn't clear it, check whether an `overrides` entry aliasing the
+   musl variant to the real glibc one (or vice versa - whichever this
+   environment's own libc-detection heuristic gets wrong) works the same
+   way the esbuild-wasm alias did above.
+
+**Not yet reached**: whether `vite@7 dev` actually serves a page without
+hitting item 9's own rolldown crash at all (the whole point of this
+detour) - blocked on resolving step 3 first. If it works, this becomes
+the recommended path for the playground demo (pin to Vite 7 + the
+esbuild-wasm override) until rolldown's own upstream bug is fixed;
+either way, the two fixes already landed (`b04b0b4`'s dynamic-import
+support, `ceedb53`'s URL-accepting fs) have value independent of how
+this specific detour concludes - both are common, general Node patterns
+this runtime now handles that it didn't before.
 
 ## Reminder: no AI attribution in commits
 
