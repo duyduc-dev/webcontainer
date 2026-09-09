@@ -245,15 +245,64 @@ const isRealCode = (masked: string, source: string, start: number): boolean => m
 // "import('...')" clause is matched (not the whole statement), so this
 // never needs to parse the binding list (`{ a, b as c }`, `* as ns`,
 // `Default, { ... }`, ...) at all - only the specifier position/text, which
-// is all that needs rewriting. Native import() handles everything else.
+// is all that needs rewriting. Native import() handles everything else -
+// EXCEPT a dynamic `import(...)` whose argument isn't a bare string literal
+// (a computed specifier, e.g. `import(someUrl + "?t=" + Date.now())` - real
+// Vite's own native config loader does exactly this). DYNAMIC_IMPORT_RE
+// below only matches the literal-argument shape; DYNAMIC_IMPORT_OPEN_RE
+// (used by the fallback pass in buildModule) catches the rest by finding
+// just the `import(` token and then walking forward for the matching `)`
+// via findMatchingParen - see its own doc comment for why a second regex
+// can't also capture an arbitrary expression directly.
+//
+// Both `import(...)` regexes use a `(?<!\.)` negative lookbehind - `\b`
+// alone matches right after a `.` too (a non-word char), so without it a
+// real property/method access named `import` (e.g. real Vite's own
+// `ModuleRunner.prototype.import(path)`, called as `this.import(x)`) gets
+// mistaken for the dynamic-import keyword. Confirmed live: exactly this
+// call site, in real Vite's `module-runner.js`, broke DYNAMIC_IMPORT_OPEN_RE's
+// fallback rewrite before this guard existed - `this.import(acceptedPath)`
+// isn't a call whose "specifier" makes sense to resolve at all. Mirrors
+// moduleLoader.ts's own `rewriteDynamicImportCalls`, which already guards
+// its CJS-side equivalent the same way.
 // ---------------------------------------------------------------------------
 
 const FROM_CLAUSE_RE = /\bfrom\s*(["'])((?:(?!\1)[^\\]|\\.)*)\1/g;
 const SIDE_EFFECT_IMPORT_RE = /\bimport\s*(["'])((?:(?!\1)[^\\]|\\.)*)\1/g;
-const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(["'])((?:(?!\1)[^\\]|\\.)*)\1\s*\)/g;
+const DYNAMIC_IMPORT_RE = /(?<!\.)\bimport\s*\(\s*(["'])((?:(?!\1)[^\\]|\\.)*)\1\s*\)/g;
+const DYNAMIC_IMPORT_OPEN_RE = /(?<!\.)\bimport\s*\(/g;
 const IMPORT_META_URL_RE = /\bimport\.meta\.url\b/g;
 const IMPORT_META_MAIN_RE = /\bimport\.meta\.main\b/g;
 const IMPORT_META_RESOLVE_RE = /\bimport\.meta\.resolve\s*\(\s*(["'])((?:(?!\1)[^\\]|\\.)*)\1\s*\)/g;
+
+/** Finds the `)` matching the `(` at `masked[openParenIndex]`, scanning the
+ * ALREADY-MASKED text (see maskNonCode) so a paren sitting inside a string/
+ * comment/regex literal never miscounts depth, while a paren inside a
+ * template literal's `${...}` interpolation (left unmasked - real code)
+ * correctly does. Returns -1 for an unterminated call (malformed source -
+ * the caller leaves it untouched rather than guessing). */
+const findMatchingParen = (masked: string, openParenIndex: number): number => {
+  let depth = 1;
+  for (let j = openParenIndex + 1; j < masked.length; j++) {
+    if (masked[j] === "(") depth++;
+    else if (masked[j] === ")" && --depth === 0) return j;
+  }
+  return -1;
+};
+
+/** True if the token right after `masked[closeParenIndex]` (skipping
+ * whitespace) is `{` - the shape of a method/function DECLARATION's own
+ * signature (`import(id) { ... }`), never a valid call expression (a real
+ * call's closing paren is never directly followed by a block). Guards
+ * DYNAMIC_IMPORT_OPEN_RE's fallback against a class or object-literal
+ * method literally named `import` with no preceding `.` for the negative
+ * lookbehind above to catch - confirmed live: real Vite's own ModuleRunner
+ * class declares exactly `async import(id) { ... }`. */
+const isFollowedByBlockBody = (masked: string, closeParenIndex: number): boolean => {
+  let j = closeParenIndex + 1;
+  while (j < masked.length && /\s/.test(masked[j]!)) j++;
+  return masked[j] === "{";
+};
 
 interface Edit {
   start: number;
@@ -375,11 +424,31 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
   // this same realm (they're not sandboxed - same Worker, same JS agent).
   const globalShims = ((globalThis as Record<string, unknown>).__dwcCjsShims ??= {}) as Record<string, unknown>;
 
+  /** Real Vite's own native config loader (a computed dynamic import - see
+   * DYNAMIC_IMPORT_OPEN_RE above) does `import(pathToFileURL(path).href +
+   * "?t=" + Date.now())` - a `file://` URL with a cache-busting query, not a
+   * shape any branch of tryResolveEsmPath understands on its own. Real
+   * Node's own resolver strips exactly this (module identity is by path, not
+   * URL+query) before ever touching the filesystem. Only touches a
+   * `file://`-prefixed specifier - a bare/relative specifier is never
+   * touched here, even one containing a literal "?" (vanishingly rare, and
+   * guessing at it isn't this helper's job). */
+  const normalizeFileUrlSpecifier = (specifier: string): string => {
+    if (!specifier.startsWith("file://")) return specifier;
+    let path = specifier.slice("file://".length);
+    const hashIndex = path.indexOf("#");
+    if (hashIndex !== -1) path = path.slice(0, hashIndex);
+    const queryIndex = path.indexOf("?");
+    if (queryIndex !== -1) path = path.slice(0, queryIndex);
+    return path;
+  };
+
   /** Resolves `specifier` (as imported from `fromPath`) to a data: URL,
    * either by recursing into the native ESM subgraph or falling back to a
    * synthesized CJS shim - shared by both the eager static-import scan
    * below and the lazy dynamic-import path (see `__dwcDynamicImport`). */
-  const resolveAndQueue = (fromPath: string, specifier: string): string => {
+  const resolveAndQueue = (fromPath: string, rawSpecifier: string): string => {
+    const specifier = normalizeFileUrlSpecifier(rawSpecifier);
     const target = tryResolveEsmPath(fromPath, specifier);
     if (target && isEsmPath(target) && !building.has(target)) {
       return buildModule(target);
@@ -506,14 +575,39 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
         edits.push({ start: match.index!, end: match.index! + full.length, replacement: `import ${quote}${dataUrl}${quote}` });
       });
 
+      const literalDynamicImportStarts = new Set<number>();
       scan(DYNAMIC_IMPORT_RE, (match) => {
         const full = match[0];
         const specifier = match[2]!;
+        literalDynamicImportStarts.add(match.index!);
         // Deferred - see `__dwcDynamicImport`'s own doc comment above.
         edits.push({
           start: match.index!,
           end: match.index! + full.length,
           replacement: `globalThis.__dwcDynamicImport(${JSON.stringify(path)}, ${JSON.stringify(specifier)})`,
+        });
+      });
+
+      // Fallback for a dynamic import() whose argument ISN'T a bare string
+      // literal (skipped by DYNAMIC_IMPORT_RE above, tracked via
+      // literalDynamicImportStarts so this never double-edits the same call).
+      // The specifier here is a computed expression - can't be known until
+      // the call actually runs, so instead of JSON-stringifying a value, the
+      // ORIGINAL expression text is spliced straight into the replacement
+      // (still evaluated at the original call site, just as an argument to
+      // __dwcDynamicImport instead of to native import()).
+      scan(DYNAMIC_IMPORT_OPEN_RE, (match) => {
+        const start = match.index!;
+        if (literalDynamicImportStarts.has(start)) return;
+        const openParenIndex = start + match[0].length - 1;
+        const closeParenIndex = findMatchingParen(masked, openParenIndex);
+        if (closeParenIndex === -1) return; // malformed - leave untouched
+        if (isFollowedByBlockBody(masked, closeParenIndex)) return; // a method/function declaration named "import", not a call
+        const expr = source.slice(openParenIndex + 1, closeParenIndex);
+        edits.push({
+          start,
+          end: closeParenIndex + 1,
+          replacement: `globalThis.__dwcDynamicImport(${JSON.stringify(path)}, (${expr}))`,
         });
       });
 

@@ -579,6 +579,70 @@ describe("moduleLoader ESM support", () => {
     expect(ns.dep.value).toBe(42);
   });
 
+  it("resolves a dynamic import() whose specifier is a COMPUTED expression, not a bare string literal (real Vite's own native config loader does `import(someUrl + '?t=' + Date.now())`)", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/package.json": '{"type":"module"}',
+        "/index.js": "const base = './dep'; export const dep = await import(base + '.js');",
+        "/dep.js": "export const value = 7;",
+      },
+    });
+
+    const ns = (await loader.run("/index.js")) as { dep: { value: number } };
+    expect(ns.dep.value).toBe(7);
+  });
+
+  it("resolves a computed dynamic import() of a `file://` URL with a cache-busting query string - the exact shape real Vite's native config loader uses (`import(pathToFileURL(path).href + '?t=' + Date.now())`)", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/package.json": '{"type":"module"}',
+        "/index.js": "export const cfg = await import('file:///config.js' + '?t=' + 12345);",
+        "/config.js": "export default { value: 'loaded' };",
+      },
+    });
+
+    const ns = (await loader.run("/index.js")) as { cfg: { default: { value: string } } };
+    expect(ns.cfg.default.value).toBe("loaded");
+  });
+
+  it("doesn't rewrite a `.import(...)` method CALL as a dynamic import, in an ESM entry (real Vite's own `module-runner.js` calls `this.import(acceptedPath)` on its ModuleRunner class - the computed-specifier fallback rewrite broke on exactly this before the `(?<!\\.)` guard existed)", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/package.json": '{"type":"module"}',
+        "/index.js": ["const obj = { import: (x) => x * 2 };", "export const value = obj.import(21);"].join("\n"),
+      },
+    });
+
+    const ns = (await loader.run("/index.js")) as { value: number };
+    expect(ns.value).toBe(42);
+  });
+
+  it("doesn't rewrite an `import(id) { ... }` method DECLARATION as a dynamic import, in an ESM entry (real Vite's own ModuleRunner class declares exactly `async import(id) { ... }` - no preceding `.` for the negative lookbehind to catch, since it's a declaration not a call; guarded instead by checking whether the closing paren is followed by a block)", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/package.json": '{"type":"module"}',
+        "/index.js": ["class Runner {", "  import(x) { return x * 2; }", "}", "export const value = new Runner().import(21);"].join(
+          "\n",
+        ),
+      },
+    });
+
+    const ns = (await loader.run("/index.js")) as { value: number };
+    expect(ns.value).toBe(42);
+  });
+
+  it("a computed dynamic import() specifier that's a genuinely unresolvable path rejects with a real error, not a bogus resolution", async () => {
+    const loader = createModuleLoader({
+      sources: {
+        "/package.json": '{"type":"module"}',
+        "/index.js": "const base = './missing'; export const lazy = () => import(base + '.js');",
+      },
+    });
+
+    const ns = (await loader.run("/index.js")) as { lazy: () => Promise<unknown> };
+    await expect(ns.lazy()).rejects.toThrow(/Cannot find module/);
+  });
+
   it("a dynamic import() of a missing/optional module doesn't crash module evaluation - resolution is deferred until the call actually runs, and only awaiting it rejects (real Vite's own optional-peer-dep pattern, e.g. `esbuild ||= import('esbuild')`, must not turn a textually-present but never-called import() into a fatal load-time error)", async () => {
     const loader = createModuleLoader({
       sources: {
