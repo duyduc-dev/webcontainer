@@ -3093,6 +3093,25 @@ any image actually served over HTTP (not inlined as a `data:` URL)
 would have 500'd exactly like `/favicon.svg` did in item 9's own
 original finding.
 
+**Follow-up, same milestone: replaced the whole e2e suite - it was
+completely stale.** `examples/playground/e2e/boot.spec.ts` asserted
+against demo content (`process.spawn`/`shell.exec`/`net`/
+`child_process` console messages, etc.) that no longer exists anywhere
+in `main.ts` - it had been rewritten several times across sessions,
+most recently into the npm-create-vite-and-preview-it flow this
+investigation got working. Every one of the old tests was guaranteed
+to fail if actually run - there was, in effect, zero automated
+coverage of anything current. Replaced with one real end-to-end test
+of the actual flow: scaffold, pin to Vite 7 + the overrides, real
+`npm install`, `npm run dev`, real preview - asserting terminal
+progress at each stage, a specific regression guard for item 9's own
+crash text (`RuntimeError`/`Cannot find module`), the preview iframe's
+real `document.title`, and at least one real (non-`data:`-URL) image
+loading with real dimensions - directly exercising the
+`createReadStream` fix. Verified 3 consecutive clean runs, ~20-25s
+each (fast - real npm's own registry-response caching, not a cold
+install each time). Commit `e1373a9`.
+
 ## Reminder: no AI attribution in commits
 
 Per standing preference, commit messages for this project should not
