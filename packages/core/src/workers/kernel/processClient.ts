@@ -302,6 +302,27 @@ const bootProcess = async (
       return;
     }
 
+    // fs.watch() (see runtime/builtins/fs.ts) - the guest process has no
+    // channel of its own to the FS Worker's watch registry, only this
+    // relay through the kernel (fsClient.request), same shape as every
+    // other guest<->FS-Worker op. Registration/unregistration are fire-
+    // and-forget from this process worker's own point of view - the actual
+    // notification, when one fires, arrives later as a completely separate,
+    // unsolicited "fs-change" FS Worker event routed by kernel/worker.ts's
+    // own fsClient.onEvent() handler (not through this bootProcess()
+    // closure at all, since that event names its target by processId, not
+    // by which worker.onmessage happened to be listening).
+    if (type === "fs-watch-register") {
+      const { id, path, recursive } = eventPayload as { id: string; path: string; recursive?: boolean };
+      void fsClient.request({ action: "watch", watchId: id, path, recursive, processId });
+      return;
+    }
+    if (type === "fs-watch-unregister") {
+      const { id } = eventPayload as { id: string };
+      void fsClient.request({ action: "unwatch", watchId: id });
+      return;
+    }
+
     // Cross-process net: this process either registered a port/path (fire-
     // and-forget) or is dialing one (net-pipe-connect gets a synchronous
     // local-registry answer back as net-pipe-connect-response), or is
@@ -437,6 +458,7 @@ const bootProcess = async (
     if (type === "exit") {
       processTable.remove(processId);
       netRelay.unregisterWorker(processId);
+      void fsClient.request({ action: "unwatchProcess", processId });
       worker.terminate();
     }
 
@@ -452,6 +474,7 @@ const bootProcess = async (
   worker.onerror = (event) => {
     processTable.remove(processId);
     netRelay.unregisterWorker(processId);
+    void fsClient.request({ action: "unwatchProcess", processId });
     worker.terminate();
     onEvent("stderr", { chunk: new TextEncoder().encode(`Process worker failed to load or crashed: ${event.message || "unknown error"}\n`) }, processId);
     onEvent("exit", { code: 1 }, processId);
@@ -751,6 +774,7 @@ const createProcessClient = (
     if (!worker) return;
     processTable.remove(payload.processId);
     netRelay.unregisterWorker(payload.processId);
+    void fsClient.request({ action: "unwatchProcess", processId: payload.processId });
     worker.terminate();
     postEvent("process:exit", { processId: payload.processId, code: 143 });
   };

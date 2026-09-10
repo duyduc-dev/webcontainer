@@ -67,6 +67,10 @@ let exited = false;
 const pendingNetRequests = new Map<string, { resolve: (reply: NetReply) => void; reject: (error: unknown) => void }>();
 const pendingPipeConnects = new Map<string, { resolve: (v: { connId: number }) => void; reject: (error: unknown) => void }>();
 let pipeMessageHandler: ((msg: PipeRelayMessage) => void) | null = null;
+// fs.watch() listeners, keyed by the same watchId the kernel's "fs-change"
+// event (routed via kernel/worker.ts's fsClient.onEvent handler) is tagged
+// with - see createFsWatchBridge below and its own doc comment.
+const fsWatchListeners = new Map<string, (eventType: "change" | "rename", filename: string | null) => void>();
 // Set inside boot() once process.stdin (a real vendored Readable) exists -
 // routes an incoming "stdin" message (dwc.process.spawn()'s host-facing
 // .stdin WritableStream, relayed through the kernel) into it. null until
@@ -152,6 +156,47 @@ const createNetBridge = (eventLoop: ReturnType<typeof createEventLoop>) => ({
     pipeMessageHandler = handler;
   },
 });
+
+/** The process-worker half of fs.watch() (see runtime/builtins/fs.ts's own
+ * `watch()`, and PROGRESS.md's item 11 for why this didn't exist before) -
+ * this worker has no direct channel to the FS Worker's watch registry, only
+ * this fire-and-forget relay through the kernel (processClient.ts's own
+ * "fs-watch-register"/"fs-watch-unregister" handling), mirroring
+ * createNetBridge's listen()/pipeListen() shape above. A later match
+ * arrives as a completely separate, unsolicited "fs-watch-event" message
+ * (see handleFsWatchEvent below) - not a reply to the register call, same
+ * "registration and notification are two independent messages" shape
+ * net-pipe-listen/net-pipe-relay already have.
+ *
+ * Refed for as long as the returned handle is open, matching real Node: an
+ * active (non-`.unref()`'d) fs.watch() FSWatcher keeps the process alive -
+ * without this, a guest script whose ENTIRE job is `fs.watch(dir, cb)` (no
+ * timer, no open server) would look "done" the instant its own top-level
+ * code returns and get torn down before ever seeing a change, exactly the
+ * eventLoop.ref() failure mode worker_threads.Worker/net's own recount()
+ * already guard against elsewhere in this file. */
+const createFsWatchBridge = (eventLoop: ReturnType<typeof createEventLoop>) => ({
+  watch(path: string, recursive: boolean, onEvent: (eventType: "change" | "rename", filename: string | null) => void): { close(): void } {
+    const id = crypto.randomUUID();
+    fsWatchListeners.set(id, onEvent);
+    eventLoop.ref();
+    self.postMessage({ type: "fs-watch-register", payload: { id, path, recursive } });
+    let closed = false;
+    return {
+      close(): void {
+        if (closed) return;
+        closed = true;
+        fsWatchListeners.delete(id);
+        eventLoop.unref();
+        self.postMessage({ type: "fs-watch-unregister", payload: { id } });
+      },
+    };
+  },
+});
+
+const handleFsWatchEvent = (payload: { id: string; eventType: "change" | "rename"; filename: string | null }): void => {
+  fsWatchListeners.get(payload.id)?.(payload.eventType, payload.filename);
+};
 
 const handlePipeConnectResponse = (payload: { id: string; connId: number }): void => {
   const waiting = pendingPipeConnects.get(payload.id);
@@ -437,10 +482,11 @@ const createFsBuiltinFromChannel = (
   nextTick: (callback: () => void) => void,
   wrapBuffer: (bytes: Uint8Array) => Uint8Array,
   createReadableFromBytes?: (bytes: Uint8Array) => unknown,
+  watchBridge?: ReturnType<typeof createFsWatchBridge>,
 ): FsBuiltin => {
   const io: FsBuiltinIO = {};
   if (channel) io.callSync = (request) => callSyncFs(channel, request);
-  return createFsBuiltin(io, nextTick, wrapBuffer, createReadableFromBytes);
+  return createFsBuiltin(io, nextTick, wrapBuffer, createReadableFromBytes, watchBridge);
 };
 
 const decoder = new TextDecoder();
@@ -707,7 +753,13 @@ const boot = async (payload: BootPayload): Promise<void> => {
       },
     });
   };
-  const fsBuiltin = createFsBuiltinFromChannel(syncFsChannel, eventLoop.nextTick, (bytes) => BufferCtor.from(bytes), createReadableFromBytes);
+  const fsBuiltin = createFsBuiltinFromChannel(
+    syncFsChannel,
+    eventLoop.nextTick,
+    (bytes) => BufferCtor.from(bytes),
+    createReadableFromBytes,
+    createFsWatchBridge(eventLoop),
+  );
   fsBuiltinForWasi = fsBuiltin;
   // Real Node's `fs` module also carries a `.promises` namespace, the same
   // object `require('fs/promises')` returns directly - both point at the
@@ -866,4 +918,5 @@ self.onmessage = (event: MessageEvent<{ type: string; payload?: unknown }>) => {
   else if (event.data.type === "cp-exec-response") handleChildExecResponse(event.data.payload as Parameters<typeof handleChildExecResponse>[0]);
   else if (event.data.type === "stdin") stdinPush?.((event.data.payload as { chunk: Uint8Array }).chunk);
   else if (event.data.type === "wt-sync-fs-channel-response") handleSyncFsChannelResponse(event.data.payload as Parameters<typeof handleSyncFsChannelResponse>[0]);
+  else if (event.data.type === "fs-watch-event") handleFsWatchEvent(event.data.payload as Parameters<typeof handleFsWatchEvent>[0]);
 };

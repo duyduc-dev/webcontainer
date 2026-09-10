@@ -264,10 +264,12 @@ describe("createFsBuiltin", () => {
 
   // Traced need: real Vite's own dev-server startup calls fs.watch()
   // directly (chokidar's fallback createFsWatchInstance) - crashed with
-  // "fs.watch is not a function" before this existed at all. Deliberately
-  // doesn't detect real changes (see fs.ts's own doc comment on watch()) -
-  // this only asserts it's callable and returns a real, well-behaved
-  // watcher handle, not that it observes anything.
+  // "fs.watch is not a function" before this existed at all. With no
+  // watchBridge injected (the default createFsBuiltin() gets in every other
+  // test in this file), real notifications aren't wired up - this only
+  // asserts it's callable and returns a real, well-behaved watcher handle,
+  // not that it observes anything. See the "watch() with a real watchBridge"
+  // describe block below for the actual notification-delivery behavior.
   it("watch() returns a closeable handle and accepts a listener without throwing", () => {
     const fs = createFsBuiltin(makeIO());
     const seen: unknown[] = [];
@@ -276,6 +278,72 @@ describe("createFsBuiltin", () => {
     expect(typeof watcher.close).toBe("function");
     expect(() => watcher.on("change", () => {})).not.toThrow();
     expect(() => watcher.close()).not.toThrow();
+  });
+
+  // Exercises the real wiring worker.ts's own createFsWatchBridge provides
+  // live (see PROGRESS.md item 11's own follow-up) - a fake bridge here
+  // stands in for the real kernel/FS-Worker round trip, since that's
+  // integration-level plumbing this file's own unit tests don't reach.
+  describe("watch() with a real watchBridge", () => {
+    const makeFakeWatchBridge = () => {
+      const registrations: Array<{ path: string; recursive: boolean; fire: (eventType: "change" | "rename", filename: string | null) => void }> = [];
+      const closed: string[] = [];
+      return {
+        registrations,
+        closed,
+        watchBridge: {
+          watch(path: string, recursive: boolean, onEvent: (eventType: "change" | "rename", filename: string | null) => void) {
+            registrations.push({ path, recursive, fire: onEvent });
+            return { close: () => closed.push(path) };
+          },
+        },
+      };
+    };
+
+    it("registers with the bridge using the watched path and recursive flag", () => {
+      const { registrations, watchBridge } = makeFakeWatchBridge();
+      const fs = createFsBuiltin(makeIO(), undefined, undefined, undefined, watchBridge);
+
+      fs.watch("/src", { recursive: true }, () => {});
+
+      expect(registrations).toEqual([{ path: "/src", recursive: true, fire: expect.any(Function) }]);
+    });
+
+    it("defaults recursive to false when no options are passed", () => {
+      const { registrations, watchBridge } = makeFakeWatchBridge();
+      const fs = createFsBuiltin(makeIO(), undefined, undefined, undefined, watchBridge);
+
+      fs.watch("/src", () => {});
+
+      expect(registrations[0]?.recursive).toBe(false);
+    });
+
+    it("delivers a bridge event to every registered change listener", () => {
+      const { registrations, watchBridge } = makeFakeWatchBridge();
+      const fs = createFsBuiltin(makeIO(), undefined, undefined, undefined, watchBridge);
+      const seenFromCtor: unknown[] = [];
+      const seenFromOn: unknown[] = [];
+      const watcher = fs.watch("/src", (eventType, filename) => seenFromCtor.push([eventType, filename]));
+      watcher.on("change", (eventType, filename) => seenFromOn.push([eventType, filename]));
+
+      registrations[0]!.fire("change", "a.txt");
+
+      expect(seenFromCtor).toEqual([["change", "a.txt"]]);
+      expect(seenFromOn).toEqual([["change", "a.txt"]]);
+    });
+
+    it("close() closes the underlying bridge handle and stops delivering events", () => {
+      const { registrations, closed, watchBridge } = makeFakeWatchBridge();
+      const fs = createFsBuiltin(makeIO(), undefined, undefined, undefined, watchBridge);
+      const seen: unknown[] = [];
+      const watcher = fs.watch("/src", (eventType, filename) => seen.push([eventType, filename]));
+
+      watcher.close();
+      registrations[0]!.fire("change", "a.txt");
+
+      expect(closed).toEqual(["/src"]);
+      expect(seen).toEqual([]);
+    });
   });
 });
 

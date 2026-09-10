@@ -20,6 +20,23 @@ const fetcherClient = createFetcherClient();
 const netRelay = createNetRelay();
 const processClient = createProcessClient(fsClient, processTable, fetcherClient, netRelay);
 
+// Routes the FS Worker's own unsolicited "fs-change" events (see workers/
+// fs/worker.ts's watch registry) back to whichever process worker actually
+// registered that watch - the FS Worker only knows a processId (it has no
+// handle to any real Worker), processTable is what turns that back into the
+// live Worker instance to postMessage(), same lookup PROCESS_STDIN already
+// uses via processClient.ts's own `stdin()`.
+fsClient.onEvent((event) => {
+  if (event.type !== "fs-change") return;
+  const { processId, watchId, eventType, filename } = event.payload as {
+    processId: string;
+    watchId: string;
+    eventType: string;
+    filename: string;
+  };
+  processTable.getWorker(processId)?.postMessage({ type: "fs-watch-event", payload: { id: watchId, eventType, filename } });
+});
+
 router.handle("PING", () => "PONG");
 router.handle("INITIALIZE", () => {
   initialize();

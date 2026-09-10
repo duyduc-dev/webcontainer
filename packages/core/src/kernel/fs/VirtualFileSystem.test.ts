@@ -281,4 +281,80 @@ describe("VirtualFileSystem", () => {
     vfs.symlink("/real.txt", "/link.txt");
     expect(vfs.lstat("/link.txt").mode).toBe(0o777);
   });
+
+  describe("onChange", () => {
+    it("reports a brand new file as rename, an overwrite as change", () => {
+      const vfs = createVirtualFileSystem();
+      const events: Array<{ eventType: string; path: string }> = [];
+      vfs.onChange((event) => events.push(event));
+
+      vfs.writeFile("/a.txt", "one");
+      vfs.writeFile("/a.txt", "two");
+
+      expect(events).toEqual([
+        { eventType: "rename", path: "/a.txt" },
+        { eventType: "change", path: "/a.txt" },
+      ]);
+    });
+
+    it("reports mkdir, rm, symlink, and chmod with the right eventType", () => {
+      const vfs = createVirtualFileSystem();
+      const events: Array<{ eventType: string; path: string }> = [];
+      vfs.onChange((event) => events.push(event));
+
+      vfs.mkdir("/dir");
+      vfs.writeFile("/dir/f.txt", "x");
+      vfs.chmod("/dir/f.txt", 0o755);
+      vfs.symlink("/dir/f.txt", "/link.txt");
+      vfs.rm("/dir/f.txt");
+
+      expect(events).toEqual([
+        { eventType: "rename", path: "/dir" },
+        { eventType: "rename", path: "/dir/f.txt" },
+        { eventType: "change", path: "/dir/f.txt" },
+        { eventType: "rename", path: "/link.txt" },
+        { eventType: "rename", path: "/dir/f.txt" },
+      ]);
+    });
+
+    it("emits a rename event for every intermediate directory a recursive mkdir creates", () => {
+      const vfs = createVirtualFileSystem();
+      const events: Array<{ eventType: string; path: string }> = [];
+      vfs.onChange((event) => events.push(event));
+
+      vfs.mkdir("/a/b/c", { recursive: true });
+
+      expect(events).toEqual([
+        { eventType: "rename", path: "/a" },
+        { eventType: "rename", path: "/a/b" },
+        { eventType: "rename", path: "/a/b/c" },
+      ]);
+    });
+
+    it("emits two rename events for a rename - one for the source path, one for the destination", () => {
+      const vfs = createVirtualFileSystem();
+      vfs.writeFile("/old.txt", "hi");
+      const events: Array<{ eventType: string; path: string }> = [];
+      vfs.onChange((event) => events.push(event));
+
+      vfs.rename("/old.txt", "/new.txt");
+
+      expect(events).toEqual([
+        { eventType: "rename", path: "/old.txt" },
+        { eventType: "rename", path: "/new.txt" },
+      ]);
+    });
+
+    it("stops delivering events after unsubscribing", () => {
+      const vfs = createVirtualFileSystem();
+      const events: Array<{ eventType: string; path: string }> = [];
+      const unsubscribe = vfs.onChange((event) => events.push(event));
+
+      vfs.writeFile("/a.txt", "one");
+      unsubscribe();
+      vfs.writeFile("/a.txt", "two");
+
+      expect(events).toEqual([{ eventType: "rename", path: "/a.txt" }]);
+    });
+  });
 });

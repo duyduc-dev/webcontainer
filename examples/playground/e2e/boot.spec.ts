@@ -73,13 +73,10 @@ test("the playground demo scaffolds a real Vite project, installs it, and shows 
   // state via a genuine RFC 6455 handshake against Vite's own bundled WS
   // server (verified manually end-to-end before adding this assertion).
   //
-  // This deliberately does NOT test "edit a file, see a live update" -
-  // that additionally requires this runtime's fs.watch (runtime/builtins/
-  // fs.ts) to fire real change notifications, which today is a complete
-  // no-op stub (accepts a listener, never calls it). Vite's dev server
-  // therefore never learns a file changed and never pushes an HMR update
-  // over this now-working connection - a separate, currently open gap
-  // this test doesn't claim to cover. See PROGRESS.md.
+  // This test itself only covers the transport - the actual "edit a file,
+  // see a live update" flow (which additionally needs fs.watch to fire real
+  // change notifications) is covered separately below, now that fs.watch is
+  // real (see PROGRESS.md item 11's own follow-up).
   const frame = page.frame({ url: /__dwc_preview__/ });
   const wsResult = await frame?.evaluate(async () => {
     const anyWindow = window as unknown as { __dwcRealWebSocket?: unknown; WebSocket: new (url: string, protocols?: string | string[]) => WebSocket };
@@ -103,4 +100,44 @@ test("the playground demo scaffolds a real Vite project, installs it, and shows 
 
   expect(wsResult?.installed).toBe(true);
   expect(wsResult?.outcome).toBe("open protocol=vite-hmr readyState=1");
+
+  // The actual end goal of item 11: a real guest file edit (via dwc.fs,
+  // exactly how a host-side code editor would write a change) becomes
+  // visible in the live preview, with no reload - real Vite CSS HMR swaps
+  // the <style> tag's content in place once it learns (via fs.watch, now
+  // real - see runtime/builtins/fs.ts and workers/fs/worker.ts's own watch
+  // registry) that /my-app/src/style.css changed. dwc.fs.writeFile() goes
+  // through the exact same kernel FS_REQUEST -> FS Worker -> VirtualFileSystem
+  // path chokidar's own fs.watch(dir, {recursive}) call is registered
+  // against, so this exercises the real, full path end to end - not a
+  // shortcut that only proves the transport (the block above) or only the
+  // watch registry in isolation (covered by unit tests elsewhere).
+  const marker = "rgb(1, 2, 3)";
+  const cssPath = "/my-app/src/style.css";
+
+  await page.evaluate(
+    async ({ path, markerColor }) => {
+      const dwc = (
+        window as unknown as {
+          dwc: { fs: { readFile(p: string): Promise<Uint8Array>; writeFile(p: string, c: string): Promise<void> } };
+        }
+      ).dwc;
+      const original = new TextDecoder().decode(await dwc.fs.readFile(path));
+      await dwc.fs.writeFile(path, `${original}\nbody { background-color: ${markerColor} !important; }\n`);
+    },
+    { path: cssPath, markerColor: marker },
+  );
+
+  await expect
+    .poll(
+      async () => {
+        const liveFrame = page.frame({ url: /__dwc_preview__/ });
+        if (!liveFrame) return null;
+        return liveFrame.evaluate(() => getComputedStyle(document.body).backgroundColor);
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(marker);
+
+  expect(pageErrors).toEqual([]);
 });

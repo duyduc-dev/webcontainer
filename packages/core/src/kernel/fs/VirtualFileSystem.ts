@@ -42,6 +42,24 @@ interface RmOptions {
   recursive?: boolean;
 }
 
+/** A raw, unfiltered mutation - real Node's own "rename" (create/remove/move)
+ * vs "change" (content/metadata) split, matching what fs.watch's listener
+ * argument names. `path` is always the fully-normalized absolute VFS path
+ * that changed - traced need: workers/fs/worker.ts's own watch registry
+ * (the single place that decides which registered fs.watch() call, if any,
+ * cares about a given change) needs a raw, caller-agnostic feed of every
+ * mutation regardless of whether it came from the async FS_REQUEST path or
+ * the synchronous SharedArrayBuffer bridge - both ultimately call through
+ * this one VirtualFileSystem instance, so hooking mutations here (rather
+ * than in each of those two separate request dispatchers) is the one choke
+ * point that can't miss a write. */
+interface VfsChangeEvent {
+  eventType: "rename" | "change";
+  path: string;
+}
+
+type VfsChangeListener = (event: VfsChangeEvent) => void;
+
 interface VirtualFileSystem {
   mkdir(path: string, options?: MkdirOptions): void;
   writeFile(path: string, contents: string | Uint8Array): void;
@@ -56,6 +74,9 @@ interface VirtualFileSystem {
   rm(path: string, options?: RmOptions): void;
   rename(from: string, to: string): void;
   exists(path: string): boolean;
+  /** Subscribes to every mutating op this VFS instance ever performs, from
+   * ANY caller. Returns an unsubscribe function. */
+  onChange(listener: VfsChangeListener): () => void;
 }
 
 const encoder = new TextEncoder();
@@ -66,6 +87,11 @@ const MAX_SYMLINK_DEPTH = 40;
 
 const createVirtualFileSystem = (): VirtualFileSystem => {
   const root: DirNode = { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 };
+
+  const changeListeners = new Set<VfsChangeListener>();
+  const emitChange = (eventType: VfsChangeEvent["eventType"], path: string): void => {
+    for (const listener of changeListeners) listener({ eventType, path });
+  };
 
   /**
    * Resolves a path to a fully symlink-free absolute path string, following
@@ -161,6 +187,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
       const { parent, name } = resolveParent(normalized);
       if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
       parent.children.set(name, { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 });
+      emitChange("rename", normalized);
       return;
     }
 
@@ -170,11 +197,18 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     // symlinks are only ever created as leaf entries (e.g. node_modules/.bin
     // shims), never as a directory a later mkdir -p walks through.
     let dir = root;
+    let currentPath = "";
     for (const segment of segs) {
+      currentPath += `/${segment}`;
       let child = dir.children.get(segment);
       if (!child) {
         child = { type: "dir", children: new Map(), mtimeMs: Date.now(), mode: 0o755 };
         dir.children.set(segment, child);
+        // Real inotify fires "rename" (creation) for every intermediate
+        // directory a recursive mkdir -p actually creates, not just the
+        // final leaf - matching that here rather than emitting only once
+        // for `normalized`.
+        emitChange("rename", currentPath);
       } else if (child.type !== "dir") {
         throw new FSError("ENOTDIR", normalized);
       }
@@ -196,6 +230,12 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     const mode = existing?.type === "file" ? existing.mode : 0o644;
     const bytes = typeof contents === "string" ? encoder.encode(contents) : contents;
     parent.children.set(name, { type: "file", contents: bytes, mtimeMs: Date.now(), mode });
+    // Real inotify (and real Node's fs.watch on top of it) reports a brand
+    // new file as "rename", an overwrite of an existing one as "change" -
+    // matters to chokidar (Vite's own file watcher), which uses this exact
+    // distinction to tell "a new module was added" apart from "an already-
+    // imported module's content changed."
+    emitChange(existing ? "change" : "rename", normalized);
   };
 
   const readFile = (path: string): Uint8Array => {
@@ -241,6 +281,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     const node = resolveNode(normalized);
     if (node.type === "symlink") throw new FSError("EINVAL", normalized, "Cannot chmod a symlink");
     node.mode = mode;
+    emitChange("change", normalized);
   };
 
   const symlink = (target: string, path: string): void => {
@@ -248,6 +289,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     const { parent, name } = resolveParent(normalized);
     if (parent.children.has(name)) throw new FSError("EEXIST", normalized);
     parent.children.set(name, { type: "symlink", target, mtimeMs: Date.now() });
+    emitChange("rename", normalized);
   };
 
   const readlink = (path: string): string => {
@@ -273,6 +315,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
       throw new FSError("ENOTEMPTY", normalized);
     }
     parent.children.delete(name);
+    emitChange("rename", normalized);
   };
 
   const rename = (from: string, to: string): void => {
@@ -282,9 +325,15 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     const node = fromParent.children.get(fromName);
     if (!node) throw new FSError("ENOENT", normalizedFrom);
 
-    const { parent: toParent, name: toName } = resolveParent(normalize(to));
+    const normalizedTo = normalize(to);
+    const { parent: toParent, name: toName } = resolveParent(normalizedTo);
     fromParent.children.delete(fromName);
     toParent.children.set(toName, node);
+    // Two separate events (real inotify's own behavior for a rename) - a
+    // watcher on the source directory and one on the destination directory
+    // are, in general, two different fs.watch() registrations.
+    emitChange("rename", normalizedFrom);
+    emitChange("rename", normalizedTo);
   };
 
   const exists = (path: string): boolean => {
@@ -296,8 +345,13 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     }
   };
 
-  return { mkdir, writeFile, readFile, readdir, stat, lstat, chmod, symlink, readlink, realpath, rm, rename, exists };
+  const onChange = (listener: VfsChangeListener): (() => void) => {
+    changeListeners.add(listener);
+    return () => changeListeners.delete(listener);
+  };
+
+  return { mkdir, writeFile, readFile, readdir, stat, lstat, chmod, symlink, readlink, realpath, rm, rename, exists, onChange };
 };
 
 export { createVirtualFileSystem };
-export type { DirNode, FileNode, MkdirOptions, Node, RmOptions, Stat, SymlinkNode, VirtualFileSystem };
+export type { DirNode, FileNode, MkdirOptions, Node, RmOptions, Stat, SymlinkNode, VfsChangeEvent, VfsChangeListener, VirtualFileSystem };

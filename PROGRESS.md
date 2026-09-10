@@ -373,15 +373,21 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated, latest session): read item 11 at the very end
-of this file first — real WebSocket/HMR transport is DONE and verified
-working end-to-end (a genuine RFC 6455 handshake succeeds against real
-Vite-bundled `ws` server code, confirmed live), but making a guest file
-edit actually visible in the preview still doesn't work — `fs.watch`
-(`runtime/builtins/fs.ts`) is a complete no-op stub that never notifies
-listeners, so Vite's dev server never learns a file changed at all,
-regardless of how correct the now-working WebSocket connection is.
-Making `fs.watch` real is the next concrete, unscoped piece of work.**
+**Pick up here (updated, latest session): read item 12 at the very end of
+this file first — `fs.watch` is now real, and the full loop items 8
+through 12 spent many sessions chasing is closed: a real `dwc.fs.
+writeFile()` edit from the host page now visibly updates the live Vite
+preview via real CSS HMR, with no reload, verified live end-to-end
+(`examples/playground/e2e/boot.spec.ts`). This closes out the whole
+multi-session "real npm install + dev-server preview + live-reload-on-edit"
+arc (items 1 through 12) for the first time in this project's history.
+Only CSS-file HMR was actually exercised live (the cleanest observable
+signal - a computed style change with no reload); a JS-file edit
+(module-level HMR accept/reject, or a full-reload fallback for a file
+Vite can't hot-swap) was NOT separately verified and is a reasonable next
+thing to check, though nothing in this session's own design is CSS-
+specific - the same real `fs.watch` notification reaches Vite for any
+file under the watched directory, JS included.**
 
 Before that: item 10 — MAJOR MILESTONE, DONE: the playground demo shows
 a real, working, crash-free live preview of a real Vite dev server.
@@ -3292,6 +3298,109 @@ follow-up** - making `fs.watch` real (wiring change notifications
 into the write-path functions, handling recursive/directory watches)
 - not attempted in this pass since it's a materially different, larger
 piece of work than the transport this item was scoped to.
+
+Per standing preference, commit messages for this project should not
+include `Co-Authored-By`/session-link footers.
+
+## 12. MAJOR MILESTONE — `fs.watch` is real; a live guest file edit now updates the running preview via HMR, verified end-to-end — DONE
+
+Follow-up to item 11's own closing gap: `fs.watch()` was a complete no-op
+stub, so even though the real WebSocket/HMR transport worked, Vite's dev
+server (via chokidar) never learned a file had changed and never had a
+reason to push anything over it. This item wires real change notifications
+through the whole stack and confirms the actual end-to-end outcome live -
+not just that a listener fires, but that a real `dwc.fs.writeFile()` call
+now visibly updates the running Vite preview with no reload.
+
+**Design.** The single choke point every fs mutation passes through -
+regardless of whether it came from a guest process's synchronous
+SharedArrayBuffer bridge (`kernel/fs/syncServer.ts`) or the kernel's async
+`FS_REQUEST` path (`workers/fs/worker.ts`'s `handleFsRequest`, also what
+`dwc.fs.*` itself proxies into) - is the one shared `VirtualFileSystem`
+instance living in the (single, dedicated) FS Worker. `VirtualFileSystem.
+onChange(listener)` (new) is called internally by every mutating op
+(`writeFile`, `mkdir`, `rm`, `rename`, `symlink`, `chmod`) with a real
+Node-shaped `{eventType: "rename"|"change", path}` event - `writeFile`
+distinguishes a brand-new file ("rename") from an overwrite ("change") by
+checking whether the target already existed; a recursive `mkdir -p` emits
+one "rename" per directory segment it actually creates, not just the final
+leaf; `rename` emits two events (source and destination, since a watcher on
+either directory is a separate registration). New unit tests in
+`VirtualFileSystem.test.ts` cover all of this directly against the VFS, no
+Worker plumbing involved.
+
+The FS Worker (`workers/fs/worker.ts`) subscribes to `vfs.onChange` once at
+boot and keeps a process-agnostic `watchRegistry` (`watchId -> {path,
+recursive, processId}`), populated by two new `FsRequestPayload` actions
+(`"watch"`/`"unwatch"`, plus `"unwatchProcess"` for cleanup - see below).
+On a real mutation, it matches every registered watch against the changed
+path (`kernel/fs/watchMatch.ts`, new - `matchesWatch`/`watchFilename`,
+extracted into their own pure, directly-unit-tested module rather than left
+inline in the Worker file, matching this project's existing "keep testable
+logic out of the untestable Worker entry point" pattern) and, for each
+match, posts an unsolicited `"fs-change"` event (via the already-existing
+but previously-unused `postEvent()` in `workers/fs/service.ts` - this
+plumbing existed already, just had no caller until now) carrying
+`{processId, watchId, eventType, filename}`.
+
+Routing that event back to the right guest process needed one new piece:
+`workers/kernel/fsClient.ts` previously only ever handled *reply* envelopes
+from the FS Worker (`isReply`) - `onEvent(handler)` (new) also dispatches
+*event* envelopes (`isEvent`, an existing but previously-unused envelope
+kind from `protocol/envelope.ts`). `workers/kernel/worker.ts` wires this
+once at the top level: `fsClient.onEvent(...)` looks up the target Worker
+via `processTable.getWorker(processId)` (the same lookup `PROCESS_STDIN`
+already uses to reach an already-running process from outside its own
+`bootProcess()` closure) and `postMessage`s it a `"fs-watch-event"`.
+
+On the guest side, `workers/process/worker.ts` gained
+`createFsWatchBridge(eventLoop)` - `watch(path, recursive, onEvent)` posts
+`"fs-watch-register"` to the kernel (handled in `processClient.ts`'s
+`bootProcess()`, which forwards to `fsClient.request({action: "watch", ...})`)
+and refs the event loop for as long as the returned handle is open, mirroring
+real Node's own "an active FSWatcher keeps the process alive" semantics and
+the same `eventLoop.ref()`/`unref()` pattern `worker_threads.Worker`/net's
+own `recount()` already use - without it, a guest script whose entire job is
+`fs.watch(dir, cb)` (no server, no timer) would tear itself down before ever
+seeing a change. `runtime/builtins/fs.ts`'s `watch()` is now real: it calls
+an injected `watchBridge.watch()` (same "externally injected, defaults to a
+harmless stand-in" shape as `wrapBuffer`/`createReadableFromBytes` already
+use, so this file's own existing tests and `workers/workerThreads/worker.ts`'s
+minimal guest environment keep working unchanged with no bridge wired in)
+and fans a bridge event out to every listener registered via the constructor
+argument or `.on("change", ...)`.
+
+**Cleanup.** A process that's killed or crashes without ever calling
+`FSWatcher.close()` would otherwise leak its `watchRegistry` entries
+forever. `processClient.ts`'s three existing worker-teardown sites (the
+`"exit"` message handler, `worker.onerror`, and `kill()`) each already call
+`netRelay.unregisterWorker(processId)` for the exact same reason - a fourth
+call, `fsClient.request({action: "unwatchProcess", processId})`, was added
+alongside all three, mirroring that existing precedent rather than
+inventing a new cleanup convention.
+
+**Verified live, precisely** (not just unit tests - the actual acceptance
+bar this item needed to clear): extended `examples/playground/e2e/
+boot.spec.ts`'s existing real end-to-end test (real `npm create vite`, real
+`npm install`, real `vite dev`, real preview) with one more step after
+confirming the WebSocket/HMR transport itself is open - call
+`dwc.fs.writeFile()` from the HOST page (the same `FS_REQUEST` path a real
+code-editor UI would use, exercising the full stack end to end, not a
+guest-internal shortcut) to append a `body { background-color: rgb(1, 2, 3)
+!important; }` rule to the scaffolded `/my-app/src/style.css`, then poll the
+live preview iframe's own `getComputedStyle(document.body).backgroundColor`.
+**Passed**: the preview's computed background color updates to the injected
+marker color with no page reload - real Vite CSS HMR, driven by a real
+`fs.watch` notification, over the real WebSocket transport item 11 already
+proved, following a real guest file write from the host page. Full suite
+(1 test, ~53-57s) green, zero page errors. This closes the loop item 11
+explicitly left open: "making a guest file edit actually visible in the
+preview still doesn't work" - it now does.
+
+Unit tests: `VirtualFileSystem.test.ts` (5 new `onChange` cases),
+`watchMatch.test.ts` (new, 7 cases covering non-recursive/recursive/root
+matching and filename computation). Full core suite (654 tests) green,
+typecheck clean, build clean.
 
 Per standing preference, commit messages for this project should not
 include `Co-Authored-By`/session-link footers.

@@ -177,13 +177,14 @@ interface FsBuiltin extends FsBuiltinCore {
   // Vite's own dependency-optimizer/config watcher (chokidar's fallback
   // createFsWatchInstance) calls this directly at dev-server *startup*, not
   // only for live-reload - crashed immediately without it existing at all.
-  // This VFS has no underlying push-based change-notification mechanism
-  // (every fs op here is a synchronous request/response round-trip - see
-  // syncWireFormat.ts), so this deliberately does NOT detect real changes,
-  // same "exists and is callable, doesn't fake the part that needs real
-  // infrastructure" precedent as vm.runInNewContext/worker_threads.Worker
-  // elsewhere in this runtime. Real hot-reload-on-file-change is the
-  // still-open, separately-tracked design question (see PROGRESS.md).
+  // Real change notifications: the synchronous SharedArrayBuffer bridge
+  // (syncWireFormat.ts) has no push channel of its own (it's strictly
+  // request/response), so this is backed by a SEPARATE async relay - see
+  // the injected `watchBridge` parameter on createFsBuiltin below, and
+  // workers/fs/worker.ts's own watch registry (the single, process-
+  // agnostic point that actually detects a mutation, since the VFS backing
+  // every process's fs calls, sync and async alike, is that one shared FS
+  // Worker instance).
   watch(path: string, listener?: FSWatchListener): FSWatcher;
   watch(path: string, options: { persistent?: boolean; recursive?: boolean } | string, listener?: FSWatchListener): FSWatcher;
   // Real Node's fs.createReadStream(path[, options]) - traced need: real
@@ -268,6 +269,19 @@ const createFsBuiltin = (
     const stub = { pipe: (dest: unknown) => dest, on: () => stub };
     return stub;
   },
+  // Backs watch() with a real, live change feed - fs.ts has no channel of
+  // its own to the kernel/FS Worker (same reason wrapBuffer/
+  // createReadableFromBytes are injected rather than reached for directly),
+  // so a caller that wants real notifications (worker.ts, wired to
+  // createFsWatchBridge) passes this in. Defaults to a stand-in that
+  // returns a real-shaped, working handle which simply never fires -
+  // matching every other "exists and is callable, doesn't fake the part
+  // that needs real infrastructure" default in this file (createReadStream,
+  // wrapBuffer) - so a caller that doesn't care about live notifications
+  // (e.g. this file's own tests) keeps working unchanged.
+  watchBridge: {
+    watch(path: string, recursive: boolean, onEvent: (eventType: "change" | "rename", filename: string | null) => void): { close(): void };
+  } = { watch: () => ({ close() {} }) },
 ): FsBuiltin => {
   // Real Node's fs functions accept a `URL` (typically `file://`, from an
   // `import.meta.url`-relative read) anywhere they accept a path string -
@@ -691,16 +705,31 @@ const createFsBuiltin = (
   };
 
   const watch: FsBuiltin["watch"] = (
-    _path: string,
+    path: string,
     optionsOrListener?: unknown,
     maybeListener?: FSWatchListener,
   ): FSWatcher => {
     const listener = typeof optionsOrListener === "function" ? (optionsOrListener as FSWatchListener) : maybeListener;
+    const recursive =
+      typeof optionsOrListener === "object" && optionsOrListener !== null
+        ? !!(optionsOrListener as { recursive?: boolean }).recursive
+        : false;
+
     const changeListeners = new Set<(...args: unknown[]) => void>();
     if (listener) changeListeners.add(listener as (...args: unknown[]) => void);
+
+    // The real, live notification feed - see watchBridge's own doc comment
+    // on createFsBuiltin for what backs this in worker.ts, and its default
+    // (a handle that never fires) for what backs it everywhere else (tests,
+    // worker_threads' own minimal guest environment).
+    const bridgeHandle = watchBridge.watch(path, recursive, (eventType, filename) => {
+      for (const fn of changeListeners) fn(eventType, filename);
+    });
+
     const watcher: FSWatcher = {
       close() {
         changeListeners.clear();
+        bridgeHandle.close();
       },
       on(event, fn) {
         if (event === "change") changeListeners.add(fn);
