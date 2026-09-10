@@ -53,6 +53,12 @@ interface EsmLoader {
    * stays CJS. Exported so moduleLoader.ts's entry-point check and this
    * module's own recursive resolution agree on exactly the same rule. */
   isEsmPath(path: string): boolean;
+  /** Builds (but does not evaluate) the data: URL for `entryPath` - exposed
+   * standalone for diagnostics/testing (e.g. measuring output size without
+   * needing a full live evaluation), matching this file's existing
+   * precedent of exporting isRealCode/maskNonCode for outside reuse. `run`
+   * below is just this plus one `import()`. */
+  buildEntryDataUrl(entryPath: string): Promise<string>;
   /** Builds the full data: URL graph for `entryPath` and evaluates it via a
    * real `import()`, returning the resulting module namespace. */
   run(entryPath: string): Promise<unknown>;
@@ -410,9 +416,17 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
     return null;
   };
 
-  const dataUrlCache = new Map<string, string>();
+  // dataUrlCache stores the in-flight/settled PROMISE, not the resolved
+  // string, and is populated synchronously (before any await - see
+  // buildModule) so concurrent/re-entrant builds of the same path share one
+  // build rather than racing to redo it independently.
+  const dataUrlCache = new Map<string, Promise<string>>();
   const cjsShimCache = new Map<string, string>();
-  const building = new Set<string>();
+  // Snapshot shims for genuine ESM->ESM static edges (see buildEsmShim) -
+  // keyed by target path only (unlike cjsShimCache's `fromPath specifier`
+  // key), since a real module namespace's shim content doesn't depend on
+  // which module is importing it.
+  const esmShimCache = new Map<string, string>();
   let entryPath = "";
   let shimSlotCounter = 0;
   // Real evaluated CJS/builtin exports values, keyed by an id embedded in
@@ -423,6 +437,13 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
   // between this code and every data:-URL module `import()` evaluates in
   // this same realm (they're not sandboxed - same Worker, same JS agent).
   const globalShims = ((globalThis as Record<string, unknown>).__dwcCjsShims ??= {}) as Record<string, unknown>;
+  // Slot IDs are unique WITHIN one createEsmLoader() instance, but
+  // globalShims itself is a single shared globalThis object - safe in
+  // production (at most one createEsmLoader() call per real Worker), but
+  // NOT across multiple createEsmLoader() calls sharing one JS realm, which
+  // is exactly what a test suite does across test cases. A short
+  // per-instance prefix keeps every instance's slot IDs disjoint.
+  const instancePrefix = `${Math.random().toString(36).slice(2, 8)}_`;
 
   /** Real Vite's own native config loader (a computed dynamic import - see
    * DYNAMIC_IMPORT_OPEN_RE above) does `import(pathToFileURL(path).href +
@@ -443,15 +464,30 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
     return path;
   };
 
-  /** Resolves `specifier` (as imported from `fromPath`) to a data: URL,
-   * either by recursing into the native ESM subgraph or falling back to a
-   * synthesized CJS shim - shared by both the eager static-import scan
-   * below and the lazy dynamic-import path (see `__dwcDynamicImport`). */
-  const resolveAndQueue = (fromPath: string, rawSpecifier: string): string => {
+  /** Resolves `specifier` (as imported from `fromPath`) to a data: URL for
+   * the LAZY dynamic-import path only (see `__dwcDynamicImport` below) -
+   * a genuine ESM target gets its own full, recursively-inlined data: URL
+   * here (not the snapshot-shim treatment resolveStaticEdge gives static
+   * edges), since a dynamic import target is evaluated standalone, not
+   * spliced as literal text into a parent's own source - no duplication
+   * risk to avoid. Falls back to the same synthesized CJS shim as every
+   * other non-ESM/cyclic edge in this file. */
+  // No cycle-guard here, deliberately: a dynamic import() is always a fresh
+  // linking root (it never participates in the SAME synchronous linking
+  // cycle a static edge would - that's structurally true of real ESM too,
+  // not just this loader's own approximation of it), so it never needs to
+  // fall back to a snapshot shim just because its target happens to be
+  // mid-build for some unrelated reason (e.g. a concurrent sibling dynamic
+  // import elsewhere reaching the same shared dependency - see
+  // resolveStaticEdge's own doc comment for why THAT case needs real
+  // ancestry-chain tracking instead of a flat "is anyone building this"
+  // check). buildModule's own promise-memoized dataUrlCache already makes
+  // "await something already in flight" safe and correct on its own.
+  const resolveAndQueue = async (fromPath: string, rawSpecifier: string): Promise<string> => {
     const specifier = normalizeFileUrlSpecifier(rawSpecifier);
     const target = tryResolveEsmPath(fromPath, specifier);
-    if (target && isEsmPath(target) && !building.has(target)) {
-      return buildModule(target);
+    if (target && isEsmPath(target)) {
+      return buildModule(target, new Set());
     }
     return buildCjsShim(fromPath, specifier);
   };
@@ -473,9 +509,22 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
   // the global always points at the live instance's own caches/closures -
   // there's exactly one esmLoader per process (see moduleLoader.ts).
   (globalThis as Record<string, unknown>).__dwcDynamicImport = async (fromPath: string, specifier: string): Promise<unknown> => {
-    const dataUrl = resolveAndQueue(fromPath, specifier);
+    const dataUrl = await resolveAndQueue(fromPath, specifier);
     return import(/* @vite-ignore */ dataUrl);
   };
+
+  /** Shared by buildCjsShim and buildEsmShim - given a value already
+   * stashed at globalThis.__dwcCjsShims[slotId], renders the `export
+   * default ...`/`export const KEY = ...` lines that read it back. Bracket
+   * notation (not `.${slotId}`) for the slot lookup deliberately - slotId
+   * embeds a random per-instance prefix (see instancePrefix) that can start
+   * with a digit, which is not a valid property name for dot notation
+   * (`globalThis.__dwcCjsShims.51i02g_s0` is a SyntaxError; confirmed live -
+   * the exact, intermittent bug this bracket-notation form fixes). */
+  const renderShimLines = (slotId: string, namedKeys: string[], defaultExpr: string): string[] => [
+    `export default ${defaultExpr};`,
+    ...namedKeys.map((key) => `export const ${key} = globalThis.__dwcCjsShims[${JSON.stringify(slotId)}][${JSON.stringify(key)}];`),
+  ];
 
   /** Runs `specifier` through the exact same require() a CJS caller would
    * get, and wraps the real result as a small ESM shim module - used both
@@ -498,20 +547,83 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
     // function object.
     const isExportsLike = exported !== null && (typeof exported === "object" || typeof exported === "function");
     const isNamespaceShaped = isExportsLike && "__esModule" in exported! && "default" in (exported as Record<string, unknown>);
-    const defaultValue = isNamespaceShaped ? (exported as Record<string, unknown>).default : exported;
     const namedKeys = isExportsLike
       ? Object.keys(exported as Record<string, unknown>).filter((key) => key !== "default" && isValidExportName(key))
       : [];
 
-    const slotId = `s${shimSlotCounter++}`;
+    const slotId = `${instancePrefix}s${shimSlotCounter++}`;
     globalShims[slotId] = exported;
-    const defaultExpr = isNamespaceShaped ? `globalThis.__dwcCjsShims.${slotId}.default` : `globalThis.__dwcCjsShims.${slotId}`;
-    const lines = [`export default ${defaultExpr};`, ...namedKeys.map((key) => `export const ${key} = globalThis.__dwcCjsShims.${slotId}[${JSON.stringify(key)}];`)];
-    void defaultValue; // captured via slotId above, not re-embedded textually
+    const slotExpr = `globalThis.__dwcCjsShims[${JSON.stringify(slotId)}]`;
+    const defaultExpr = isNamespaceShaped ? `${slotExpr}.default` : slotExpr;
+    const lines = renderShimLines(slotId, namedKeys, defaultExpr);
 
     const dataUrl = toDataUrl(lines.join("\n"));
     cjsShimCache.set(cacheKey, dataUrl);
     return dataUrl;
+  };
+
+  /** Snapshot shim for a genuine ESM->ESM static edge - see this file's own
+   * top-of-file doc comment for why every static edge, not just
+   * CJS/builtin/circular ones, goes through this now: splicing a
+   * dependency's OWN full (already-inlined) data: URL directly into every
+   * importer duplicates it once per importer, compounding exponentially
+   * with graph depth/reuse (confirmed live against a real Vite 8/rolldown
+   * scaffold - a 65MB+ stack trace before this fix). `namespace` is a REAL,
+   * already-evaluated ES module namespace object (from a real `import()`),
+   * so - unlike buildCjsShim - no `__esModule`-shape guessing is needed:
+   * its own keys ARE its real named exports, exactly.
+   *
+   * Accepted tradeoff (same one buildCjsShim already makes for CJS/circular
+   * edges, now widened to every ESM edge): this is a snapshot taken once,
+   * at generation time, not a live binding - a `let`/`var` export
+   * REASSIGNED after initial evaluation is not observed by importers.
+   * Mutating an exported object/function/class's own contents remains
+   * genuinely shared (the snapshot holds a reference, not a deep copy).
+   * Checked directly against real code motivating this fix: zero `export
+   * let` occurrences anywhere in vendored vite@8/rolldown's own dist/. */
+  const buildEsmShim = (namespace: Record<string, unknown>): string => {
+    const namedKeys = Object.keys(namespace).filter((key) => key !== "default" && isValidExportName(key));
+    const slotId = `${instancePrefix}s${shimSlotCounter++}`;
+    globalShims[slotId] = namespace;
+    const hasDefault = "default" in namespace;
+    const defaultExpr = hasDefault ? `globalThis.__dwcCjsShims[${JSON.stringify(slotId)}].default` : "undefined";
+    const lines = renderShimLines(slotId, namedKeys, defaultExpr);
+    return toDataUrl(lines.join("\n"));
+  };
+
+  /** Resolves a STATIC import edge (see buildModule's FROM_CLAUSE_RE/
+   * SIDE_EFFECT_IMPORT_RE scans) - a genuine, non-cyclic ESM target is
+   * built, actually evaluated via a real `import()`, and replaced by a
+   * tiny snapshot shim (buildEsmShim) instead of its own full inlined
+   * content - see buildEsmShim's own doc comment for why. Everything else
+   * (CJS/builtin, or a cyclic back-edge) falls through to the unchanged
+   * buildCjsShim, exactly as before this fix.
+   *
+   * `chain` is the set of paths currently on THIS SPECIFIC build's own
+   * ancestry (entry -> ... -> fromPath), not a global "is anyone, anywhere,
+   * building this" flag - now that buildModule is genuinely async, two
+   * UNRELATED builds (e.g. two concurrent dynamic imports that both happen
+   * to reach the same shared static dependency) can legitimately have that
+   * dependency "in flight" at the same time without being a real cycle at
+   * all; a flat global check would wrongly treat that benign, concurrent
+   * sharing as a cycle and needlessly fall back to the CJS shim path
+   * (confirmed live - exactly the bug a concurrent-dynamic-import test
+   * caught). `chain.has(target)` correctly answers "would awaiting this
+   * deadlock MY OWN call chain" - the only case that actually needs the
+   * fallback. */
+  const resolveStaticEdge = async (fromPath: string, rawSpecifier: string, chain: ReadonlySet<string>): Promise<string> => {
+    const specifier = normalizeFileUrlSpecifier(rawSpecifier);
+    const target = tryResolveEsmPath(fromPath, specifier);
+    if (target && isEsmPath(target) && !chain.has(target)) {
+      const cachedShim = esmShimCache.get(target);
+      if (cachedShim) return cachedShim;
+      const targetUrl = await buildModule(target, chain);
+      const namespace = (await import(/* @vite-ignore */ targetUrl)) as Record<string, unknown>;
+      const shim = buildEsmShim(namespace);
+      esmShimCache.set(target, shim);
+      return shim;
+    }
+    return buildCjsShim(fromPath, specifier);
   };
 
   /** Recursively builds the data: URL for `path`, post-order (dependencies
@@ -520,20 +632,36 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
    * imports A) can't be represented this way - there's no way to
    * "forward-reference" not-yet-finalized content the way the browser's
    * own parse-then-link-then-evaluate algorithm can for a real cycle. When
-   * `building.has(target)` is true (a back-edge into a module currently
-   * being built), that ONE edge falls back to buildCjsShim instead - the
-   * exact same mechanism real Node's own CJS circular require() already
-   * uses correctly elsewhere in this loader (a partial/in-progress exports
-   * object, not a hang), just reused here for a circular ESM edge. This is
-   * a deliberate, documented limitation, not an oversight: genuine ESM
-   * import cycles are rare in practice (most real circular-import code in
-   * the wild is CJS). */
-  const buildModule = (path: string): string => {
+   * `target` is already in `chain` (a back-edge into an ANCESTOR of this
+   * specific build - see resolveStaticEdge's own doc comment for why this
+   * must be per-call ancestry, not a global flag), that ONE edge falls back
+   * to buildCjsShim instead - the exact same mechanism real Node's own CJS
+   * circular require() already uses correctly elsewhere in this loader (a
+   * partial/in-progress exports object, not a hang), just reused here for
+   * a circular ESM edge. This is a deliberate, documented limitation, not
+   * an oversight: genuine ESM import cycles are rare in practice (most
+   * real circular-import code in the wild is CJS).
+   *
+   * `chain` defaults to empty (a fresh top-level entry, or a dynamic
+   * import's own fresh linking root - see resolveAndQueue) and grows by
+   * exactly `path` for everything reached from HERE, so a sibling branch of
+   * the graph (not an ancestor of this one) never sees it and can build the
+   * same shared dependency concurrently without being mistaken for a
+   * cycle. */
+  const buildModule = (path: string, chain: ReadonlySet<string> = new Set()): Promise<string> => {
     const cached = dataUrlCache.get(path);
     if (cached) return cached;
 
-    building.add(path);
-    try {
+    const nextChain = new Set(chain);
+    nextChain.add(path);
+
+    // A synchronous outer function wrapping an async IIFE: the promise is
+    // cached (below) before the IIFE's body ever reaches an `await`, so a
+    // concurrent/re-entrant call for the SAME path (possible now that
+    // static edges do real `await import()` round-trips - see
+    // resolveStaticEdge) shares this one in-flight build instead of
+    // redoing it independently.
+    const promise = (async (): Promise<string> => {
       const source = readSource(path);
       if (source === undefined) throw new Error(`Cannot find module '${path}'`);
       const masked = maskNonCode(source);
@@ -543,23 +671,24 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
       // `matchAll` (not a manual `.exec()` loop): per spec it clones the
       // regex internally rather than mutating the shared module-level
       // constant's own `lastIndex` - `onMatch` below recursively calls
-      // buildModule() -> scan() again for a DIFFERENT module, and a
-      // manual exec loop sharing the same regex object's `lastIndex`
-      // across that reentrant call would silently corrupt the OUTER
-      // loop's iteration position once the inner call returns. Collected
-      // into an array up front so the loop itself is also fully decoupled
-      // from anything the callback does.
-      const scan = (re: RegExp, onMatch: (match: RegExpMatchArray) => void): void => {
+      // buildModule() -> scan() again for a DIFFERENT module (now via a
+      // real `await`, not just reentrancy - the same reasoning applies,
+      // more so), and a manual exec loop sharing the same regex object's
+      // `lastIndex` across that reentrant call would silently corrupt the
+      // OUTER loop's iteration position once the inner call returns.
+      // Collected into an array up front so the loop itself is also
+      // fully decoupled from anything the callback does.
+      const scan = async (re: RegExp, onMatch: (match: RegExpMatchArray) => void | Promise<void>): Promise<void> => {
         for (const match of Array.from(source.matchAll(re))) {
-          if (match.index !== undefined && isRealCode(masked, source, match.index)) onMatch(match);
+          if (match.index !== undefined && isRealCode(masked, source, match.index)) await onMatch(match);
         }
       };
 
-      scan(FROM_CLAUSE_RE, (match) => {
+      await scan(FROM_CLAUSE_RE, async (match) => {
         const full = match[0];
         const quote = match[1]!;
         const specifier = match[2]!;
-        const dataUrl = resolveAndQueue(path, specifier);
+        const dataUrl = await resolveStaticEdge(path, specifier, nextChain);
         // full = "from" + whitespace + quote + specifier + quote - the
         // quoted region is always exactly its last (specifier.length + 2)
         // characters.
@@ -567,16 +696,16 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
         edits.push({ start: quoteStart, end: quoteStart + specifier.length + 2, replacement: `${quote}${dataUrl}${quote}` });
       });
 
-      scan(SIDE_EFFECT_IMPORT_RE, (match) => {
+      await scan(SIDE_EFFECT_IMPORT_RE, async (match) => {
         const full = match[0];
         const quote = match[1]!;
         const specifier = match[2]!;
-        const dataUrl = resolveAndQueue(path, specifier);
+        const dataUrl = await resolveStaticEdge(path, specifier, nextChain);
         edits.push({ start: match.index!, end: match.index! + full.length, replacement: `import ${quote}${dataUrl}${quote}` });
       });
 
       const literalDynamicImportStarts = new Set<number>();
-      scan(DYNAMIC_IMPORT_RE, (match) => {
+      await scan(DYNAMIC_IMPORT_RE, (match) => {
         const full = match[0];
         const specifier = match[2]!;
         literalDynamicImportStarts.add(match.index!);
@@ -596,7 +725,7 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
       // ORIGINAL expression text is spliced straight into the replacement
       // (still evaluated at the original call site, just as an argument to
       // __dwcDynamicImport instead of to native import()).
-      scan(DYNAMIC_IMPORT_OPEN_RE, (match) => {
+      await scan(DYNAMIC_IMPORT_OPEN_RE, (match) => {
         const start = match.index!;
         if (literalDynamicImportStarts.has(start)) return;
         const openParenIndex = start + match[0].length - 1;
@@ -611,15 +740,15 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
         });
       });
 
-      scan(IMPORT_META_URL_RE, (match) => {
+      await scan(IMPORT_META_URL_RE, (match) => {
         edits.push({ start: match.index!, end: match.index! + match[0].length, replacement: JSON.stringify(fileUrl) });
       });
 
-      scan(IMPORT_META_MAIN_RE, (match) => {
+      await scan(IMPORT_META_MAIN_RE, (match) => {
         edits.push({ start: match.index!, end: match.index! + match[0].length, replacement: String(path === entryPath) });
       });
 
-      scan(IMPORT_META_RESOLVE_RE, (match) => {
+      await scan(IMPORT_META_RESOLVE_RE, (match) => {
         const full = match[0];
         const specifier = match[2]!;
         const target = tryResolveEsmPath(path, specifier);
@@ -633,19 +762,22 @@ const createEsmLoader = (options: EsmLoaderOptions): EsmLoader => {
         rewritten = rewritten.slice(0, edit.start) + edit.replacement + rewritten.slice(edit.end);
       }
 
-      const dataUrl = toDataUrl(rewritten);
-      dataUrlCache.set(path, dataUrl);
-      return dataUrl;
-    } finally {
-      building.delete(path);
-    }
+      return toDataUrl(rewritten);
+    })();
+
+    dataUrlCache.set(path, promise);
+    return promise;
   };
 
   return {
     isEsmPath,
+    buildEntryDataUrl(entry: string): Promise<string> {
+      entryPath = entry;
+      return buildModule(entry);
+    },
     async run(entry: string): Promise<unknown> {
       entryPath = entry;
-      const dataUrl = buildModule(entry);
+      const dataUrl = await buildModule(entry);
       return import(/* @vite-ignore */ dataUrl);
     },
   };
