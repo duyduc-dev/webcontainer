@@ -373,8 +373,20 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated, latest session): read item 12 at the very end of
-this file first — `fs.watch` is now real, and the full loop items 8
+**Pick up here (updated, latest session): read item 13 at the very end of
+this file first — tried Vite 8/rolldown again (prompted by re-reading
+Vivari's roadmap), found and fixed two real, general bugs along the way
+(a missing `util.isDeepStrictEqual`, and a genuine exponential-blowup bug
+in `esmLoader.ts` unrelated to Vite specifically - both worth keeping),
+but the ORIGINAL item 9/10 upstream rolldown/napi-rs tokio-runtime crash
+is CONFIRMED STILL THE BLOCKER once those two were out of the way -
+reproduced the exact same `Uncaught RuntimeError: unreachable` trap live.
+This definitively closes the "should we try Vite 8 instead of the Vite 7
+workaround" question for now: no, not until upstream fixes the
+tokio-runtime lifecycle bug. The Vite 7 workaround (item 10) remains the
+right path.**
+
+Before that: item 12 — `fs.watch` is real, and the full loop items 8
 through 12 spent many sessions chasing is closed: a real `dwc.fs.
 writeFile()` edit from the host page now visibly updates the live Vite
 preview via real CSS HMR, with no reload, verified live end-to-end
@@ -387,7 +399,7 @@ signal - a computed style change with no reload); a JS-file edit
 Vite can't hot-swap) was NOT separately verified and is a reasonable next
 thing to check, though nothing in this session's own design is CSS-
 specific - the same real `fs.watch` notification reaches Vite for any
-file under the watched directory, JS included.**
+file under the watched directory, JS included.
 
 Before that: item 10 — MAJOR MILESTONE, DONE: the playground demo shows
 a real, working, crash-free live preview of a real Vite dev server.
@@ -3401,6 +3413,109 @@ Unit tests: `VirtualFileSystem.test.ts` (5 new `onChange` cases),
 `watchMatch.test.ts` (new, 7 cases covering non-recursive/recursive/root
 matching and filename computation). Full core suite (654 tests) green,
 typecheck clean, build clean.
+
+Per standing preference, commit messages for this project should not
+include `Co-Authored-By`/session-link footers.
+
+## 13. Tried Vite 8 + rolldown again - found and fixed a real, general esmLoader bug along the way, but the original item 9/10 upstream crash is CONFIRMED STILL THE BLOCKER
+
+Prompted by reading `~/workspace/vivari`'s own `roadmap.md` again: it
+documents pinning `vite: "^8.0.0"` successfully, which looked like it might
+mean the item 9/10 rolldown crash was avoidable after all. Their template
+also declares `"@rolldown/binding-wasm32-wasi"` as an explicit
+`devDependency` - worth testing directly rather than reasoning from that
+alone, since two different things were going on in their own investigation
+(see below).
+
+**What Vivari's roadmap actually says, read closely:** their own template
+broke for an UNRELATED reason first - rolldown 1.2.2 stopped listing
+`@rolldown/binding-wasm32-wasi` as an `optionalDependency`, so npm's
+platform auto-select stopped installing it, and rolldown's own
+`webcontainer-fallback.cjs` (the same `execFileSync('pnpm i ...')` path this
+project's own item 8/9 work already found fragile) failed for them the same
+way. Their fix - declaring the binding explicitly - avoids THAT bug, not
+the tokio-runtime one. Separately, their roadmap explicitly states the real
+tokio panic **still exists and still pins Svelte to Vite 7** in their own
+templates, and only doesn't fire for their plain client-rendered
+React/Vue/Preact templates because "the panic... needs TWO rolldown
+dep-optimize passes in one process... and what forces the second is an SSR
+optimize" - a plain client app runs exactly one pass and never trips it.
+
+**Tested directly rather than assumed**, in a throwaway `/my-app-v8`
+scaffold (same isolated-scaffold technique item 10 itself used): pinned
+`vite: "^8.0.0"` + `"@rolldown/binding-wasm32-wasi": "^1.2.4"` (a version at
+or after upstream's own fix for a separate `@emnapi/*` peer-mismatch bug
+Vivari also found) as explicit `devDependencies` in a real
+`npm create vite@latest -- --template vanilla` scaffold.
+
+1. **`npm install` succeeded** (Vivari's binding-declaration fix holds).
+2. **`npm run dev` hit a missing builtin**: `util.isDeepStrictEqual` -
+   **fixed**, a real, spec-accurate implementation (`Object.is` primitive
+   semantics, strict prototype equality, Map/Set/Date/RegExp/TypedArray
+   support, circular-reference tracking), not a narrow stand-in. Commit
+   `473d6d3`.
+3. **Then hit something new and much bigger: a ~65 million character stack
+   trace** from a `buildCrawler`-adjacent failure, before the process was
+   killed. Proven (not just observed) to be a real, general, EXPONENTIAL
+   bug in this project's own `esmLoader.ts` - completely unrelated to
+   Vite 8 specifically - via a direct, isolated reproduction (a synthetic
+   "diamond" dependency graph): `buildModule()` spliced a dependency's own
+   full, already-recursively-inlined `data:` URL directly into every
+   importer's rewritten source, so a shared dependency's content duplicates
+   once per importer, compounding with graph depth (~2.67x per level
+   measured: 7.5KB at depth 1 -> 7.2MB at depth 8). **Fixed** by extending
+   `buildCjsShim`'s existing snapshot-into-`globalThis` pattern (already
+   used for CJS/builtin/circular edges) to every genuine ESM->ESM static
+   edge - a target is now actually evaluated via a real `import()` and
+   replaced by a tiny reference shim instead of its own inlined content, so
+   output size scales with the number of distinct modules touched, not the
+   number of paths through the graph. Commit `8a6bf9c`.
+
+   Two more real bugs surfaced building this fix, both caught by the new
+   test suite itself, not found by inspection:
+   - **An intermittent `SyntaxError`, not a logic bug**: shim slot IDs
+     embed a random per-instance prefix (added so concurrent vitest
+     instances in one process can't collide on the same shared
+     `globalThis.__dwcCjsShims` object) and were accessed via DOT notation
+     (`globalThis.__dwcCjsShims.51i02g_s0`) - invalid syntax whenever
+     `Math.random()`'s own output happened to start with a digit. Fixed by
+     switching every slot-ID access to bracket notation, which needs no
+     identifier-validity guarantee at all.
+   - **A genuine cycle-detection design gap, caught by a new concurrent-
+     dynamic-import test, not assumed away**: a flat, global "is this path
+     currently building" `Set` couldn't distinguish a REAL cycle (an
+     ancestor of the CURRENT build) from a benign concurrent SIBLING
+     reference (an unrelated build that happens to be in flight - e.g. two
+     concurrent dynamic imports both reaching the same shared dependency,
+     structurally impossible before this fix made building genuinely
+     async). Fixed by replacing the flat set with per-call ancestry chains
+     threaded through `buildModule`/`resolveStaticEdge`.
+
+   Accepted, documented tradeoff (same one already made for CJS/circular
+   edges, now widened to every ESM edge): an exported `let`/`var`
+   REASSIGNED after initial evaluation is no longer observed as live by
+   importers - checked directly against real code, not just asserted: zero
+   `export let` occurrences anywhere in vendored `vite@8.2.2`/rolldown's own
+   `dist/`. New `esmLoader.test.ts` (none existed before) covers the size
+   regression directly, this tradeoff (locked in as an explicit test, not
+   silent drift), cycles combined with diamond-shaped reuse, and concurrent
+   dynamic imports. Full suite (672 tests) green, typecheck/build clean.
+
+4. **Re-ran the exact same live scaffold after the fix**: `npm install` and
+   `npm run dev` now proceed with no runaway output, and
+   `dwc.preview.fetch(5173, "/")` returns a real 200. **Then, on a
+   follow-up request, the dev server process crashed with
+   `Uncaught RuntimeError: unreachable`** - the exact same trap signature
+   item 9 originally found and item 9/10's own root-cause work confirmed is
+   a real, upstream rolldown/napi-rs tokio-runtime lifecycle bug, not
+   fixable from this project's side. **This definitively answers the
+   question this whole detour was chasing: Vite 8/rolldown is still
+   blocked by the same confirmed-upstream bug as before** - the
+   `esmLoader.ts` fix and the `util.isDeepStrictEqual` fix were both real,
+   were both masking the actual crash behind earlier, different failures,
+   and are both worth keeping regardless, but neither one (nor both
+   together) makes Vite 8 usable. The Vite 7 workaround (item 10) remains
+   the right path until upstream fixes the tokio-runtime issue.
 
 Per standing preference, commit messages for this project should not
 include `Co-Authored-By`/session-link footers.
