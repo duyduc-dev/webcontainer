@@ -373,11 +373,20 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated, latest session): read item 10 at the very end
-of this file first — MAJOR MILESTONE, DONE: the playground demo now
-shows a real, working, crash-free live preview of a real Vite dev
-server.** This is the actual end goal of the whole multi-session item
-8/9/10 investigation, finally reached. Short version: item 9's crash
+**Pick up here (updated, latest session): read item 11 at the very end
+of this file first — real WebSocket/HMR transport is DONE and verified
+working end-to-end (a genuine RFC 6455 handshake succeeds against real
+Vite-bundled `ws` server code, confirmed live), but making a guest file
+edit actually visible in the preview still doesn't work — `fs.watch`
+(`runtime/builtins/fs.ts`) is a complete no-op stub that never notifies
+listeners, so Vite's dev server never learns a file changed at all,
+regardless of how correct the now-working WebSocket connection is.
+Making `fs.watch` real is the next concrete, unscoped piece of work.**
+
+Before that: item 10 — MAJOR MILESTONE, DONE: the playground demo shows
+a real, working, crash-free live preview of a real Vite dev server.
+This is the actual end goal of the whole multi-session item 8/9/10
+investigation, finally reached. Short version: item 9's crash
 (a real HTTP 200 followed ~0-1s later by a non-deterministic WASM
 trap) turned out to be a confirmed UPSTREAM bug in rolldown itself
 (`napi::tokio_runtime::RT`, a Rust static torn down after the first
@@ -3127,6 +3136,162 @@ exit code) rather than silently proceeding to preview a server that
 was never actually running. Verified the happy path is unaffected: the
 e2e test above still passes end to end after this change. Commit
 `933a635`.
+
+Per standing preference, commit messages for this project should not
+include `Co-Authored-By`/session-link footers.
+
+## 11. Real WebSocket/HMR transport — DONE and verified working end-to-end; a SEPARATE gap (`fs.watch` is a no-op stub) blocks true observable HMR
+
+Follow-up to item 10: with a real, crash-free Vite preview working for
+plain HTTP, the browser console showed `[vite] failed to connect to
+websocket` - no WebSocket support existed anywhere in this runtime
+(`grep -rln "WebSocket" packages/core/src` was empty, `http.js` never
+emitted an `'upgrade'` event). This item built the real transport.
+
+**Key design insight, confirmed by reading real Vite 7's own bundled
+code** (`dist/node/chunks/config.js`, `dist/client/client.mjs`): Vite's
+dev server already vendors a COMPLETE `WebSocketServer` (`ws`-shaped,
+`new WebSocketServerRaw({noServer:true})`), driven via Node's own
+`http.Server`'s `'upgrade'` event. So the guest side needed only to
+correctly hand a socket off on Upgrade - no WS protocol logic had to be
+implemented in guest code at all. All the new protocol logic
+(handshake, RFC 6455 framing) lives in the KERNEL worker instead, which
+already has direct `netRelay` access and `crypto.subtle` (same as any
+page) - `apis/Preview.ts` stays what it already was, a thin relay,
+extended with one more `postMessage` shape rather than a new transport.
+
+**What was built** (full design in the plan this was implemented from):
+1. `runtime/node/internal/httpWireFormat.ts` - one additive
+   `HttpParser.drainPending()` method: recovers bytes already buffered
+   past the most recently parsed message (e.g. the first WS frame,
+   stapled to the same chunk as a 101 handshake response) that would
+   otherwise be silently trapped in the parser's private state.
+2. `runtime/node/lib/http.js` - `Server` now detects an Upgrade request
+   and emits a real `'upgrade'` event with `(req, socket, head)`,
+   removing the old HTTP-request `'data'` listener first so later raw
+   WS frame bytes never get fed back into it.
+3. `workers/kernel/wsFrame.ts` (new) - a pure RFC 6455 codec: masked
+   frame encoding (mandatory for every host→guest frame - a compliant
+   server rejects unmasked ones), incremental decode with continuation-
+   frame reassembly, ping/pong, close-frame payload codec.
+   permessage-deflate is sidestepped entirely (never negotiated in the
+   handshake request), not implemented.
+4. `workers/kernel/previewSocket.ts` (new, sibling to `previewRelay.ts`)
+   - `openPreviewSocket`/`sendPreviewSocketMessage`/`closePreviewSocket`:
+   real handshake (`Sec-WebSocket-Key` → verified `Sec-WebSocket-Accept`
+   via `crypto.subtle.digest("SHA-1", ...)`), then steady-state framing
+   over the same `netRelay.pipeConnect`/`relay` pipe `previewRelay.ts`
+   uses for plain HTTP - confirmed that transport is already persistent/
+   bidirectional/unlimited-message; the old "one request then close"
+   behavior was purely `fetchFromGuestServer`'s own policy, not a
+   transport limit.
+5. `workers/kernel/worker.ts` - three new router entries,
+   `PREVIEW_WS_OPEN`/`PREVIEW_WS_SEND`/`PREVIEW_WS_CLOSE`, mirroring the
+   existing `PROCESS_STDIN`/`PROCESS_KILL` shape.
+6. `apis/Preview.ts` - `createPreviewAPI` now takes `(request, on)`
+   (matching `Process.ts`'s existing shape); a same-origin
+   `window.addEventListener("message", ...)` channel relays `dwc:ws-*`
+   messages from a preview iframe to the kernel and kernel `preview:ws-
+   message`/`preview:ws-close` events back down to whichever iframe
+   opened that `wsId`.
+7. `workers/preview/wsPolyfill.ts` (new) - the actual `WebSocket`
+   replacement, injected as a classic inline `<script>` (runs
+   synchronously during HTML parsing, before any deferred
+   `type="module"` script regardless of position) into every HTML
+   response. A Service Worker can never intercept a page's own `new
+   WebSocket(...)` call (confirmed real browser platform limitation),
+   so this is the only way to route Vite's client through the kernel.
+8. `workers/preview/previewHtmlInject.ts` (new) - `injectPreviewWsBootstrap`,
+   kept in its own module rather than inline in `PreviewServiceWorker.ts`
+   for a real, load-bearing reason (see the bug below), wired into that
+   file's `fetch` handler: HTML responses (uncompressed only - this SW
+   never decodes `content-encoding`) get the polyfill script inserted
+   after `<head>` (or prepended if none), with the now-stale
+   `content-length` header removed.
+
+**Real bug #1, caught only by actually registering the Service Worker in
+a browser (not by any unit test): a top-level `export` breaks a
+classic-script Service Worker.** First pass exported
+`injectPreviewWsBootstrap` directly from `PreviewServiceWorker.ts` for
+testability. `Preview.ts`'s `enable()` registers the SW via
+`navigator.serviceWorker.register(url, {scope})` with no `{type:
+"module"}`, i.e. as a CLASSIC script - and tsup already bundles that
+entry with all internal imports inlined (no bare `import`/`export`
+survives), which is exactly why the file worked fine before despite
+already having an `import` in its source. Adding a top-level `export`
+put a real `export` statement into the final classic-script bundle - a
+SyntaxError there, surfacing as `ServiceWorker script evaluation
+failed` with the registration silently rejecting. Fixed by moving
+`injectPreviewWsBootstrap` into its own module (`previewHtmlInject.ts`)
+that `PreviewServiceWorker.ts` only ever *imports* (tsup inlines it,
+same as the existing `wsPolyfill.ts` import) - never exports anything
+itself. Caught by actually calling `navigator.serviceWorker.register()`
+in a real browser tab; nothing in the unit tests (which stub `self` and
+never touch real SW registration semantics) could have caught this.
+
+**Real bug #2, also only catchable live: `Object.create(EventTarget.
+prototype)` doesn't make a real EventTarget.** The polyfill's first
+version built `DwcWebSocket` the old ES5 way -
+`DwcWebSocket.prototype = Object.create(EventTarget.prototype)`. Every
+`addEventListener`/`dispatchEvent` call on an instance threw `TypeError:
+Illegal invocation` - `EventTarget`'s native methods brand-check for
+internal slots that only actually get set up by really calling
+`EventTarget`'s own constructor (via `super()` in a real subclass, or
+`Reflect.construct`), not just inheriting its prototype. Fixed by
+rewriting `DwcWebSocket` as a real `class DwcWebSocket extends
+EventTarget { constructor() { super(); ... } }`. Confirmed by
+constructing a `DwcWebSocket` directly inside the live preview iframe
+and calling `addEventListener` on it - the exact repro.
+
+**Verified working, end to end, for real** (not just unit tests):
+loaded the actual playground demo in a real Chrome tab, waited for the
+real preview to come up, then from the OUTER page drove
+`new (previewIframe.contentWindow.WebSocket)("ws://localhost/",
+"vite-hmr")` directly - confirming: the polyfill installs
+(`window.__dwcRealWebSocket` present, `window.WebSocket` replaced), the
+constructed socket reaches `readyState === 1` (OPEN), and
+`ws.protocol === "vite-hmr"` - i.e. a genuine RFC 6455 handshake
+(masked key generation, SHA-1 accept-key verification, subprotocol
+negotiation) succeeded against REAL Vite-bundled `ws` server code
+running inside the guest sandbox, over the full
+polyfill→postMessage→kernel→netRelay→guest-http.js→Vite chain. No
+`[vite] failed to connect to websocket]` text appeared anywhere in the
+terminal/console across this or any earlier run this session.
+
+**Unit tests** (all new, all passing, full suite 638/638 green):
+`http_parser.test.ts` (`drainPending` incl. the exact 101-plus-stapled-
+WS-frame case), `http.test.ts` (`'upgrade'` event incl. proving the old
+data listener is actually removed, and the no-listener-registered
+`socket.destroy()` case), `wsFrame.test.ts` (17 cases: masked/unmasked
+round-trip at every length-encoding boundary 0/125/126/65535/65536,
+continuation-frame reassembly, ping/pong, close payload codec),
+`previewSocket.test.ts` (10 cases: real handshake against a fake WS-
+accepting guest server, bad-accept/non-101 rejection, stapled-frame
+decode, masked send, guest-close and simulated-crash cleanup),
+`previewHtmlInject.test.ts` (4 cases), `Preview.test.ts` (extended, 6
+new WS-relay cases). `examples/playground/e2e/boot.spec.ts` extended
+with a real assertion (polyfill installed + a WebSocket dialed through
+it reaches `open protocol=vite-hmr readyState=1`) - 3 consecutive clean
+Playwright runs, ~19-24s each.
+
+**This item's scope was deliberately the TRANSPORT only, per the
+approved plan, and that scope is genuinely done and proven correct.**
+It does NOT mean editing a guest file now live-updates the preview -
+testing that directly (stamped a DOM marker in the iframe, edited
+`/my-app/src/style.css` via `dwc.fs.writeFile()`, waited 15+s) showed
+no change and no marker loss. Root cause, confirmed by reading the
+source: `runtime/builtins/fs.ts`'s `watch()` is a **complete no-op
+stub** - it builds a real-looking `FSWatcher` object with working
+`on`/`off`/`close`, but nothing anywhere ever calls those listeners on
+a real file mutation (`writeFileSync` et al. never notify it). Vite's
+own dev server relies on exactly this (via chokidar) to learn a file
+changed at all; without it, Vite never has a reason to push anything
+over the now-fully-working WebSocket connection, regardless of how
+correct that connection is. **This is a separate, not-yet-scoped
+follow-up** - making `fs.watch` real (wiring change notifications
+into the write-path functions, handling recursive/directory watches)
+- not attempted in this pass since it's a materially different, larger
+piece of work than the transport this item was scoped to.
 
 Per standing preference, commit messages for this project should not
 include `Co-Authored-By`/session-link footers.
