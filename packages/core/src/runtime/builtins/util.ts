@@ -333,6 +333,102 @@ const parseEnv = (content: string): Record<string, string> => {
   return result;
 };
 
+// Real Node's util.isDeepStrictEqual(val1, val2) - the same algorithm
+// assert.deepStrictEqual() uses internally, exposed as a boolean-returning
+// comparator rather than a throwing assertion. Traced need: real Vite 8's
+// own dependency chain (`@rolldown/binding-wasm32-wasi`'s supporting
+// packages) calls this directly - `The requested module '...' does not
+// provide an export named 'isDeepStrictEqual'` was a hard SyntaxError
+// aborting the ESM-shim's synthesized module before `npm run dev` ever
+// printed its ready banner. A full, spec-accurate implementation (not a
+// narrow stand-in), matching this file's own `promisify` precedent -
+// this is a general-purpose comparator real code is likely to depend on
+// for actual correctness (config/cache diffing), not just existence.
+//
+// Semantics matching real Node's documented behavior: primitives compare
+// via `Object.is` (NaN equals itself, -0 does not equal +0); strict mode
+// requires identical prototypes (unlike the non-strict `isDeepEqual`,
+// which this runtime doesn't implement - no traced need for it);
+// circular references are tracked (a WeakMap of already-compared pairs)
+// so a self-referential structure compares as equal to an equally-shaped
+// self-referential structure instead of recursing forever.
+const isDeepStrictEqual = (val1: unknown, val2: unknown): boolean => {
+  const seen = new WeakMap<object, WeakSet<object>>();
+
+  const alreadySeen = (a: object, b: object): boolean => {
+    const bs = seen.get(a);
+    return bs !== undefined && bs.has(b);
+  };
+  const markSeen = (a: object, b: object): void => {
+    let bs = seen.get(a);
+    if (!bs) {
+      bs = new WeakSet();
+      seen.set(a, bs);
+    }
+    bs.add(b);
+  };
+
+  const compareOwnProps = (a: object, b: object): boolean => {
+    const aKeys = [...Object.getOwnPropertyNames(a), ...Object.getOwnPropertySymbols(a)];
+    const bKeys = [...Object.getOwnPropertyNames(b), ...Object.getOwnPropertySymbols(b)];
+    if (aKeys.length !== bKeys.length) return false;
+    for (const key of aKeys) {
+      if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+      const aDesc = Object.getOwnPropertyDescriptor(a, key)!;
+      const bDesc = Object.getOwnPropertyDescriptor(b, key)!;
+      if (!!aDesc.enumerable !== !!bDesc.enumerable) return false;
+      if (!eq((a as Record<PropertyKey, unknown>)[key], (b as Record<PropertyKey, unknown>)[key])) return false;
+    }
+    return true;
+  };
+
+  const eq = (a: unknown, b: unknown): boolean => {
+    if (Object.is(a, b)) return true;
+    if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+    if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+
+    if (alreadySeen(a, b)) return true;
+    markSeen(a, b);
+    markSeen(b, a);
+
+    if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
+    if (a instanceof RegExp && b instanceof RegExp) return a.source === b.source && a.flags === b.flags;
+
+    if (ArrayBuffer.isView(a) && ArrayBuffer.isView(b)) {
+      const av = new Uint8Array((a as ArrayBufferView).buffer, (a as ArrayBufferView).byteOffset, (a as ArrayBufferView).byteLength);
+      const bv = new Uint8Array((b as ArrayBufferView).buffer, (b as ArrayBufferView).byteOffset, (b as ArrayBufferView).byteLength);
+      if (av.length !== bv.length) return false;
+      for (let i = 0; i < av.length; i++) if (av[i] !== bv[i]) return false;
+      return compareOwnProps(a, b);
+    }
+
+    if (a instanceof Map && b instanceof Map) {
+      if (a.size !== b.size) return false;
+      for (const [key, aValue] of a) {
+        if (!b.has(key)) return false;
+        if (!eq(aValue, b.get(key))) return false;
+      }
+      return true;
+    }
+
+    if (a instanceof Set && b instanceof Set) {
+      if (a.size !== b.size) return false;
+      for (const value of a) if (!b.has(value)) return false;
+      return true;
+    }
+
+    if (Array.isArray(a) && Array.isArray(b)) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (!eq(a[i], b[i])) return false;
+      return compareOwnProps(a, b);
+    }
+
+    return compareOwnProps(a, b);
+  };
+
+  return eq(val1, val2);
+};
+
 // Real Node's util.TextEncoder/TextDecoder are literally the same
 // constructors as the global ones (`require('util').TextEncoder ===
 // TextEncoder`), kept for backward compatibility with code written before
@@ -350,10 +446,11 @@ const utilModule = {
   styleText,
   stripVTControlCharacters,
   parseEnv,
+  isDeepStrictEqual,
   TextEncoder: globalThis.TextEncoder,
   TextDecoder: globalThis.TextDecoder,
   types: utilTypesModule.exports,
 };
 
 export default utilModule;
-export { deprecate, format, formatWithOptions, inherits, inspect, promisify, styleText, stripVTControlCharacters, parseEnv };
+export { deprecate, format, formatWithOptions, inherits, inspect, isDeepStrictEqual, promisify, styleText, stripVTControlCharacters, parseEnv };

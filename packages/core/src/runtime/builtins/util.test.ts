@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import utilModule, { deprecate, inspect, promisify, styleText, stripVTControlCharacters, parseEnv } from "./util";
+import utilModule, { deprecate, inspect, isDeepStrictEqual, promisify, styleText, stripVTControlCharacters, parseEnv } from "./util";
 
 describe("util.TextEncoder/TextDecoder", () => {
   // Real npm's own react-dom/server output does
@@ -32,6 +32,78 @@ describe("util.types", () => {
     expect(utilModule.types.isDate(new Date())).toBe(true);
     expect(utilModule.types.isRegExp(/x/)).toBe(true);
     expect(utilModule.types.isPromise(Promise.resolve())).toBe(true);
+  });
+});
+
+describe("util.isDeepStrictEqual", () => {
+  it("compares primitives with Object.is semantics (NaN equals itself, -0 does not equal +0)", () => {
+    expect(isDeepStrictEqual(1, 1)).toBe(true);
+    expect(isDeepStrictEqual(1, 2)).toBe(false);
+    expect(isDeepStrictEqual("a", "a")).toBe(true);
+    expect(isDeepStrictEqual(NaN, NaN)).toBe(true);
+    expect(isDeepStrictEqual(0, -0)).toBe(false);
+    expect(isDeepStrictEqual(null, undefined)).toBe(false);
+    expect(isDeepStrictEqual(1, "1")).toBe(false);
+  });
+
+  it("deep-compares plain objects, including nested structures", () => {
+    expect(isDeepStrictEqual({ a: 1, b: { c: 2 } }, { a: 1, b: { c: 2 } })).toBe(true);
+    expect(isDeepStrictEqual({ a: 1, b: { c: 2 } }, { a: 1, b: { c: 3 } })).toBe(false);
+    expect(isDeepStrictEqual({ a: 1 }, { a: 1, b: 2 })).toBe(false);
+  });
+
+  it("requires identical prototypes (the strict variant)", () => {
+    class Foo {
+      x = 1;
+    }
+    class Bar {
+      x = 1;
+    }
+    expect(isDeepStrictEqual(new Foo(), new Bar())).toBe(false);
+    expect(isDeepStrictEqual(new Foo(), new Foo())).toBe(true);
+    expect(isDeepStrictEqual({ x: 1 }, Object.create(null, { x: { value: 1, enumerable: true } }))).toBe(false);
+  });
+
+  it("deep-compares arrays", () => {
+    expect(isDeepStrictEqual([1, [2, 3]], [1, [2, 3]])).toBe(true);
+    expect(isDeepStrictEqual([1, 2], [1, 2, 3])).toBe(false);
+    expect(isDeepStrictEqual([1, 2], [2, 1])).toBe(false);
+  });
+
+  it("compares Map/Set by content, not identity", () => {
+    expect(isDeepStrictEqual(new Map([["a", 1]]), new Map([["a", 1]]))).toBe(true);
+    expect(isDeepStrictEqual(new Map([["a", 1]]), new Map([["a", 2]]))).toBe(false);
+    expect(isDeepStrictEqual(new Set([1, 2]), new Set([2, 1]))).toBe(true);
+    expect(isDeepStrictEqual(new Set([1, 2]), new Set([1, 3]))).toBe(false);
+  });
+
+  it("compares Date by time value and RegExp by source/flags", () => {
+    expect(isDeepStrictEqual(new Date(2024, 0, 1), new Date(2024, 0, 1))).toBe(true);
+    expect(isDeepStrictEqual(new Date(2024, 0, 1), new Date(2024, 0, 2))).toBe(false);
+    expect(isDeepStrictEqual(/abc/gi, /abc/gi)).toBe(true);
+    expect(isDeepStrictEqual(/abc/gi, /abc/g)).toBe(false);
+  });
+
+  it("compares typed arrays by byte content", () => {
+    expect(isDeepStrictEqual(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 3]))).toBe(true);
+    expect(isDeepStrictEqual(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 4]))).toBe(false);
+    expect(isDeepStrictEqual(new Uint8Array([1]), new Int8Array([1]))).toBe(false);
+  });
+
+  it("handles circular references without infinite recursion", () => {
+    const a: Record<string, unknown> = { name: "x" };
+    a.self = a;
+    const b: Record<string, unknown> = { name: "x" };
+    b.self = b;
+    expect(isDeepStrictEqual(a, b)).toBe(true);
+
+    const c: Record<string, unknown> = { name: "y" };
+    c.self = c;
+    expect(isDeepStrictEqual(a, c)).toBe(false);
+  });
+
+  it("is exposed on the main util module too", () => {
+    expect(utilModule.isDeepStrictEqual({ a: 1 }, { a: 1 })).toBe(true);
   });
 });
 
