@@ -20,7 +20,7 @@ interface ParsedMessage {
 
 interface HttpParser {
   execute(chunk: Uint8Array): ParsedMessage[];
-  finish(): { headBytesOrBody: Uint8Array } | null;
+  drainPending(): Uint8Array;
 }
 
 interface HttpParserModule {
@@ -135,6 +135,50 @@ describe("internal/http_parser HttpParser (response)", () => {
     const messages = parser.execute(enc("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"));
     expect(messages[0].statusCode).toBe(404);
     expect(messages[0].statusMessage).toBe("Not Found");
+  });
+});
+
+describe("internal/http_parser HttpParser drainPending", () => {
+  it("returns empty bytes when nothing trails the most recently parsed message", () => {
+    const { HttpParser } = requireHttpParser();
+    const parser = new HttpParser("response");
+    const messages = parser.execute(enc("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"));
+
+    expect(messages).toHaveLength(1);
+    expect(parser.drainPending()).toHaveLength(0);
+  });
+
+  it("recovers raw bytes stapled after a 101-shaped (no-body) response in the same chunk", () => {
+    // A 101 Switching Protocols response has neither Content-Length nor
+    // Transfer-Encoding, so the parser's "no declared body" branch treats
+    // it as complete right after the header block - any bytes appended
+    // after that in the same read (e.g. the first WebSocket frame,
+    // flushed immediately after the handshake response) must be
+    // recoverable via drainPending(), not silently dropped.
+    const { HttpParser } = requireHttpParser();
+    const parser = new HttpParser("response");
+    const head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const trailing = new Uint8Array([0x81, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f]); // a raw WS text frame, unrelated to HTTP framing
+
+    const combined = new Uint8Array(enc(head).length + trailing.length);
+    combined.set(enc(head), 0);
+    combined.set(trailing, enc(head).length);
+
+    const messages = parser.execute(combined);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].statusCode).toBe(101);
+    expect(messages[0].body).toHaveLength(0);
+
+    expect(parser.drainPending()).toEqual(trailing);
+    // draining clears it - a second call has nothing left to return.
+    expect(parser.drainPending()).toHaveLength(0);
+  });
+
+  it("does not disturb subsequent execute() calls when drainPending() was never called", () => {
+    const { HttpParser } = requireHttpParser();
+    const parser = new HttpParser("request");
+    expect(parser.execute(enc("GET /a HTTP/1.1\r\nHost: x\r\n\r\n"))).toHaveLength(1);
+    expect(parser.execute(enc("GET /b HTTP/1.1\r\nHost: x\r\n\r\n"))).toHaveLength(1);
   });
 });
 

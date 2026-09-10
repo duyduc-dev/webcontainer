@@ -76,7 +76,7 @@ const bootDWC = (options: BootDWCOptions = {}): BootDWCReturn => {
     fs: createFileSystemAPI(request),
     process: createProcessAPI(request, on),
     shell: createShellAPI(request),
-    preview: createPreviewAPI(request),
+    preview: createPreviewAPI(request, on),
     addEventListener: on,
     ready: bridgeReady.then(() => undefined),
   };

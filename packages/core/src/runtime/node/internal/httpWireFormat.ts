@@ -145,6 +145,19 @@ class HttpParser {
     return messages;
   }
 
+  /** Returns and clears any bytes already buffered past the most recently
+   * parsed message - e.g. the first WebSocket frame, when a 101 handshake
+   * response (or an Upgrade request) arrives in the same chunk as data that
+   * belongs to the protocol taking over the connection. Call this once,
+   * immediately after execute() returns that message; the parser must not
+   * be execute()'d again afterward - ownership of the byte stream passes to
+   * whatever protocol takes over. */
+  drainPending(): Uint8Array {
+    const bytes = this._pending.length > 1 ? concatBytes(this._pending) : (this._pending[0] ?? new Uint8Array(0));
+    this._pending = [];
+    return bytes;
+  }
+
   private _tryParseOne(bytes: Uint8Array): ParseOneResult | null {
     const headerEnd = findHeaderEnd(bytes, 0);
     if (headerEnd === -1) return null;

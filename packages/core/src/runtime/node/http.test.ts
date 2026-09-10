@@ -273,4 +273,83 @@ describe("vendored 'http' Server (real net.js underneath, real HTTP/1.1 wire for
     expect(second).toContain("response 2");
     server.close();
   });
+
+  // 'upgrade' support is what an in-VM WebSocket server (e.g. Vite's own
+  // bundled `ws`-shaped WebSocketServer, driven via httpServer.on('upgrade',
+  // ...)) needs to exist at all - see PROGRESS.md's HMR item. The server
+  // itself never implements WS framing; it only has to correctly detect an
+  // Upgrade request and hand off the real, persistent net.Socket.
+  it("emits 'upgrade' with (req, socket, head) for an Upgrade request, and stops routing further data through the HTTP request parser", async () => {
+    const { require } = createNodeModules(fakeProcess());
+    const http = require("http") as {
+      createServer(handler: (req: any, res: any) => void): {
+        listen(port: number, cb?: () => void): unknown;
+        close(): unknown;
+        on(event: string, cb: (...args: any[]) => void): unknown;
+        listenerCount(event: string): number;
+      };
+    };
+    const net = require("net") as { connect(port: number, cb?: () => void): any };
+
+    const server = http.createServer(() => {
+      throw new Error("'request' must not fire for an Upgrade request");
+    });
+    const upgrade: Promise<{ req: any; socket: any; head: Buffer }> = new Promise((resolve) => {
+      server.on("upgrade", (req: any, socket: any, head: Buffer) => resolve({ req, socket, head }));
+    });
+    await new Promise<void>((resolve) => server.listen(3004, resolve));
+
+    const clientSocket: any = await new Promise((resolve) => {
+      const socket = net.connect(3004, () => {
+        socket.write(
+          "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        resolve(socket);
+      });
+    });
+
+    const { req, socket, head } = await upgrade;
+    expect(req.method).toBe("GET");
+    expect(req.url).toBe("/ws");
+    expect(req.headers.upgrade).toBe("websocket");
+    expect(head).toHaveLength(0);
+
+    // The handed-off socket is the same real, persistent net.Socket - a raw
+    // write from the server side reaches the client, proving the old HTTP
+    // request-parsing 'data' listener was actually removed (not just
+    // ignored) and this is a genuine bidirectional handoff, not a one-shot.
+    const raw: string = await new Promise((resolve) => {
+      clientSocket.on("data", (chunk: { toString(): string }) => resolve(chunk.toString()));
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    });
+    expect(raw).toContain("101 Switching Protocols");
+
+    socket.destroy();
+    clientSocket.destroy();
+    server.close();
+  });
+
+  it("destroys the socket on an Upgrade request when no 'upgrade' listener is registered", async () => {
+    const { require } = createNodeModules(fakeProcess());
+    const http = require("http") as {
+      createServer(handler: (req: any, res: any) => void): { listen(port: number, cb?: () => void): unknown; close(): unknown };
+    };
+    const net = require("net") as { connect(port: number, cb?: () => void): any };
+
+    const server = http.createServer(() => {
+      throw new Error("'request' must not fire for an Upgrade request");
+    });
+    await new Promise<void>((resolve) => server.listen(3005, resolve));
+
+    const closed: boolean = await new Promise((resolve) => {
+      const socket = net.connect(3005, () => {
+        socket.write("GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+      });
+      socket.on("close", () => resolve(true));
+      socket.on("end", () => resolve(true));
+    });
+    expect(closed).toBe(true);
+
+    server.close();
+  });
 });

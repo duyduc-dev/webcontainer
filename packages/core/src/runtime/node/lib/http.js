@@ -230,7 +230,7 @@ export default function (exports, require, module, process, internalBinding, pri
       if (typeof handler === "function") this.on("request", handler);
       this._netServer = net.createServer((socket) => {
         const parser = new HttpParser("request");
-        socket.on("data", (chunk) => {
+        const onData = (chunk) => {
           let messages;
           try {
             messages = parser.execute(chunk);
@@ -239,11 +239,30 @@ export default function (exports, require, module, process, internalBinding, pri
             return;
           }
           for (const message of messages) {
+            const connectionHeader = String(message.headers.connection || "").toLowerCase();
+            const upgradeHeader = String(message.headers.upgrade || "").toLowerCase();
+            if (upgradeHeader === "websocket" && /(^|,)\s*upgrade\s*($|,)/.test(connectionHeader)) {
+              // Hand the real, persistent net.Socket off to whatever
+              // 'upgrade' listener is registered (e.g. a bundled `ws`
+              // WebSocketServer) - remove this handler first so raw frame
+              // bytes that follow never get fed back into the now-irrelevant
+              // HTTP request parser.
+              socket.removeListener("data", onData);
+              const head = Buffer.from(parser.drainPending());
+              const req = createIncomingMessage(message, socket);
+              if (this.listenerCount("upgrade") > 0) {
+                this.emit("upgrade", req, socket, head);
+              } else {
+                socket.destroy();
+              }
+              return;
+            }
             const req = createIncomingMessage(message, socket);
             const res = new ServerResponse(socket);
             this.emit("request", req, res);
           }
-        });
+        };
+        socket.on("data", onData);
         socket.on("error", () => {});
       });
     }

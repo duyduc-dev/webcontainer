@@ -31,6 +31,7 @@ declare const self: ServiceWorkerGlobalScope;
 
 import { PREVIEW_SCOPE_PREFIX } from "../../apis/previewProtocol";
 import type { PreviewRelayRequest, PreviewRelayResponse } from "../../apis/previewProtocol";
+import { injectPreviewWsBootstrap } from "./previewHtmlInject";
 
 type RelayResult = Extract<PreviewRelayResponse, { ok: true }>["result"];
 
@@ -136,7 +137,24 @@ self.addEventListener("fetch", (event) => {
       for (const [name, value] of Object.entries(result.headers)) {
         responseHeaders[name] = Array.isArray(value) ? value.join(", ") : value;
       }
-      return new Response(result.body as BodyInit, { status: result.status, statusText: result.statusMessage, headers: responseHeaders });
+
+      let responseBody: Uint8Array = result.body;
+      const contentType = responseHeaders["content-type"];
+      const isHtml = typeof contentType === "string" && contentType.toLowerCase().includes("text/html");
+      // Only ever rewritten when uncompressed - this worker never decodes
+      // content-encoding (fetchFromGuestServer/HttpParser hand back raw
+      // wire bytes), and Vite's own dev server doesn't compress by default,
+      // so this covers the real case and explicitly no-ops the rare
+      // compressed one rather than corrupting it.
+      if (isHtml && !responseHeaders["content-encoding"]) {
+        responseBody = new TextEncoder().encode(injectPreviewWsBootstrap(new TextDecoder().decode(result.body)));
+        // The original length is stale once the body is rewritten; a
+        // Response derives the real length from the buffer itself, so an
+        // absent header is safe where a wrong one may not be.
+        delete responseHeaders["content-length"];
+      }
+
+      return new Response(responseBody as BodyInit, { status: result.status, statusText: result.statusMessage, headers: responseHeaders });
     } catch (error) {
       return new Response(`dwc preview relay error: ${String(error)}`, {
         status: 502,
