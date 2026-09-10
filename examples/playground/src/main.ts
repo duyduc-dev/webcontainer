@@ -77,6 +77,12 @@ async function main() {
   try {
     const dwc = await bootDWC();
 
+    // Test/debugging hook only - lets the e2e suite (and a developer's own
+    // console) drive dwc.fs/process/preview directly against this exact
+    // running instance, the same way the terminal/iframe are already
+    // inspected. Not needed for the demo itself.
+    (window as unknown as { dwc: typeof dwc }).dwc = dwc;
+
     dwc.diagnostics.onEvent((event) => {
       console.log("[dwc]", event.type, event.payload);
     });

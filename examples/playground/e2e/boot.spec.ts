@@ -63,4 +63,44 @@ test("the playground demo scaffolds a real Vite project, installs it, and shows 
     .toBeGreaterThan(0);
 
   expect(pageErrors).toEqual([]);
+
+  // Real WebSocket/HMR transport support: the injected polyfill
+  // (workers/preview/wsPolyfill.ts) replaces window.WebSocket inside the
+  // preview iframe before Vite's own client script runs (a Service Worker
+  // can never intercept a page's own `new WebSocket(...)` call - see that
+  // file's doc comment) - confirm it's actually installed, and that a
+  // WebSocket dialed through it reaches a real, protocol-correct OPEN
+  // state via a genuine RFC 6455 handshake against Vite's own bundled WS
+  // server (verified manually end-to-end before adding this assertion).
+  //
+  // This deliberately does NOT test "edit a file, see a live update" -
+  // that additionally requires this runtime's fs.watch (runtime/builtins/
+  // fs.ts) to fire real change notifications, which today is a complete
+  // no-op stub (accepts a listener, never calls it). Vite's dev server
+  // therefore never learns a file changed and never pushes an HMR update
+  // over this now-working connection - a separate, currently open gap
+  // this test doesn't claim to cover. See PROGRESS.md.
+  const frame = page.frame({ url: /__dwc_preview__/ });
+  const wsResult = await frame?.evaluate(async () => {
+    const anyWindow = window as unknown as { __dwcRealWebSocket?: unknown; WebSocket: new (url: string, protocols?: string | string[]) => WebSocket };
+    if (!anyWindow.__dwcRealWebSocket) return { installed: false };
+
+    const ws = new anyWindow.WebSocket("ws://localhost/", "vite-hmr");
+    const outcome = await new Promise<string>((resolve) => {
+      const timeout = setTimeout(() => resolve(`timeout readyState=${ws.readyState}`), 8000);
+      ws.addEventListener("open", () => {
+        clearTimeout(timeout);
+        resolve(`open protocol=${ws.protocol} readyState=${ws.readyState}`);
+      });
+      ws.addEventListener("close", (event) => {
+        clearTimeout(timeout);
+        resolve(`closed code=${event.code}`);
+      });
+    });
+    ws.close();
+    return { installed: true, outcome };
+  });
+
+  expect(wsResult?.installed).toBe(true);
+  expect(wsResult?.outcome).toBe("open protocol=vite-hmr readyState=1");
 });
