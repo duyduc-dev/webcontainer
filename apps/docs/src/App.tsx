@@ -6,6 +6,7 @@ import Filesystem from './docs/pages/Filesystem';
 import Installation from './docs/pages/Installation';
 import Introduction from './docs/pages/Introduction';
 import NodeBuiltins from './docs/pages/NodeBuiltins';
+import Npm from './docs/pages/Npm';
 import Playground from './docs/pages/Playground';
 import Preview from './docs/pages/Preview';
 import Process from './docs/pages/Process';
@@ -23,6 +24,7 @@ function App() {
           <Route element={<Installation />} path="installation" />
           <Route element={<Playground />} path="playground" />
           <Route element={<Filesystem />} path="filesystem" />
+          <Route element={<Npm />} path="npm" />
           <Route element={<Process />} path="process" />
           <Route element={<Shell />} path="shell" />
           <Route element={<Preview />} path="preview" />

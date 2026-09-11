@@ -93,7 +93,14 @@ const resolveExportsMap = (exportsField: unknown, subpath: string, conditions: r
   const pickCondition = (value: unknown): string | null => {
     if (typeof value === "string") return value;
     if (value === null) return null;
-    if (value && typeof value === "object" && !Array.isArray(value)) {
+    if (Array.isArray(value)) {
+      for (const candidate of value) {
+        const resolved = pickCondition(candidate);
+        if (resolved !== null) return resolved;
+      }
+      return null;
+    }
+    if (value && typeof value === "object") {
       const conditionMap = value as Record<string, unknown>;
       for (const condition of conditions) {
         if (condition in conditionMap) return pickCondition(conditionMap[condition]);

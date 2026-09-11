@@ -39,9 +39,9 @@ const result = await dwc.shell.exec("cd /project && pwd");
           cross-origin isolation for the full feature set.
         </li>
         <li>
-          <Link to="/docs/filesystem">Filesystem</Link>, <Link to="/docs/process">Process</Link>,{' '}
-          <Link to="/docs/shell">Shell</Link>, and <Link to="/docs/preview">Preview</Link> — the four APIs
-          `bootDWC()` returns.
+          <Link to="/docs/filesystem">Filesystem</Link>, <Link to="/docs/npm">Npm</Link>,{' '}
+          <Link to="/docs/process">Process</Link>, <Link to="/docs/shell">Shell</Link>, and{' '}
+          <Link to="/docs/preview">Preview</Link> — the APIs `bootDWC()` returns.
         </li>
         <li>
           <Link to="/docs/node-builtins">Node builtins</Link> — exactly what a guest script's <code>require()</code>{' '}

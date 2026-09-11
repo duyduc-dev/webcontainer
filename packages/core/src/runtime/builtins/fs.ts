@@ -90,6 +90,11 @@ interface FsBuiltinCore {
   readlinkSync(path: string): string;
   realpathSync: { (path: string): string; native(path: string): string };
   rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
+  // Distinct real Node call from rmSync (removes an empty directory,
+  // ENOTEMPTY if not - no `force`/`recursive` traced need yet, unlike
+  // rmSync) - traced need: real npm's own dependency tree calls this
+  // directly rather than the newer rmSync/rm.
+  rmdirSync(path: string): void;
   renameSync(from: string, to: string): void;
   existsSync(path: string): boolean;
   // Traced need: real create-vite's own file-copying helper (used to lay
@@ -431,6 +436,9 @@ const createFsBuiltin = (
         if (options.force && (error as { code?: string }).code === "ENOENT") return;
         throw error;
       }
+    },
+    rmdirSync(path) {
+      call({ op: FsOp.RM, path, recursive: false });
     },
     renameSync(from, to) {
       call({ op: FsOp.RENAME, from, to });

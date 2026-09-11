@@ -1,5 +1,7 @@
 import { createFileSystemAPI } from "./apis/FileSystem";
 import type { FileSystemAPI } from "./apis/FileSystem";
+import { createNpmAPI } from "./apis/npm/Npm";
+import type { NpmAPI } from "./apis/npm/Npm";
 import { createPreviewAPI } from "./apis/Preview";
 import type { PreviewAPI } from "./apis/Preview";
 import { createProcessAPI } from "./apis/Process";
@@ -19,13 +21,14 @@ interface BootDWCOptions extends KernelBridgeOptions {}
 interface BootDWCReturn {
   diagnostics: Diagnostics;
   fs: FileSystemAPI;
+  npm: NpmAPI;
   process: ProcessAPI;
   shell: ShellAPI;
   preview: PreviewAPI;
   addEventListener(type: string, handler: Handler): Unsubscribe;
   /** Resolves once the kernel worker has actually finished booting, rejects
    * if it never does (worker construction failure, boot timeout). Every
-   * `fs`/`process`/`shell`/`preview` call already waits for this
+   * `fs`/`npm`/`process`/`shell`/`preview` call already waits for this
    * internally (and surfaces the same rejection on its own returned
    * promise) - awaiting `ready` directly is only useful if you want to know
    * boot succeeded/failed without making an actual call. */
@@ -34,8 +37,8 @@ interface BootDWCReturn {
 
 /**
  * `bootDWC()` is deliberately synchronous - it returns real, immediately
- * usable `fs`/`process`/`shell`/`preview`/`addEventListener` handles right
- * away, not a Promise of them, so callers never need `await bootDWC()` (a
+ * usable `fs`/`npm`/`process`/`shell`/`preview`/`addEventListener` handles
+ * right away, not a Promise of them, so callers never need `await bootDWC()` (a
  * plain `const dwc = bootDWC();` works). The actual kernel worker boot
  * handshake still happens asynchronously underneath; every call these
  * handles make transparently waits for that to finish first (queuing behind
@@ -71,9 +74,12 @@ const bootDWC = (options: BootDWCOptions = {}): BootDWCReturn => {
     };
   };
 
+  const fs = createFileSystemAPI(request);
+
   return {
     diagnostics,
-    fs: createFileSystemAPI(request),
+    fs,
+    npm: createNpmAPI(fs),
     process: createProcessAPI(request, on),
     shell: createShellAPI(request),
     preview: createPreviewAPI(request, on),

@@ -21,6 +21,7 @@ export const DOCS_NAV: DocSection[] = [
     title: 'API',
     links: [
       { label: 'Filesystem', to: '/docs/filesystem' },
+      { label: 'Npm', to: '/docs/npm' },
       { label: 'Process', to: '/docs/process' },
       { label: 'Shell', to: '/docs/shell' },
       { label: 'Preview', to: '/docs/preview' },

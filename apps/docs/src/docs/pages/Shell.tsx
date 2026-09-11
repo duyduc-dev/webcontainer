@@ -21,7 +21,7 @@ function Shell() {
         <code>echo</code>, <code>rm [-r]</code>, <code>mv</code>, <code>true</code>, <code>false</code>.{' '}
         <code>node &lt;script&gt;</code> runs a script the same way <code>dwc.process.spawn()</code> does; any other
         command resolves against <code>/bin/&lt;name&gt;.js</code> on the virtual filesystem (which is how{' '}
-        <code>npm</code>/<code>npx</code> become runnable once vendored there).
+        <code>npm</code>/<code>npx</code> become runnable once loaded via <Link to="/docs/npm">dwc.npm</Link>).
       </p>
       <h2>Needs cross-origin isolation</h2>
       <p>
