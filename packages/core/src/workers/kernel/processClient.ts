@@ -398,7 +398,7 @@ const bootProcess = async (
       const { id, command, args: childArgs, cwd: childCwd, env: childEnv } = eventPayload;
       (async () => {
         try {
-          const relayEvent = (childType: string, childPayload: any) => {
+          const relayEvent = (childType: string, childPayload: any, childProcessId: string) => {
             if (childType === "stdout" || childType === "stderr") {
               worker.postMessage({ type: "cp-event", payload: { id, kind: childType, chunk: childPayload.chunk } });
               return;
@@ -406,6 +406,16 @@ const bootProcess = async (
             if (childType === "exit") {
               childWorkersByRequestId.delete(id);
               worker.postMessage({ type: "cp-event", payload: { id, kind: "exit", code: childPayload.code } });
+              return;
+            }
+            // npm run-script launches a package script as its own child
+            // process (typically `sh -c vite`). stdout/stderr/exit travel
+            // back to npm as cp-events, but a top-level host `listen` event
+            // has no Node child_process equivalent to relay through. Forward
+            // it directly through this parent process's handler so a
+            // dwc.shell.spawn("npm run dev") caller can start its preview.
+            if (childType === "listen") {
+              onEvent("listen", childPayload, childProcessId);
             }
           };
 

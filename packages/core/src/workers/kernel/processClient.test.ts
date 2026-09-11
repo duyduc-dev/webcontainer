@@ -514,6 +514,27 @@ describe("createProcessClient — spawnShell/killShell (streaming progress for a
     await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith({ type: "shell:exit", payload: { shellId, code: 0 } }));
   });
 
+  it("forwards a listen event from npm's nested run-script child to the host", async () => {
+    const client = setup();
+
+    await client.spawnShell({ line: "npm run dev", cwd: "/my-app" });
+    const npmWorker = await waitForWorker(0);
+
+    // npm's run-script implementation launches package scripts as `sh -c`.
+    npmWorker.onmessage?.({
+      data: {
+        type: "cp-spawn",
+        payload: { id: "npm-run-dev", command: "sh", args: ["-c", "vite"], cwd: "/my-app", env: { PATH: "/bin" } },
+      },
+    } as MessageEvent);
+    const viteWorker = await waitForWorker(1);
+
+    viteWorker.onmessage?.({ data: { type: "net-listen", payload: { port: 5173 } } } as MessageEvent);
+    viteWorker.onmessage?.({ data: { type: "net-pipe-listen", payload: { key: "\u0000dwc-tcp:5173" } } } as MessageEvent);
+
+    expect(postMessage).toHaveBeenCalledWith({ type: "listen", payload: { port: 5173 } });
+  });
+
   it("killShell() terminates the currently-running worker and posts a 143 exit", async () => {
     const client = setup();
 

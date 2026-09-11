@@ -18,6 +18,62 @@ function pipeToConsole(
   })();
 }
 
+function pipeToConsoleUntil(
+  stream: ReadableStream<Uint8Array>,
+  label: string,
+  marker: string,
+): Promise<void> {
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
+
+  return new Promise<void>((resolve, reject) => {
+    let found = false;
+    let trailingText = "";
+
+    const logAndCheck = (text: string): void => {
+      if (!text) return;
+
+      console.log(`[${label}]`, text);
+      if (found) return;
+
+      const combined = trailingText + text;
+      if (combined.includes(marker)) {
+        found = true;
+        resolve();
+        return;
+      }
+
+      const trailingLength = Math.max(marker.length - 1, 0);
+      trailingText = trailingLength === 0 ? "" : combined.slice(-trailingLength);
+    };
+
+    void (async () => {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            logAndCheck(decoder.decode());
+            if (!found) {
+              reject(new Error(`[${label}] exited before printing ${JSON.stringify(marker)}`));
+            }
+            return;
+          }
+
+          logAndCheck(decoder.decode(value, { stream: true }));
+        }
+      } catch (error) {
+        if (found) {
+          console.error(`[${label}] output stream failed after startup:`, error);
+        } else {
+          reject(error);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    })();
+  });
+}
+
 const main = async () => {
   const npm = await dwc.npm.install("10.9.2");
   console.log("npm loaded result:", npm.version, npm.fileCount);
@@ -32,6 +88,39 @@ const main = async () => {
     "npm create vite@latest my-vite-app -- --template vanilla",
   );
   console.log("shell exec result 2:", shell2.output);
+
+  // Vite 8 defaults to rolldown, whose native runtime is not compatible with
+  // this browser-hosted environment. Use Vite 7 and its WASM toolchain before
+  // installing the scaffold's dependencies.
+  const packageJsonPath = "/my-vite-app/package.json";
+  const scaffoldedPkg = JSON.parse(new TextDecoder().decode(await dwc.fs.readFile(packageJsonPath))) as {
+    devDependencies?: Record<string, string>;
+    overrides?: Record<string, string>;
+    scripts?: Record<string, string>;
+  };
+  scaffoldedPkg.devDependencies = { ...scaffoldedPkg.devDependencies, vite: "^7.0.0" };
+  scaffoldedPkg.overrides = {
+    ...scaffoldedPkg.overrides,
+    esbuild: "npm:esbuild-wasm@^0.25.0",
+    rollup: "npm:@rollup/wasm-node@^4.43.0",
+  };
+  scaffoldedPkg.scripts = { ...scaffoldedPkg.scripts, dev: "vite --configLoader native" };
+  await dwc.fs.writeFile(packageJsonPath, JSON.stringify(scaffoldedPkg, null, 2));
+  console.log("[vite] pinned Vite 7 with WASM esbuild and Rollup overrides");
+
+  // The vanilla scaffold has no external app dependencies. Disabling Vite's
+  // optional discovery scan avoids the unsupported picomatch path. The native
+  // loader avoids the config loader's esbuild service requirement.
+  await dwc.fs.writeFile(
+    "/my-vite-app/vite.config.mjs",
+    `export default {
+  optimizeDeps: {
+    noDiscovery: true,
+  },
+};
+`,
+  );
+  console.log("[vite] disabled automatic dependency discovery");
 
   // const createProc = await dwc.process.spawn("/bin/npm.js", {
   //   argv: ["create", "vite@latest", "my-app", "--", "--template", "vanilla"],
@@ -56,29 +145,31 @@ const main = async () => {
   console.log("shell exec result 4:", shell4.output.split("\n"));
 
   const dev = await dwc.shell.spawn("npm run dev", { cwd: "/my-vite-app" });
-  pipeToConsole(dev.stdout, "dev");
+  const devReady = pipeToConsoleUntil(dev.stdout, "dev", "Local:");
   pipeToConsole(dev.stderr, "dev");
   // A dev server never exits on its own - dev.exit intentionally isn't
   // awaited here. dev.kill() is available to stop it later.
 
-  // Wait for the guest server to actually bind the port before touching
-  // preview - dev.spawn() resolving only means the process STARTED, not
-  // that Vite has finished booting (can take 15-20+s for a real cold
-  // start). Without this, preview.enable()/the iframe navigation races
-  // ahead and hits "nothing is listening on port 5173".
-  await new Promise<void>((resolve) => {
-    const off = dwc.addEventListener("listen", (payload: { port: number }) => {
-      if (payload.port !== 5173) return;
-      off();
-      resolve();
-    });
-  });
+  // Vite first probes port 5173 before it starts serving. Waiting for the
+  // ready banner avoids previewing that short-lived probe connection.
+  try {
+    await devReady;
+  } catch (error) {
+    const exitCode = await dev.exit;
+    console.error("npm run dev exited before Vite became ready:", exitCode, error);
+    return;
+  }
 
   await dwc.preview.enable({ swUrl: "/dwc-preview-sw.js" });
   const url = dwc.preview.url(5173, "/");
-  console.log("url >> ", url);
-  const preview = document.getElementById("preview");
-  preview?.setAttribute("src", url);
+  const preview = document.getElementById("preview") as HTMLIFrameElement | null;
+  if (!preview) {
+    console.error("[preview] no #preview iframe found");
+    return;
+  }
+
+  preview.src = url;
+  console.log("[preview] iframe.src ->", preview.src);
 };
 
 main();
