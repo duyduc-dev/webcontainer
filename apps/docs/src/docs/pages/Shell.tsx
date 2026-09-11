@@ -15,6 +15,28 @@ function Shell() {
         <code>output</code> if a command might fail, or use <code>dwc.process.spawn()</code> for anything where you
         need the real exit code back.
       </p>
+      <h2>spawn() — streaming progress</h2>
+      <p>
+        <code>exec()</code> is fully buffered — nothing comes back until the whole line finishes, which for
+        something like <code>npm install</code> can look indistinguishable from a hang. <code>dwc.shell.spawn()</code>{' '}
+        is the streaming counterpart: same line semantics (<code>&amp;&amp;</code> chaining, <code>cd</code>,
+        PATH-resolved commands), but <code>stdout</code>/<code>stderr</code> arrive as real{' '}
+        <code>ReadableStream</code>s as output is produced.
+      </p>
+      <CodeBlock>
+        {`const install = await dwc.shell.spawn("npm install", { cwd: "/my-app" });
+
+const reader = install.stdout.getReader();
+const decoder = new TextDecoder();
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  console.log(decoder.decode(value)); // progress, as it happens
+}
+
+const exitCode = await install.exit;
+install.kill(); // stop whatever's currently running in the line's own && chain`}
+      </CodeBlock>
       <h2>Built-in commands</h2>
       <p>
         <code>pwd</code>, <code>cd</code>, <code>ls</code>, <code>cat</code>, <code>mkdir [-p]</code>,{' '}

@@ -100,6 +100,14 @@ describe("syncWireFormat requests", () => {
     });
   });
 
+  it("round-trips UTIMES", () => {
+    expect(roundTripRequest({ op: FsOp.UTIMES, path: "/a.txt", mtimeMs: 1_700_000_000_123 })).toEqual({
+      op: FsOp.UTIMES,
+      path: "/a.txt",
+      mtimeMs: 1_700_000_000_123,
+    });
+  });
+
   it("round-trips LSTAT", () => {
     expect(roundTripRequest({ op: FsOp.LSTAT, path: "/link.txt" })).toEqual({ op: FsOp.LSTAT, path: "/link.txt" });
   });
@@ -173,6 +181,10 @@ describe("syncWireFormat responses", () => {
 
   it("round-trips a CHMOD success response", () => {
     expect(roundTripResponse({ ok: true, op: FsOp.CHMOD })).toEqual({ ok: true, op: FsOp.CHMOD });
+  });
+
+  it("round-trips a UTIMES success response", () => {
+    expect(roundTripResponse({ ok: true, op: FsOp.UTIMES })).toEqual({ ok: true, op: FsOp.UTIMES });
   });
 
   it("round-trips a REALPATH success response", () => {

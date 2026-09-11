@@ -373,18 +373,33 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated, latest session): read item 13 at the very end of
-this file first — tried Vite 8/rolldown again (prompted by re-reading
-Vivari's roadmap), found and fixed two real, general bugs along the way
-(a missing `util.isDeepStrictEqual`, and a genuine exponential-blowup bug
-in `esmLoader.ts` unrelated to Vite specifically - both worth keeping),
-but the ORIGINAL item 9/10 upstream rolldown/napi-rs tokio-runtime crash
-is CONFIRMED STILL THE BLOCKER once those two were out of the way -
-reproduced the exact same `Uncaught RuntimeError: unreachable` trap live.
-This definitively closes the "should we try Vite 8 instead of the Vite 7
-workaround" question for now: no, not until upstream fixes the
-tokio-runtime lifecycle bug. The Vite 7 workaround (item 10) remains the
-right path.**
+**Pick up here (updated, latest session): read item 14 at the very end of
+this file first — moved npm loading into `@dwc/core` as a real `dwc.npm`
+API (zero-local-build-step `install()`, fetching straight from the real
+registry), added a genuinely new `dwc.shell.spawn()` streaming API so a
+long-running command like `npm install` shows live progress instead of a
+silent buffered wait, and — after two real-but-wrong fixes along the
+way — finally root-caused a long-standing "create-vite: command not
+found" bug down to a single missing `PATH` env default in
+`runProgramViaShell`. Verified live, repeatedly. Still open: whether
+`main.ts`'s preview.enable()/iframe wiring after the new `"listen"` wait
+actually completes end-to-end (the browser tooling used to verify this
+session became unreliable right at the end, mid-check) — pick that back
+up first.**
+
+Earlier session, still valid: read item 13 - tried Vite 8/rolldown again
+(prompted by re-reading Vivari's roadmap), found and fixed two real,
+general bugs along the way (a missing `util.isDeepStrictEqual`, and a
+genuine exponential-blowup bug in `esmLoader.ts` unrelated to Vite
+specifically - both worth keeping), but the ORIGINAL item 9/10 upstream
+rolldown/napi-rs tokio-runtime crash is CONFIRMED STILL THE BLOCKER once
+those two were out of the way - reproduced the exact same `Uncaught
+RuntimeError: unreachable` trap live. This definitively closes the
+"should we try Vite 8 instead of the Vite 7 workaround" question for
+now: no, not until upstream fixes the tokio-runtime lifecycle bug. The
+Vite 7 workaround (item 10) remains the right path - and is very likely
+about to matter again, since item 14's own scaffolded demo project has
+no version pin applied and installed Vite 8/rolldown by default.
 
 Before that: item 12 — `fs.watch` is real, and the full loop items 8
 through 12 spent many sessions chasing is closed: a real `dwc.fs.
@@ -3516,6 +3531,284 @@ Vivari also found) as explicit `devDependencies` in a real
    and are both worth keeping regardless, but neither one (nor both
    together) makes Vite 8 usable. The Vite 7 workaround (item 10) remains
    the right path until upstream fixes the tokio-runtime issue.
+
+Per standing preference, commit messages for this project should not
+include `Co-Authored-By`/session-link footers.
+
+## 14. `dwc.npm` moved into the library, `dwc.shell.spawn()` added for live progress, and a long-standing "create-vite: command not found" bug finally root-caused (took three tries)
+
+### `dwc.npm` — the npm-loading mechanism is now part of `@dwc/core`, not the playground app
+
+Previously `examples/playground/src/vendorNpm.ts` (app-level) fetched a
+locally-built `public/vendor/npm.json` asset and mounted it into the VFS.
+Decision this session: move the *mechanism* (decode → mount → node-gyp
+stub → `/bin/npm.js`/`npx.js`/`pnpm.js` shims) into the library as
+`dwc.npm.load(asset)`/`loadFrom(url)`, while deliberately keeping *which
+npm version, how the asset is built* an app-level concern - `@dwc/core`
+doesn't ship or pin any particular npm version itself. This mirrors how
+`~/workspace/vivari` (a sibling WebContainer-clone project, referenced
+for research purposes only - see the "Remove all references to the
+vivari project" commit for why it's not named in code/docs) splits the
+same problem: its own `vendor-npm.mjs` build script stays outside its
+`packages/kernel-host` library package, only the load/mount mechanism
+moved in.
+
+**Then taken further: `dwc.npm.install(version?)` needs no local build
+step or vendored asset at all.** New `packages/core/src/apis/npm/npmTar.ts`
+resolves a version against the real npm registry's own abbreviated
+metadata endpoint (confirmed via `curl`: both
+`registry.npmjs.org/npm` and its tarball endpoint send
+`access-control-allow-origin: *`, so a browser can fetch them directly,
+no proxy needed), fetches the real `.tgz`, gunzips it via the native
+`DecompressionStream` Web API (this code runs host-side, not inside the
+guest sandbox, so there's no need for this project's own guest-side
+pure-JS inflate), and parses the raw POSIX ustar/PAX tar format by hand
+(a small, from-scratch reader - handles GNU long-name and PAX
+extended-header entries, needed for real npm's own deeply-nested
+`node_modules/@scope/pkg` paths). Verified directly against the real
+npm@12.0.2 tarball (not just unit-tested): extraction is byte-for-byte
+correct, 1594 files, including scoped packages like
+`node_modules/@gar/promise-retry/*` that a subsequent bug (see below)
+briefly looked like it might be dropping.
+
+`examples/playground/src/vendorNpm.ts` and its build-time
+`scripts/vendor-npm.mjs` step are gone; `main.ts` just calls
+`dwc.npm.install("10.9.2")` (or no argument, for whatever `latest`
+currently resolves to).
+
+### The Vite dev-server console leak — root-caused, but the fix made things worse; reverted
+
+Confirmed root cause (traced, not guessed): `packages/core/src/workers/
+process/worker.ts`'s `boot()` does `Object.assign(self, {console: {...
+guest stdout shim...}})` - a GLOBAL replacement of the Worker's own
+ambient `console`, needed because the guest module wrapper (`new
+Function(...)`) closes over the real global scope and real Node's own
+`console`/`process`/`global` are ambient globals too, not module-wrapper
+parameters. Because `@dwc/core` is a pnpm workspace-linked package (not
+an opaque `node_modules` dependency), Vite's dev server resolves through
+the symlink to the real monorepo path and applies its own dev-mode HMR
+client injection to every `new Worker(new URL(...), {type:"module"})` it
+finds there - including the kernel/process workers. That injected
+client's own `console.log('[vite] connected.')` call, once it fires
+(after `boot()` has already replaced `console`), gets captured into the
+SAME buffer as real guest process stdout - confirmed live: a freshly
+spawned process's captured output started with `"[vite]
+connected.\n"` before the real command's own output, every time, in dev
+mode only.
+
+**Attempted fix made things categorically worse.** Adding `resolve:
+{preserveSymlinks: true}` to `examples/playground/vite.config.ts` does
+stop Vite from injecting into `@dwc/core`'s worker files - but it does so
+by making Vite treat `@dwc/core` as an ordinary `node_modules` dependency,
+which puts it through Vite's `optimizeDeps` esbuild pre-bundling by
+default. Pre-bundling breaks `new Worker(new URL("workers/kernel/
+worker.js", import.meta.url))`'s relative-URL resolution entirely -
+confirmed live, repeatedly (`@dwc/core` resolving to `/node_modules/.vite/
+deps/@dwc_core.js?v=...`), every single boot failing with `DWCError:
+Kernel worker did not respond within 10000ms` / `FSError: Kernel worker
+did not respond within 10000ms`. **Reverted immediately**, `.vite`
+dep-cache cleared, dev server restarted, confirmed booting cleanly again
+(`npm loaded result: 10.9.2 1935`, zero timeout errors, two clean reloads
+in a row).
+
+**Decision: leave the original cosmetic leak alone.** The safer
+alternative (confine the guest console shim to the module-wrapper's own
+closure via a parameter, instead of a global `self.console`
+reassignment) would fix the root cause without touching Vite config at
+all, but is a more invasive change to `worker.ts`'s core
+module-execution mechanism - given how badly the config-level attempt
+backfired, explicitly chose not to chase this further for a dev-only,
+harmless display issue. Still open if someone wants to pick it up later.
+
+### The real bug hunt: "create-vite: command not found" - three tries to root-cause, verified wrong twice before finding it
+
+Long-running real-world test in `main.ts`: `npm.install()` → `npm create
+vite@latest my-vite-app -- --template vanilla` → `npm install` (inside
+the scaffold) → `npm run dev`. The `npm create` step kept failing:
+
+```
+npm warn exec The following package was not found and will be installed: create-vite@9.2.1
+create-vite: command not found
+npm error code 127
+```
+
+**Attempt 1 (wrong, but a real fix, kept): `fs.utimes`/`fs.utimesSync`
+were permanent no-ops.** A live investigation found `create-vite`'s own
+`node_modules/create-vite` directory existed but was completely empty,
+and separately reproduced `npm error code ECOMPROMISED` in an isolated
+repro - real npm's own lock implementation (`libnpmexec/lib/
+with-lock.js`, the same algorithm real `proper-lockfile` uses, not that
+package itself - it isn't even in npm 12.0.2's own tree) periodically
+bumps a lock file's mtime via `fs.utimes()` to prove it's still held,
+then re-stats to confirm the bump took effect. A no-op `utimes()` makes
+that verification always fail. Fixed for real: a new `FsOp.UTIMES`
+kernel operation end-to-end - `kernel/fs/VirtualFileSystem.ts` (new
+`utimes(path, mtimeMs)` mutator, follows symlinks like `chmod`, `Stat`
+already tracked `mtimeMs` per node so this was a small addition, not a
+new timestamp model), `kernel/fs/syncWireFormat.ts` (new `UTIMES = 15`
+op, request/response encode/decode), `kernel/fs/syncServer.ts`
+(dispatch), `runtime/builtins/fs.ts` (`utimesSync`/real `utimes`/
+`futimes`, plus a `toMtimeMs()` helper for real Node's own genuinely
+surprising rule that a plain number here means SECONDS since epoch, not
+milliseconds - only a `Date` uses real `getTime()` ms). Real, tested
+(new cases in `fs.test.ts`, `syncWireFormat.test.ts`), fully verified via
+unit tests and typecheck. **Did not fix the actual symptom** - re-tested
+live, byte-identical failure.
+
+**Attempt 2 (wrong again, but also a real fix, kept): `fs.promises.utimes`
+didn't exist at all.** A second live investigation (constructing a real
+sandbox instance and calling into it directly) found `with-lock.js`
+actually does `require('node:fs/promises')` and calls the PROMISE form,
+not the callback form attempt 1 fixed - reproduced verbatim: `TypeError:
+fs.utimes is not a function`. Fixed: added `utimes` to
+`createFsPromisesBuiltin` (wired to the now-real `utimesSync`), new test
+in `fs.test.ts`. **Also did not fix the actual symptom** - re-verified
+live, byte-identical failure again, confirmed skeptically (fetched the
+served worker bundle fresh, confirmed the new code was actually in it).
+
+**The real cause, found by refusing to trust either "fix" and getting a
+direct diagnostic to the actual failure point:** the browser extension's
+console capture can't see kernel-Worker-context `console.log` calls at
+all (confirmed - a diagnostic `console.log` placed directly in
+`resolveEntryPoint()` never appeared, even after rebuilding and
+reloading), so the diagnostic had to write its findings to a VFS file
+(`/diag.json`) instead, read back via `dwc.fs.readFile()`. That surfaced
+it immediately: `{"pathVar": "", "envKeys": [...no PATH or Path key at
+all...]}`. Root cause: `packages/core/src/workers/kernel/
+processClient.ts`'s `runProgramViaShell()` - the function behind
+`dwc.shell.exec()` - spawned its process with `env: {}`, completely
+empty. Real npm's own `@npmcli/run-script`'s `setPATH()` (used to build
+the env for whatever `sh -c <cmd>` it spawns, including `npm create`'s
+own internal run of the just-fetched binary) only ever **extends** an
+existing PATH-shaped env key - it never creates one from scratch (its
+own mutation loop is `for (const key of Object.keys(env)) if
+(/^path$/i.test(key)) env[key] = pathVal` - a no-op if no such key
+exists yet). With no PATH ever seeded, every descendant spawn - no
+matter how correctly `create-vite` had already been fetched and
+bin-linked, which it always was, the whole time - permanently had
+nothing to search. Fixed: one line, `env: {}` → `env: { PATH: "/bin" }`,
+matching the exact convention `apis/Process.ts`'s `dwc.process.spawn()`
+already used. New regression test in `processClient.test.ts` asserting
+the `"boot"` payload now carries `env: { PATH: "/bin" }`.
+
+**Verified live, for real this time, skeptically: 3/3 consecutive runs**
+succeed identically, ending with `create-vite`'s own genuine success
+banner (`◇ Scaffolding project in /my-vite-app... └ Done. Now run: cd
+my-vite-app / npm install / npm run dev`). All three fixes (utimes ×2 +
+the PATH default) are real, independently-valid gaps and all three are
+kept; only the third was ever the actual blocker for this symptom - a
+concrete reminder that a fix passing every test it has doesn't mean it's
+the fix for the bug someone is actually chasing.
+
+Two smaller, unrelated gaps hit and fixed along the way during this same
+investigation: `fs.rmdirSync` (missing entirely - added, delegates to
+the same `FsOp.RM` the existing async `rmdir`/`rmSync` already use,
+non-recursive, matching real Node's own `rmdirSync` semantics), and
+`diagnostics_channel` (a complete stub already existed in `runtime/node/
+lib/diagnostics_channel.js` and was already used internally by `net.js`,
+but was never added to `runtime/builtins/index.ts`'s `BUILTIN_NAMES`
+allowlist, so guest code - here, `lru-cache`'s minified build, deep in
+npm's own dependency tree - couldn't `require()` it directly).
+
+### `dwc.shell.spawn()` - a new, genuinely streaming counterpart to `dwc.shell.exec()`
+
+The actual feature request this all came out of: `dwc.shell.exec()` is
+fully buffered - nothing comes back until the whole line finishes, which
+for something like a real `npm install` (network-bound, can take minutes
+depending on what's being fetched) is indistinguishable from a hang.
+The mechanism to stream a shell line's output already existed
+internally - `runShellLineStreamed()` in `processClient.ts`, built
+earlier for guest-code-initiated `child_process.spawn('sh', ['-c',
+...])` (the `cp-exec` relay) - it just had never been exposed to the
+host page. This session wired it through:
+
+- `processClient.ts`: new `ShellSpawnPayload`/`ShellKillPayload` types,
+  `spawnShell()`/`killShell()` on `ProcessClient`. A `shellId` (not a
+  `processId` - a `&&`-chained line can run through several different
+  process workers over its lifetime) is minted via `crypto.randomUUID()`
+  and tracked in a small `shellWorkers` map (`shellId → Worker | null`),
+  updated live via `runShellLineStreamed`'s existing `onWorkerCreated`
+  hook, purely so `killShell()` has something to terminate - whichever
+  command is CURRENTLY running in the chain. Reuses
+  `runProgramViaShell()`'s own `{PATH: "/bin"}` default env.
+- `workers/kernel/worker.ts`: new `SHELL_SPAWN`/`SHELL_KILL` router
+  entries, same pattern as `PROCESS_SPAWN`/`PROCESS_KILL`.
+- `apis/Shell.ts`: new `ShellHandle` (`{stdout, stderr, exit, kill()}`,
+  deliberately no `stdin` - no traced need yet, and unlike a single
+  `dwc.process.spawn()`'d process, a shell line's identity isn't tied to
+  one single process to write to) and `spawn(line, options)`, built the
+  same way `createProcessAPI`'s own `spawn()` already is - subscribe to
+  `shell:stdout`/`shell:stderr`/`shell:exit` events scoped by `shellId`,
+  build real `ReadableStream`s, resolve `exit` from the terminal event.
+  `dwc.ts` updated to pass `on` into `createShellAPI` (previously only
+  took `request`, since `exec()` alone never needed event subscription).
+- Tests: new `apis/Shell.test.ts` (5 cases - exec's own existing
+  contract, spawn's stdout/stderr streaming scoped correctly to its own
+  shellId, exit code resolution, `kill()`), 3 new cases in
+  `processClient.test.ts` (streaming relay AS PRODUCED not buffered,
+  `killShell()` terminating the live worker and posting a 143 exit,
+  `killShell()` on an unknown id being a silent no-op).
+- Docs: new "spawn() — streaming progress" section on the `Shell` docs
+  page.
+
+**Verified live, genuinely useful in practice, not just passing tests:**
+wired into `main.ts` for the real `npm install`/`npm run dev` steps
+(`pipeToConsole()`, a small helper piping each stream's chunks to
+`console.log` with a label). Two real, honest confirmations this
+actually does what it's for, not just what its own tests assert:
+1. A real `npm install` for the scaffolded vite project took genuinely
+   ~2 minutes (`added 13 packages in 2m`) with zero output the whole
+   time except one leaked `"[vite] connected."` line (see above) - it
+   really was just slow, not stuck, and the new streaming showed that
+   distinction live instead of leaving it ambiguous the way
+   `dwc.shell.exec()` would have.
+2. Hours later (machine had gone idle/asleep in between), a retry hit a
+   **real, transient network failure** -
+   `npm error request to https://registry.npmjs.org/postcss failed:
+   fetch failed` - and `dwc.shell.spawn()` surfaced it immediately, live,
+   with the real exit code (`1`), rather than it being invisible until
+   the whole buffered command eventually gave up. Confirmed the failure
+   itself was environmental, not a code bug (`curl` to both
+   `registry.npmjs.org` and the local dev server succeeded moments
+   later).
+
+### Two more real, smaller findings from the same session, worth a future look
+
+- **`payload.cwd` is never normalized to an absolute path anywhere in
+  the spawn chain.** `workers/process/worker.ts:537`'s guest
+  `process.cwd()` returns whatever raw string was given
+  (`cwd: () => payload.cwd`) - a caller passing a relative path (e.g.
+  `dwc.shell.exec("npm install", {cwd: "./my-vite-app"})`, an easy
+  mistake to make) makes the guest's own `process.cwd()` violate real
+  Node's invariant that it's always absolute, which could plausibly
+  confuse real npm's own directory-walking/path-joining logic in subtle
+  ways. Not fixed this session (worked around in `main.ts` by using an
+  absolute `/my-vite-app` instead) - the right fix is normalizing `cwd`
+  (resolve against `/` if relative) at the host-facing boundary in
+  `apis/Shell.ts`/`apis/Process.ts`, reusing the same resolution
+  `shell/resolvePath.ts`'s `cd` handling already does internally.
+- **Still unconfirmed end-to-end: does `main.ts`'s new `"listen"`-event
+  wait actually let `dwc.preview.enable()`/the iframe navigation succeed
+  for a shell-spawned dev server?** `main.ts` was updated to `await`
+  `dwc.addEventListener("listen", ...)` before touching preview (the
+  original bug reported this session - `dwc preview relay error:
+  nothing is listening on port 5173` - was a plain race: the iframe was
+  being pointed at the server before Vite had finished booting, which
+  can take 15-20+s for a real cold start). The underlying `"listen"`
+  event mechanism is the same one `dwc.process.spawn()` already relies
+  on and `spawnShell()`'s own `onEvent` handler explicitly forwards it
+  the same way `spawn()`'s does - structurally there's no reason it
+  wouldn't fire for a shell-spawned server too, but this was never
+  actually confirmed live: the browser extension's console-message
+  tracking became unreliable right at this point (silently stopped
+  picking up new messages for an extended stretch, unrelated to
+  anything in this project's own code) and the check was handed off
+  mid-verification. **Pick this up first next session** - reload,
+  wait for the real flow to complete (accounts for the genuinely slow
+  `npm install`), and confirm whether the iframe actually renders the
+  scaffolded page's real content, the way `dwc.preview.fetch()` was
+  confirmed to do for a `dwc.process.spawn()`-based server back in
+  Phase 3.
 
 Per standing preference, commit messages for this project should not
 include `Co-Authored-By`/session-link footers.

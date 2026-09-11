@@ -68,6 +68,7 @@ interface VirtualFileSystem {
   stat(path: string): Stat;
   lstat(path: string): Stat;
   chmod(path: string, mode: number): void;
+  utimes(path: string, mtimeMs: number): void;
   symlink(target: string, path: string): void;
   readlink(path: string): string;
   realpath(path: string): string;
@@ -284,6 +285,17 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     emitChange("change", normalized);
   };
 
+  // Only mtime - this VFS has no atime/ctime model at all (see Stat's own
+  // shape), matching the existing chown/utimes precedent elsewhere in this
+  // project. Follows symlinks, matching real fs.utimesSync (fs.lutimesSync
+  // is the non-following variant - no traced need for it yet).
+  const utimes = (path: string, mtimeMs: number): void => {
+    const normalized = normalize(path);
+    const node = resolveNode(normalized);
+    node.mtimeMs = mtimeMs;
+    emitChange("change", normalized);
+  };
+
   const symlink = (target: string, path: string): void => {
     const normalized = normalize(path);
     const { parent, name } = resolveParent(normalized);
@@ -350,7 +362,7 @@ const createVirtualFileSystem = (): VirtualFileSystem => {
     return () => changeListeners.delete(listener);
   };
 
-  return { mkdir, writeFile, readFile, readdir, stat, lstat, chmod, symlink, readlink, realpath, rm, rename, exists, onChange };
+  return { mkdir, writeFile, readFile, readdir, stat, lstat, chmod, utimes, symlink, readlink, realpath, rm, rename, exists, onChange };
 };
 
 export { createVirtualFileSystem };

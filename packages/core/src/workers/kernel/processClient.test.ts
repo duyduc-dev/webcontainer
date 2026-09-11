@@ -294,6 +294,23 @@ describe("createProcessClient — runShell (cd, node, and /bin PATH resolution)"
     await expect(resultPromise).resolves.toEqual({ output: "hello\n", cwd: "/project" });
   });
 
+  it("seeds a default PATH env for the spawned program - a real `npm create <pkg>` failed with \"command not found\" for a correctly-fetched-and-bin-linked package because real npm's own setPATH() only EXTENDS an existing PATH-shaped env key, never creates one from scratch, so an empty env here left every descendant spawn permanently PATH-less", async () => {
+    const { client } = setup();
+
+    const resultPromise = client.runShell({ line: "ls", cwd: "/project" });
+    const worker = await waitForWorker(0);
+
+    expect(worker.posted).toEqual([
+      expect.objectContaining({
+        type: "boot",
+        payload: expect.objectContaining({ env: { PATH: "/bin" } }),
+      }),
+    ]);
+
+    finishWith(worker, 0);
+    await resultPromise;
+  });
+
   it("resolves a script path relative to cwd and forwards extra argv to the script", async () => {
     const { client } = setup();
 
@@ -428,6 +445,90 @@ describe("createProcessClient — runShell (cd, node, and /bin PATH resolution)"
 
     await expect(resultPromise).resolves.toEqual({ output: "", cwd: "/" });
     expect(fsClient.request).toHaveBeenCalledWith({ action: "writeFile", path: "/x/f", contents: "hi\n" });
+  });
+});
+
+describe("createProcessClient — spawnShell/killShell (streaming progress for a shell line)", () => {
+  const originalWorker = globalThis.Worker;
+  const originalSelf = (globalThis as { self?: unknown }).self;
+  let spawnedWorkers: FakeWorker[] = [];
+  let postMessage: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    postMessage = vi.fn();
+    (globalThis as { self?: unknown }).self = { crossOriginIsolated: false, postMessage };
+  });
+
+  afterEach(() => {
+    globalThis.Worker = originalWorker;
+    (globalThis as { self?: unknown }).self = originalSelf;
+    spawnedWorkers = [];
+  });
+
+  const fakeShellFsClient = (): FsClient => {
+    const request = vi.fn(async (payload: { action: string }) => {
+      switch (payload.action) {
+        case "readFile":
+          return new TextEncoder().encode("// entry");
+        case "exists":
+          return true;
+        default:
+          return { sources: {} };
+      }
+    });
+    return { request, attachSyncChannel: vi.fn() } as unknown as FsClient;
+  };
+
+  const setup = () => {
+    class SpawningWorker extends FakeWorker {
+      constructor() {
+        super();
+        spawnedWorkers.push(this);
+      }
+    }
+    // @ts-expect-error test stub, not a full Worker implementation
+    globalThis.Worker = SpawningWorker;
+
+    const fetcherClient: FetcherClient = { request: vi.fn() };
+    return createProcessClient(fakeShellFsClient(), fakeProcessTable() as never, fetcherClient, createNetRelay());
+  };
+
+  const waitForWorker = async (index: number): Promise<FakeWorker> => {
+    await vi.waitFor(() => expect(spawnedWorkers.length).toBeGreaterThan(index));
+    return spawnedWorkers[index]!;
+  };
+  const encoder = new TextEncoder();
+
+  it("relays stdout as shell:<shellId> events AS PRODUCED, not buffered until exit", async () => {
+    const client = setup();
+
+    const { shellId } = await client.spawnShell({ line: "echo hi", cwd: "/" });
+    const worker = await waitForWorker(0);
+    worker.onmessage?.({ data: { type: "stdout", payload: { chunk: encoder.encode("hi\n") } } } as MessageEvent);
+
+    expect(postMessage).toHaveBeenCalledWith({ type: "shell:stdout", payload: { shellId, chunk: encoder.encode("hi\n") } });
+    // Posted as soon as the chunk arrives - no exit event yet.
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "shell:exit" }));
+
+    worker.onmessage?.({ data: { type: "exit", payload: { code: 0 } } } as MessageEvent);
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledWith({ type: "shell:exit", payload: { shellId, code: 0 } }));
+  });
+
+  it("killShell() terminates the currently-running worker and posts a 143 exit", async () => {
+    const client = setup();
+
+    const { shellId } = await client.spawnShell({ line: "sleep 5", cwd: "/" });
+    const worker = await waitForWorker(0);
+
+    client.killShell({ shellId });
+
+    expect(worker.terminated).toBe(true);
+    expect(postMessage).toHaveBeenCalledWith({ type: "shell:exit", payload: { shellId, code: 143 } });
+  });
+
+  it("killShell() is a silent no-op for an unknown shellId", async () => {
+    const client = setup();
+    expect(() => client.killShell({ shellId: "does-not-exist" })).not.toThrow();
   });
 });
 

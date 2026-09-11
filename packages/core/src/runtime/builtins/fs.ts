@@ -86,6 +86,9 @@ interface FsBuiltinCore {
   statSync(path: string): StatResult;
   lstatSync(path: string): StatResult;
   chmodSync(path: string, mode: number): void;
+  // Only mtime is honored (no atime model - see utimes' own doc comment
+  // below for why this needs to be real, not a no-op).
+  utimesSync(path: string, atime: number | string | Date, mtime: number | string | Date): void;
   symlinkSync(target: string, path: string): void;
   readlinkSync(path: string): string;
   realpathSync: { (path: string): string; native(path: string): string };
@@ -139,13 +142,21 @@ interface FsBuiltin extends FsBuiltinCore {
   unlink(path: string, callback: NodeCallback<void>): void;
   rmdir(path: string, callback: NodeCallback<void>): void;
   rename(from: string, to: string, callback: NodeCallback<void>): void;
-  // No real multi-user ownership or mtime-preservation model exists in this
-  // VFS (there's nothing to chown to, and nothing reads a restored mtime
-  // back) - traced need: real tar's own Unpack calls these unconditionally
-  // while restoring an extracted entry's metadata, so they need to exist
-  // and succeed, not actually change anything.
+  // No real multi-user ownership model exists in this VFS (there's nothing
+  // to chown to) - traced need: real tar's own Unpack calls these
+  // unconditionally while restoring an extracted entry's metadata, so they
+  // need to exist and succeed, not actually change anything.
   chown(path: string, uid: number, gid: number, callback: NodeCallback<void>): void;
   fchown(fd: number, uid: number, gid: number, callback: NodeCallback<void>): void;
+  // Unlike chown/fchown above, this DOES need to actually change the file's
+  // mtime - traced need: `proper-lockfile` (used by real npm's own
+  // cacache/@npmcli/fs for concurrent-safe writes) periodically bumps a
+  // lock file's mtime via fs.utimes() to prove it's still held, then
+  // re-stats to confirm the bump took effect; a no-op utimes() makes that
+  // verification always fail, which proper-lockfile treats as "lock
+  // compromised" (ECOMPROMISED) and aborts the write - this is what broke a
+  // real `npm create vite` mid-extraction. Only mtime is honored (atime
+  // isn't tracked at all - see VirtualFileSystem's Stat shape).
   utimes(path: string, atime: number | string | Date, mtime: number | string | Date, callback: NodeCallback<void>): void;
   futimes(fd: number, atime: number | string | Date, mtime: number | string | Date, callback: NodeCallback<void>): void;
   // File-descriptor-based I/O - traced need: fs-minipass (real tar's own
@@ -230,6 +241,16 @@ interface FdEntry {
    * an explicit numeric position never touches this. */
   position: number;
 }
+
+/** Real Node's fs.utimes()/utimesSync() have a genuinely surprising rule
+ * (unlike every other timestamp API in Node): a plain number - or a numeric
+ * string - is Unix epoch time in SECONDS, not milliseconds, matching POSIX
+ * utime()'s own units; only a Date uses real getTime() milliseconds. */
+const toMtimeMs = (value: number | string | Date): number => {
+  if (value instanceof Date) return value.getTime();
+  const seconds = typeof value === "string" ? parseFloat(value) : value;
+  return seconds * 1000;
+};
 
 /** Grows (never shrinks) a Uint8Array in place, preserving existing bytes -
  * backs "write" mode's in-memory file image, since a write can land past
@@ -413,6 +434,9 @@ const createFsBuiltin = (
     chmodSync(path, mode) {
       call({ op: FsOp.CHMOD, path, mode });
     },
+    utimesSync(path, _atime, mtime) {
+      call({ op: FsOp.UTIMES, path, mtimeMs: toMtimeMs(mtime) });
+    },
     symlinkSync(target, path) {
       call({ op: FsOp.SYMLINK, target, path });
     },
@@ -582,12 +606,26 @@ const createFsBuiltin = (
     nextTick(() => callback(null));
   };
 
-  const utimes: FsBuiltin["utimes"] = (_path, _atime, _mtime, callback) => {
-    nextTick(() => callback(null));
+  const utimes: FsBuiltin["utimes"] = (path, atime, mtime, callback) => {
+    nextTick(() => {
+      try {
+        core.utimesSync(path, atime, mtime);
+        callback(null);
+      } catch (error) {
+        callback(error);
+      }
+    });
   };
 
-  const futimes: FsBuiltin["futimes"] = (_fd, _atime, _mtime, callback) => {
-    nextTick(() => callback(null));
+  const futimes: FsBuiltin["futimes"] = (fd, atime, mtime, callback) => {
+    nextTick(() => {
+      try {
+        core.utimesSync(requireFd(fd).path, atime, mtime);
+        callback(null);
+      } catch (error) {
+        callback(error);
+      }
+    });
   };
 
   const fdTable = new Map<number, FdEntry>();
@@ -877,6 +915,18 @@ const createFsPromisesBuiltin = (fs: FsBuiltin, nextTick: (callback: () => void)
     stat: (path: string) => toPromise(() => fs.statSync(path)),
     lstat: (path: string) => toPromise(() => fs.lstatSync(path)),
     chmod: (path: string, mode: number) => toPromise(() => fs.chmodSync(path, mode)),
+    // Traced need: real npm's own lock implementation (libnpmexec's
+    // with-lock.js, the actual "cacache/proper-lockfile"-shaped algorithm
+    // behind `npm exec`/`npm create`) does `require('node:fs/promises')`
+    // and periodically `await fs.utimes(lockPath, mtime, mtime)` to prove
+    // its lock is still held - with no promise-form utimes at all (only the
+    // callback form existed until this), that threw `TypeError: fs.utimes
+    // is not a function`, silently aborted via an AbortSignal, and left
+    // whatever package was being fetched (e.g. create-vite) with an empty
+    // node_modules entry - the actual root cause of a real `npm create
+    // vite` failing with "command not found" further downstream.
+    utimes: (path: string, atime: number | string | Date, mtime: number | string | Date) =>
+      toPromise(() => fs.utimesSync(path, atime, mtime)),
     symlink: (target: string, path: string) => toPromise(() => fs.symlinkSync(target, path)),
     readlink: (path: string) => toPromise(() => fs.readlinkSync(path)),
     realpath: (path: string) => toPromise(() => fs.realpathSync(path)),

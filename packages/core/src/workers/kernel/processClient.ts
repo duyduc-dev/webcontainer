@@ -40,6 +40,16 @@ interface ShellExecPayload {
   cwd?: string;
 }
 
+interface ShellSpawnPayload {
+  line: string;
+  cwd?: string;
+  env?: Record<string, string>;
+}
+
+interface ShellKillPayload {
+  shellId: string;
+}
+
 interface StdinPayload {
   processId: string;
   chunk: Uint8Array;
@@ -66,6 +76,20 @@ interface ProcessClient {
    * `.kill()`. Silently a no-op for an unknown/already-exited processId,
    * same fire-and-forget shape as `stdin` above. */
   kill(payload: KillPayload): void;
+  /** Streaming counterpart to runShell() above: same `&&`-chained-line/`cd`-
+   * mutates-cwd/PATH-resolved-command interpreter (reuses runShellLineStreamed,
+   * already built for child_process.spawn('sh', ['-c', ...]) from guest code),
+   * but relays stdout/stderr/exit as `shell:*` events AS PRODUCED instead of
+   * buffering into one string - lets a host page show real progress for a
+   * long-running line like `npm install` instead of a silent wait until it
+   * finishes. Returns a shellId immediately; the line keeps running across
+   * however many commands the chain has after this resolves. */
+  spawnShell(payload: ShellSpawnPayload): Promise<{ shellId: string }>;
+  /** Terminates whichever command is CURRENTLY running under this shellId
+   * (a `&&` chain may have moved through several by the time this is called)
+   * and reports a normal-shaped exit (code 143, matching kill() above).
+   * Silently a no-op for an unknown/already-finished shellId. */
+  killShell(payload: ShellKillPayload): void;
 }
 
 interface BootProcessPayload {
@@ -511,7 +535,16 @@ const runProgramViaShell = async (
     resolveExit = resolve;
   });
 
-  await bootProcess(fsClient, processTable, fetcherClient, netRelay, { entryPath, argv, env: {}, cwd }, (type, eventPayload) => {
+  // A real, if minimal, default PATH - matching apis/Process.ts's own
+  // dwc.process.spawn() convention. Without at least one truthy PATH key
+  // here, real npm's own @npmcli/run-script setPATH() (which only ever
+  // UPDATES an existing PATH-shaped env key, never adds one from scratch -
+  // see set-path.js) has nothing to extend, so every descendant it spawns
+  // (e.g. `npm create`'s own internal `sh -c <fetched-package-bin>` call)
+  // permanently has no PATH at all - this was the actual root cause of a
+  // real `npm create vite` failing with "create-vite: command not found"
+  // even after the package was correctly fetched and bin-linked.
+  await bootProcess(fsClient, processTable, fetcherClient, netRelay, { entryPath, argv, env: { PATH: "/bin" }, cwd }, (type, eventPayload) => {
     if (type === "stdout" || type === "stderr") {
       output += decoder.decode(eventPayload.chunk);
       return;
@@ -739,6 +772,14 @@ const createProcessClient = (
   fetcherClient: FetcherClient,
   netRelay: NetRelay,
 ): ProcessClient => {
+  // A shell spawn's line may run through several DIFFERENT process workers
+  // over its lifetime (one per `&&`-separated command), so unlike processTable
+  // there's no single stable Worker to key on - this tracks whichever one is
+  // CURRENTLY running under a given shellId, updated live via
+  // runShellLineStreamed's onWorkerCreated hook, purely so killShell() has
+  // something to terminate.
+  const shellWorkers = new Map<string, Worker | null>();
+
   const spawn = async (payload: SpawnPayload): Promise<{ processId: string }> => {
     const { entryPath, argv = [], env = {}, cwd = "/" } = payload;
 
@@ -765,6 +806,61 @@ const createProcessClient = (
     return { output, cwd };
   };
 
+  const spawnShell = async (payload: ShellSpawnPayload): Promise<{ shellId: string }> => {
+    // Same real, if minimal, default PATH runProgramViaShell() itself seeds -
+    // without it, real npm's own setPATH() (which only ever EXTENDS an
+    // existing PATH-shaped env key, never creates one from scratch) has
+    // nothing to extend for anything this line spawns.
+    const { line, cwd = "/", env = { PATH: "/bin" } } = payload;
+    const shellId = crypto.randomUUID();
+    shellWorkers.set(shellId, null);
+
+    void runShellLineStreamed(
+      fsClient,
+      processTable,
+      fetcherClient,
+      netRelay,
+      { line, cwd, env },
+      (type, eventPayload) => {
+        if (type === "stdout" || type === "stderr") {
+          postEvent(`shell:${type}`, { shellId, chunk: eventPayload.chunk });
+          return;
+        }
+        if (type === "exit") {
+          postEvent("shell:exit", { shellId, code: eventPayload.code });
+          return;
+        }
+        if (type === "listen") {
+          // Matches spawn()'s own "listen" forwarding above - a host page
+          // cares that something is listening, not which call started it
+          // (traced need: `npm run dev` running a real dev server through
+          // dwc.shell.spawn() should still fire the same "listen" event
+          // dwc.process.spawn() already does).
+          postEvent("listen", { port: eventPayload.port });
+        }
+      },
+      (worker) => {
+        shellWorkers.set(shellId, worker);
+      },
+    )
+      // runShellLineStreamed already turns any resolution/exit-code failure
+      // into its own "exit" event - this only guards against a genuinely
+      // unexpected throw (e.g. an fsClient request rejecting) so a shellId
+      // never leaks forever with nothing ever posting its exit.
+      .catch(() => postEvent("shell:exit", { shellId, code: 1 }))
+      .finally(() => shellWorkers.delete(shellId));
+
+    return { shellId };
+  };
+
+  const killShell = (payload: ShellKillPayload): void => {
+    const worker = shellWorkers.get(payload.shellId);
+    if (worker === undefined) return; // unknown or already-finished shellId
+    shellWorkers.delete(payload.shellId);
+    worker?.terminate();
+    postEvent("shell:exit", { shellId: payload.shellId, code: 143 });
+  };
+
   const stdin = (payload: StdinPayload): void => {
     processTable.getWorker(payload.processId)?.postMessage({ type: "stdin", payload: { chunk: payload.chunk } });
   };
@@ -779,8 +875,8 @@ const createProcessClient = (
     postEvent("process:exit", { processId: payload.processId, code: 143 });
   };
 
-  return { spawn, runShell, stdin, kill };
+  return { spawn, runShell, stdin, kill, spawnShell, killShell };
 };
 
 export { createProcessClient };
-export type { KillPayload, ProcessClient, ShellExecPayload, SpawnPayload, StdinPayload };
+export type { KillPayload, ProcessClient, ShellExecPayload, ShellKillPayload, ShellSpawnPayload, SpawnPayload, StdinPayload };

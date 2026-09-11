@@ -43,6 +43,7 @@ enum FsOp {
    * being read (only one request is ever in flight per channel, since the
    * client blocks on Atomics.wait between round-trips). */
   READ_CHUNK = 14,
+  UTIMES = 15,
 }
 
 type FsRequest =
@@ -61,7 +62,8 @@ type FsRequest =
   | { op: FsOp.LSTAT; path: string }
   | { op: FsOp.CHMOD; path: string; mode: number }
   | { op: FsOp.REALPATH; path: string }
-  | { op: FsOp.READ_CHUNK };
+  | { op: FsOp.READ_CHUNK }
+  | { op: FsOp.UTIMES; path: string; mtimeMs: number };
 
 type FsResponseOk =
   // `more: true` means the file is bigger than fit in this frame - the
@@ -87,7 +89,8 @@ type FsResponseOk =
   | { ok: true; op: FsOp.SYMLINK }
   | { ok: true; op: FsOp.READLINK; target: string }
   | { ok: true; op: FsOp.CHMOD }
-  | { ok: true; op: FsOp.REALPATH; path: string };
+  | { ok: true; op: FsOp.REALPATH; path: string }
+  | { ok: true; op: FsOp.UTIMES };
 
 type FsResponseError = { ok: false; code: FSErrorCode; path: string; message: string };
 
@@ -211,6 +214,10 @@ const encodeFsRequest = (request: FsRequest, buffer: ArrayBufferLike, byteOffset
       writer.writeString(request.path);
       writer.writeUint32(request.mode);
       break;
+    case FsOp.UTIMES:
+      writer.writeString(request.path);
+      writer.writeFloat64(request.mtimeMs);
+      break;
     case FsOp.READ_CHUNK:
       break;
   }
@@ -245,6 +252,8 @@ const decodeFsRequest = (buffer: ArrayBufferLike, byteOffset = 0): FsRequest => 
       return { op, target: reader.readString(), path: reader.readString() };
     case FsOp.CHMOD:
       return { op, path: reader.readString(), mode: reader.readUint32() };
+    case FsOp.UTIMES:
+      return { op, path: reader.readString(), mtimeMs: reader.readFloat64() };
     case FsOp.READ_CHUNK:
       return { op };
     default:
@@ -298,6 +307,7 @@ const encodeFsResponse = (response: FsResponse, buffer: ArrayBufferLike, byteOff
     case FsOp.RENAME:
     case FsOp.SYMLINK:
     case FsOp.CHMOD:
+    case FsOp.UTIMES:
       break;
   }
 
@@ -354,6 +364,7 @@ const decodeFsResponse = (buffer: ArrayBufferLike, byteOffset = 0): FsResponse =
     case FsOp.RENAME:
     case FsOp.SYMLINK:
     case FsOp.CHMOD:
+    case FsOp.UTIMES:
       return { ok: true, op };
     default:
       throw new Error(`Unknown FsOp: ${op}`);

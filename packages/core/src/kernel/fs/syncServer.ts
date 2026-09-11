@@ -105,6 +105,9 @@ const executeFsRequest = (vfs: VirtualFileSystem, state: SyncFsServerState, requ
     case FsOp.CHMOD:
       vfs.chmod(request.path, request.mode);
       return { ok: true, op: FsOp.CHMOD };
+    case FsOp.UTIMES:
+      vfs.utimes(request.path, request.mtimeMs);
+      return { ok: true, op: FsOp.UTIMES };
     case FsOp.REALPATH:
       return { ok: true, op: FsOp.REALPATH, path: vfs.realpath(request.path) };
   }

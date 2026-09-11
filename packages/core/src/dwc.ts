@@ -81,7 +81,7 @@ const bootDWC = (options: BootDWCOptions = {}): BootDWCReturn => {
     fs,
     npm: createNpmAPI(fs),
     process: createProcessAPI(request, on),
-    shell: createShellAPI(request),
+    shell: createShellAPI(request, on),
     preview: createPreviewAPI(request, on),
     addEventListener: on,
     ready: bridgeReady.then(() => undefined),

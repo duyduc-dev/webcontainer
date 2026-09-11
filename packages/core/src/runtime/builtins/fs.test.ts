@@ -668,13 +668,25 @@ describe("createFsBuiltin extraction-support callback methods (lstat/mkdir/chmod
     expect(new TextDecoder().decode(fs.readFileSync("/b.txt"))).toBe("hi");
   });
 
-  it("chown/fchown/utimes/futimes exist and succeed as no-ops (no real multi-user ownership or mtime-preservation model in this VFS - real tar's Unpack calls these unconditionally while restoring an extracted entry's metadata)", async () => {
+  it("chown/fchown exist and succeed as no-ops (no real multi-user ownership model in this VFS - real tar's Unpack calls these unconditionally while restoring an extracted entry's metadata)", async () => {
     const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
     fs.writeFileSync("/a.txt", "hi");
     await expect(callback((cb) => fs.chown("/a.txt", 501, 20, cb))).resolves.toBeUndefined();
     await expect(callback((cb) => fs.fchown(3, 501, 20, cb))).resolves.toBeUndefined();
-    await expect(callback((cb) => fs.utimes("/a.txt", 0, 0, cb))).resolves.toBeUndefined();
-    await expect(callback((cb) => fs.futimes(3, 0, 0, cb))).resolves.toBeUndefined();
+  });
+
+  it("utimes/futimes actually change mtime (unlike chown/fchown above) - real npm's own proper-lockfile bumps a lock's mtime this way and re-stats to verify it took, throwing ECOMPROMISED if it silently no-ops", async () => {
+    const fs = createFsBuiltin(makeIO(), (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/a.txt", "hi");
+
+    await callback((cb) => fs.utimes("/a.txt", 0, 1000, cb));
+    expect(fs.statSync("/a.txt").mtimeMs).toBe(1_000_000); // seconds -> ms, real fs.utimes' own convention
+
+    const fd = fs.openSync("/a.txt", "r");
+    await callback((cb) => fs.futimes(fd, 0, new Date(2_000_000), cb));
+    expect(fs.statSync("/a.txt").mtimeMs).toBe(2_000_000); // a Date arg uses real getTime() ms, not seconds
+
+    await expect(callback((cb) => fs.futimes(3, 0, 0, cb))).rejects.toMatchObject({ code: "EBADF" });
   });
 });
 
@@ -751,6 +763,16 @@ describe("createFsPromisesBuiltin", () => {
     const fsPromises = createFsPromisesBuiltin(fs, (cb) => queueMicrotask(cb));
 
     await expect(fsPromises.readFile("/missing")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("utimes actually changes mtime - real npm's own libnpmexec with-lock.js calls this exact promise form to keep its exec lock alive, and threw TypeError: fs.utimes is not a function before this existed", async () => {
+    const fs = createFsBuiltin(makeIO());
+    const fsPromises = createFsPromisesBuiltin(fs, (cb) => queueMicrotask(cb));
+    fs.writeFileSync("/lock", "");
+
+    await fsPromises.utimes("/lock", 0, 1000);
+
+    expect(fs.statSync("/lock").mtimeMs).toBe(1_000_000);
   });
 
   it("access() resolves for an existing path and rejects for a missing one", async () => {

@@ -7,7 +7,7 @@ import type { NetRequestPayload } from "./fetcherClient";
 import { createFsClient } from "./fsClient";
 import { createNetRelay } from "./netRelay";
 import { createProcessClient } from "./processClient";
-import type { KillPayload, ShellExecPayload, SpawnPayload, StdinPayload } from "./processClient";
+import type { KillPayload, ShellExecPayload, ShellKillPayload, ShellSpawnPayload, SpawnPayload, StdinPayload } from "./processClient";
 import { fetchFromGuestServer } from "./previewRelay";
 import type { PreviewFetchInit } from "./previewRelay";
 import { closePreviewSocket, openPreviewSocket, sendPreviewSocketMessage } from "./previewSocket";
@@ -55,6 +55,11 @@ router.handle("PROCESS_KILL", (payload) => {
   return undefined;
 });
 router.handle("SHELL_EXEC", (payload) => processClient.runShell(payload as ShellExecPayload));
+router.handle("SHELL_SPAWN", (payload) => processClient.spawnShell(payload as ShellSpawnPayload));
+router.handle("SHELL_KILL", (payload) => {
+  processClient.killShell(payload as ShellKillPayload);
+  return undefined;
+});
 router.handle("PREVIEW_FETCH", (payload) => {
   const { port, path, init } = payload as { port: number; path: string; init?: PreviewFetchInit };
   return fetchFromGuestServer(netRelay, port, path, init);
