@@ -1,15 +1,13 @@
 import { expect, test } from "@playwright/test";
 
 // The whole flow (a real `npm create vite@latest`, pinning the scaffold to
-// Vite 7 + the esbuild-wasm/@rollup/wasm-node overrides, a real `npm
+// Vite 8.0.0 + its explicit Rolldown WASI binding and the esbuild-wasm/
+// @rollup/wasm-node overrides, a real `npm
 // install` against the real registry, `npm run dev`, then a real request
 // the guest server actually serves) is a genuine end-to-end run - several
-// minutes, not seconds, dominated by the real npm install. See PROGRESS.md
-// items 9/10 for why Vite 7 (not latest/8) is pinned: Vite 8 defaults to
-// rolldown, which hits a confirmed upstream bug (a Rust static torn down
-// after the first native call panics on a later one) that crashes the dev
-// server on almost any real request - not fixable from this project's
-// side, so the demo routes around it instead.
+// minutes, not seconds, dominated by the real npm install. The exact pin
+// avoids silently moving to a later Rolldown release until it passes this
+// full preview flow too; see PROGRESS.md for the WASI compatibility boundary.
 test.setTimeout(10 * 60 * 1000);
 
 test("the playground demo scaffolds a real Vite project, installs it, and shows a real, crash-free, interactive dev-server preview (images included)", async ({
@@ -21,16 +19,14 @@ test("the playground demo scaffolds a real Vite project, installs it, and shows 
   await page.goto("/");
 
   // Scaffolding itself is fast; the real npm install (against the real
-  // registry, now also pulling vite@7 + the two WASM-build overrides) is
+  // registry, now installing Vite/Rolldown's explicitly pinned WASI package) is
   // the slow part.
   await expect(page.locator("#terminal")).toContainText("[npm create vite] exit=0", { timeout: 60_000 });
   await expect(page.locator("#terminal")).toContainText("[npm install] exit=0", { timeout: 5 * 60_000 });
   await expect(page.locator("#terminal")).toContainText("[preview] iframe.src ->", { timeout: 3 * 60_000 });
 
-  // Regression guard for item 9's own rolldown crash: if the Vite 7 pin
-  // (or either override) ever gets reverted, this is exactly the text
-  // that comes back - fail loud and specifically here, not just with a
-  // blank iframe further down.
+  // Regression guard for the WASI Rolldown lifecycle trap: fail loud and
+  // specifically here, not just with a blank iframe further down.
   const terminalText = await page.locator("#terminal").innerText();
   expect(terminalText).not.toContain("RuntimeError");
   expect(terminalText).not.toContain("Cannot find module");

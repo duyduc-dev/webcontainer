@@ -3535,6 +3535,52 @@ Vivari also found) as explicit `devDependencies` in a real
 Per standing preference, commit messages for this project should not
 include `Co-Authored-By`/session-link footers.
 
+## 13.1. Added WASI binding and Worker-liveness compatibility; Vite 8 remains gated by Rolldown's upstream trap
+
+`process.versions.webcontainer` remains the feature-detection signal for
+packages that need a browser-container fallback. Rolldown takes that path to
+its WASI binding; the guest application must declare that binding explicitly
+when its selected Rolldown release does not list it as an optional dependency.
+The runtime intentionally continues to report its stable Linux/x64 package
+platform rather than globally forcing all npm dependency selection to WASI.
+
+**Vite 8.0.0 binding-version correction.** Vite 8.0.0 pins
+`rolldown@1.0.0-rc.9`; its explicitly installed WASI package must therefore
+also be exactly `@rolldown/binding-wasm32-wasi@1.0.0-rc.9`. A prior `~1.2.0`
+binding range resolved an incompatible binding and failed at dev-server startup
+with `value "builtin:vite-wasm-fallback" does not match any variant of enum
+BindingBuiltinPluginName`. The playground now uses the matching exact version.
+Because the runtime's normal `process.arch` remains `x64`, the playground
+runs `npm install --force` for this project. The vendored npm 10.9.2
+Arborist checks an explicit direct dependency's CPU against `process.arch`
+even when `--cpu=wasm32` is supplied, so the configuration override cannot
+install this package. `--force` bypasses that direct-dependency platform check
+for the explicitly pinned browser-only WASI binding without globally changing
+guest platform reporting.
+
+`node:worker_threads.Worker` also no longer approximates `unref()` with a
+three-second message-traffic timeout. It now tracks the Worker handle and
+its message port as separate event-loop references, matching Node's listener
+lifecycle: `unref()` releases both immediately, a later `"message"` listener
+retains the port, removing the final listener releases it, and `ref()` restores
+both applicable references. This removes a shutdown race in the
+`@napi-rs/wasm-runtime` Worker pool, whose workers are unref'd while their
+message port becomes active when work arrives.
+
+Focused lifecycle tests, the full core suite (691 tests), core build, and
+playground production build are green. The browser end-to-end check could
+not reach guest setup in this environment: both the initial
+`dwc.npm.install()` request and a controlled local-asset `dwc.npm.loadFrom()`
+replacement remained pending for 60 seconds with no page error. That occurs
+before any Vite/Rolldown code runs. This is a compatibility improvement, not
+a Vite 8 sign-off: the real Vite 8 preview path still needs browser
+end-to-end validation, and Rolldown's independently reproducible
+`RuntimeError: unreachable` WASI lifecycle issue recorded above remains the
+current risk. The playground nevertheless uses the explicitly requested,
+exact `vite@8.0.0` and matching
+`@rolldown/binding-wasm32-wasi@1.0.0-rc.9` pair; do not upgrade either
+package implicitly until that browser flow passes.
+
 ## 14. `dwc.npm` moved into the library, `dwc.shell.spawn()` added for live progress, and a long-standing "create-vite: command not found" bug finally root-caused (took three tries)
 
 ### `dwc.npm` — the npm-loading mechanism is now part of `@dwc/core`, not the playground app

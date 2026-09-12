@@ -89,16 +89,22 @@ const main = async () => {
   );
   console.log("shell exec result 2:", shell2.output);
 
-  // Vite 8 defaults to rolldown, whose native runtime is not compatible with
-  // this browser-hosted environment. Use Vite 7 and its WASM toolchain before
-  // installing the scaffold's dependencies.
+  // Vite 8 uses Rolldown. Declare its WASI binding explicitly: some Rolldown
+  // releases do not expose it as an optional dependency for npm to select.
+  // Its version must exactly match Vite 8.0.0's Rolldown dependency; mixing
+  // Rolldown 1.2's binding with Vite's 1.0.0-rc.9 JavaScript causes a
+  // `builtin:vite-wasm-fallback` enum mismatch at server startup.
   const packageJsonPath = "/my-vite-app/package.json";
   const scaffoldedPkg = JSON.parse(new TextDecoder().decode(await dwc.fs.readFile(packageJsonPath))) as {
     devDependencies?: Record<string, string>;
     overrides?: Record<string, string>;
     scripts?: Record<string, string>;
   };
-  scaffoldedPkg.devDependencies = { ...scaffoldedPkg.devDependencies, vite: "^7.0.0" };
+  scaffoldedPkg.devDependencies = {
+    ...scaffoldedPkg.devDependencies,
+    vite: "8.0.0",
+    "@rolldown/binding-wasm32-wasi": "1.0.0-rc.9",
+  };
   scaffoldedPkg.overrides = {
     ...scaffoldedPkg.overrides,
     esbuild: "npm:esbuild-wasm@^0.25.0",
@@ -106,7 +112,7 @@ const main = async () => {
   };
   scaffoldedPkg.scripts = { ...scaffoldedPkg.scripts, dev: "vite --configLoader native" };
   await dwc.fs.writeFile(packageJsonPath, JSON.stringify(scaffoldedPkg, null, 2));
-  console.log("[vite] pinned Vite 7 with WASM esbuild and Rollup overrides");
+  console.log("[vite] pinned Vite 8.0.0 with its explicit WASI Rolldown binding");
 
   // The vanilla scaffold has no external app dependencies. Disabling Vite's
   // optional discovery scan avoids the unsupported picomatch path. The native
@@ -134,7 +140,11 @@ const main = async () => {
   const shell3 = await dwc.shell.exec("cat /my-vite-app/src/main.js");
   console.log("shell exec result 3:", shell3.output.split("\n"));
 
-  const install = await dwc.shell.spawn("npm install", { cwd: "/my-vite-app" });
+  // The WASI binding declares `cpu: wasm32`, while DWC correctly reports a
+  // stable x64 package platform. npm 10's Arborist validates direct package
+  // dependencies against process.arch (not npm's --cpu config), so force this
+  // one install to retain the explicitly pinned browser-only binding.
+  const install = await dwc.shell.spawn("npm install --force", { cwd: "/my-vite-app" });
   pipeToConsole(install.stdout, "install");
   pipeToConsole(install.stderr, "install");
   const installExit = await install.exit;

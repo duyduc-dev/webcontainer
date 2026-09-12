@@ -313,7 +313,7 @@ const spawnWorker = (
   cwd: string,
   defaultEnv: Record<string, string>,
   eventLoop: ReturnType<typeof createEventLoop>,
-): { worker: Worker; ready: Promise<void>; unref: () => void } => {
+): { worker: Worker; ready: Promise<void>; ref: () => void; unref: () => void } => {
   const worker = new Worker(new URL("../workerThreads/worker.js", import.meta.url), { type: "module", name: `WorkerThreads:${entryPath}` });
   // Refed for as long as this worker is alive (see worker_threads.ts's own
   // SpawnedWorker doc comment for the real hang this fixes) - without it,
@@ -328,7 +328,10 @@ const spawnWorker = (
       transfer,
     );
   });
-  return { worker, ready, unref: () => eventLoop.unref() };
+  // The Worker handle and its message port are independently ref-counted by
+  // worker_threads.ts, so expose the event loop's counted operations rather
+  // than a single idempotent flag for the whole nested Worker.
+  return { worker, ready, ref: eventLoop.ref, unref: eventLoop.unref };
 };
 
 const handleChildProcessEvent = (payload: {
