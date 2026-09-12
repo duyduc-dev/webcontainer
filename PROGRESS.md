@@ -3558,6 +3558,13 @@ install this package. `--force` bypasses that direct-dependency platform check
 for the explicitly pinned browser-only WASI binding without globally changing
 guest platform reporting.
 
+**Install progress.** `dwc.shell.spawn()` already relays stdout and stderr as
+each chunk is produced. The playground invokes npm with
+`--loglevel=info --foreground-scripts` so dependency resolution, downloads,
+and lifecycle-script output appear in the host console. The browser relay is
+intentionally non-TTY, so npm's animated progress bar is not used; text output
+is reliable in the streamed console.
+
 `node:worker_threads.Worker` also no longer approximates `unref()` with a
 three-second message-traffic timeout. It now tracks the Worker handle and
 its message port as separate event-loop references, matching Node's listener

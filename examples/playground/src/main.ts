@@ -12,7 +12,11 @@ function pipeToConsole(
   void (async () => {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) return;
+      if (done) {
+        const trailing = decoder.decode();
+        if (trailing) console.log(`[${label}]`, trailing);
+        return;
+      }
       console.log(`[${label}]`, decoder.decode(value, { stream: true }));
     }
   })();
@@ -144,7 +148,15 @@ const main = async () => {
   // stable x64 package platform. npm 10's Arborist validates direct package
   // dependencies against process.arch (not npm's --cpu config), so force this
   // one install to retain the explicitly pinned browser-only binding.
-  const install = await dwc.shell.spawn("npm install --force", { cwd: "/my-vite-app" });
+  //
+  // Shell streams every output chunk. Its browser relay deliberately is not a
+  // TTY, so request npm's textual progress and lifecycle-script output instead
+  // of its animated terminal progress bar.
+  console.log("[install] Resolving and downloading dependencies...");
+  const install = await dwc.shell.spawn(
+    "npm install --force --loglevel=info --foreground-scripts",
+    { cwd: "/my-vite-app" },
+  );
   pipeToConsole(install.stdout, "install");
   pipeToConsole(install.stderr, "install");
   const installExit = await install.exit;
