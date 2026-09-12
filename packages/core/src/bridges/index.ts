@@ -12,7 +12,7 @@ type Handler = (payload?: any) => void;
 interface KernelBridgeOptions {
   bootTimeoutMs?: number;
   /** Reuse an already-constructed Diagnostics instance instead of creating a
-   * new one - lets a caller (dwc.ts's synchronous bootDWC()) obtain the
+   * new one - lets a caller (dwc.ts's synchronous bootWC()) obtain the
    * diagnostics object synchronously, before this async boot process even
    * starts, and still have it correctly receive every event this bridge
    * logs once booted. createDiagnostics() is plain and side-effect-free, so

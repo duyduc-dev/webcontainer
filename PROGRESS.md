@@ -19,7 +19,7 @@ Written to hand off work-in-progress across devices.
 
 ## 0. Docs site (GitHub Pages) + Playground demo — `main` branch
 
-Goal for this thread: a public docs site for `@dwc/core` with a live,
+Goal for this thread: a public docs site for `duckwc` with a live,
 editable code sandbox embedded in it (StackBlitz-style — edit a
 file, see it rebuild and re-preview, entirely client-side). Everything
 below is already committed and pushed to `origin/main`; the GitHub Actions
@@ -28,14 +28,14 @@ every push that touches `apps/docs/**` or `packages/core/**`.
 
 ### Shipped and verified
 
-- **CI actually builds `@dwc/core` before `apps/docs`, and redeploys on
+- **CI actually builds `duckwc` before `apps/docs`, and redeploys on
   core-only changes too.** Two separate bugs: the workflow only ran
   `pnpm --filter docs build` (now `pnpm --filter docs... build`, which
   topologically builds workspace deps first), and its `paths:` trigger
   only watched `apps/docs/**` (now also `packages/core/**`). Without
-  both fixes the deployed site could silently run stale `@dwc/core` code
+  both fixes the deployed site could silently run stale `duckwc` code
   indefinitely.
-- **Real `@dwc/core` bug: a consumer bundler can't always re-bundle a
+- **Real `duckwc` bug: a consumer bundler can't always re-bundle a
   worker file.** `tsup`'s default code-splitting factored shared code
   across `dist/index.js` and the `dist/workers/*/worker.js` files into
   sibling `chunk-*.js` files — fine for a plain npm install (the whole
@@ -52,7 +52,7 @@ every push that touches `apps/docs/**` or `packages/core/**`.
   general library bug — affects any consumer deploying under a subpath
   with a bundler that doesn't recursively re-bundle copied-out workers,
   not just this docs site.
-- **Real `@dwc/core` bug: the `"listen"` event fired from the wrong
+- **Real `duckwc` bug: the `"listen"` event fired from the wrong
   message.** `bindings/net.ts`'s `net.Server.listen()` posts `net-listen`
   then `net-pipe-listen` as two separate, sequential messages for one
   `.listen()` call. The top-level `dwc.addEventListener("listen", ...)`
@@ -69,7 +69,7 @@ every push that touches `apps/docs/**` or `packages/core/**`.
   after the fix (both a direct `dwc.preview.fetch()` stress test and the
   full iframe/Service-Worker path, 25+ successes with zero failures,
   every time run **locally**).
-- **`process.kill()` added to `@dwc/core`'s public API** — a real,
+- **`process.kill()` added to `duckwc`'s public API** — a real,
   previously-missing capability (no way to stop a spawned process short
   of it exiting on its own). Threaded through end-to-end: `apis/
   Process.ts` → `PROCESS_KILL` request → kernel `processClient.ts`
@@ -374,7 +374,7 @@ the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
 **Pick up here (updated, latest session): read item 14 at the very end of
-this file first — moved npm loading into `@dwc/core` as a real `dwc.npm`
+this file first — moved npm loading into `duckwc` as a real `dwc.npm`
 API (zero-local-build-step `install()`, fetching straight from the real
 registry), added a genuinely new `dwc.shell.spawn()` streaming API so a
 long-running command like `npm install` shows live progress instead of a
@@ -1912,7 +1912,7 @@ re-applied after the isolated test passed, and is committed as `c659c31`.
 
 **Follow-up session: re-verified live against the real end-to-end demo —
 confirmed NOT sufficient, and found a new, more precise failure signature.**
-Rebuilt `@dwc/core` (dist was stale relative to `c659c31`), then drove the
+Rebuilt `duckwc` (dist was stale relative to `c659c31`), then drove the
 real `examples/playground` demo (`npm create vite` → `npm install` → `npm
 run dev`) with a Playwright script polling tab responsiveness every 10s via
 `document.readyState`, per this doc's own prior recommendation.
@@ -3590,14 +3590,14 @@ package implicitly until that browser flow passes.
 
 ## 14. `dwc.npm` moved into the library, `dwc.shell.spawn()` added for live progress, and a long-standing "create-vite: command not found" bug finally root-caused (took three tries)
 
-### `dwc.npm` — the npm-loading mechanism is now part of `@dwc/core`, not the playground app
+### `dwc.npm` — the npm-loading mechanism is now part of `duckwc`, not the playground app
 
 Previously `examples/playground/src/vendorNpm.ts` (app-level) fetched a
 locally-built `public/vendor/npm.json` asset and mounted it into the VFS.
 Decision this session: move the *mechanism* (decode → mount → node-gyp
 stub → `/bin/npm.js`/`npx.js`/`pnpm.js` shims) into the library as
 `dwc.npm.load(asset)`/`loadFrom(url)`, while deliberately keeping *which
-npm version, how the asset is built* an app-level concern - `@dwc/core`
+npm version, how the asset is built* an app-level concern - `duckwc`
 doesn't ship or pin any particular npm version itself. This mirrors how
 `~/workspace/vivari` (a sibling WebContainer-clone project, referenced
 for research purposes only - see the "Remove all references to the
@@ -3637,7 +3637,7 @@ guest stdout shim...}})` - a GLOBAL replacement of the Worker's own
 ambient `console`, needed because the guest module wrapper (`new
 Function(...)`) closes over the real global scope and real Node's own
 `console`/`process`/`global` are ambient globals too, not module-wrapper
-parameters. Because `@dwc/core` is a pnpm workspace-linked package (not
+parameters. Because `duckwc` is a pnpm workspace-linked package (not
 an opaque `node_modules` dependency), Vite's dev server resolves through
 the symlink to the real monorepo path and applies its own dev-mode HMR
 client injection to every `new Worker(new URL(...), {type:"module"})` it
@@ -3651,12 +3651,12 @@ mode only.
 
 **Attempted fix made things categorically worse.** Adding `resolve:
 {preserveSymlinks: true}` to `examples/playground/vite.config.ts` does
-stop Vite from injecting into `@dwc/core`'s worker files - but it does so
-by making Vite treat `@dwc/core` as an ordinary `node_modules` dependency,
+stop Vite from injecting into `duckwc`'s worker files - but it does so
+by making Vite treat `duckwc` as an ordinary `node_modules` dependency,
 which puts it through Vite's `optimizeDeps` esbuild pre-bundling by
 default. Pre-bundling breaks `new Worker(new URL("workers/kernel/
 worker.js", import.meta.url))`'s relative-URL resolution entirely -
-confirmed live, repeatedly (`@dwc/core` resolving to `/node_modules/.vite/
+confirmed live, repeatedly (`duckwc` resolving to `/node_modules/.vite/
 deps/@dwc_core.js?v=...`), every single boot failing with `DWCError:
 Kernel worker did not respond within 10000ms` / `FSError: Kernel worker
 did not respond within 10000ms`. **Reverted immediately**, `.vite`

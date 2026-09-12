@@ -16,9 +16,9 @@ import type { Diagnostics } from "./protocol/diagnostics";
 type Unsubscribe = () => void;
 type Handler = (payload?: any) => void;
 
-interface BootDWCOptions extends KernelBridgeOptions {}
+interface BootWCOptions extends KernelBridgeOptions {}
 
-interface BootDWCReturn {
+interface BootWCReturn {
   diagnostics: Diagnostics;
   fs: FileSystemAPI;
   npm: NpmAPI;
@@ -36,20 +36,20 @@ interface BootDWCReturn {
 }
 
 /**
- * `bootDWC()` is deliberately synchronous - it returns real, immediately
+ * `bootWC()` is deliberately synchronous - it returns real, immediately
  * usable `fs`/`npm`/`process`/`shell`/`preview`/`addEventListener` handles
- * right away, not a Promise of them, so callers never need `await bootDWC()` (a
- * plain `const dwc = bootDWC();` works). The actual kernel worker boot
+ * right away, not a Promise of them, so callers never need `await bootWC()` (a
+ * plain `const dwc = bootWC();` works). The actual kernel worker boot
  * handshake still happens asynchronously underneath; every call these
  * handles make transparently waits for that to finish first (queuing behind
  * `bridgeReady` below), so nothing is unsafe about calling them immediately -
- * a `dwc.fs.mkdir(...)` issued the same tick `bootDWC()` returns simply
+ * a `dwc.fs.mkdir(...)` issued the same tick `bootWC()` returns simply
  * resolves a little later than one issued after the kernel is already up.
- * `await bootDWC()` (the old call shape) still works unchanged: `await` on a
+ * `await bootWC()` (the old call shape) still works unchanged: `await` on a
  * plain object that isn't a Promise/thenable just resolves to that object on
  * the next microtask, so existing call sites don't need to change.
  */
-const bootDWC = (options: BootDWCOptions = {}): BootDWCReturn => {
+const bootWC = (options: BootWCOptions = {}): BootWCReturn => {
   const diagnostics = createDiagnostics();
   const bridgeReady = createKernelBridge({ ...options, diagnostics });
   // A promise nobody ever awaits still logs an "unhandled rejection" console
@@ -88,5 +88,5 @@ const bootDWC = (options: BootDWCOptions = {}): BootDWCReturn => {
   };
 };
 
-export { bootDWC };
-export type { BootDWCOptions, BootDWCReturn };
+export { bootWC };
+export type { BootWCOptions, BootWCReturn };

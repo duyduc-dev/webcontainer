@@ -1,7 +1,7 @@
 import { javascript } from '@codemirror/lang-javascript';
 import CodeMirror from '@uiw/react-codemirror';
-import { bootDWC } from '@dwc/core';
-import type { ProcessHandle } from '@dwc/core';
+import { bootWC } from 'duckwc';
+import type { ProcessHandle } from 'duckwc';
 import { useEffect, useRef, useState } from 'react';
 import DocPage from '../components/DocPage';
 
@@ -72,7 +72,7 @@ const useSystemTheme = (): 'light' | 'dark' => {
 };
 
 function Playground() {
-  const dwcRef = useRef<ReturnType<typeof bootDWC> | null>(null);
+  const dwcRef = useRef<ReturnType<typeof bootWC> | null>(null);
   const bootedRef = useRef(false);
   const runIdRef = useRef(0);
   const filesRef = useRef<Record<string, string>>(DEFAULT_FILES);
@@ -96,7 +96,7 @@ function Playground() {
     if (bootedRef.current) return;
     bootedRef.current = true;
 
-    const dwc = bootDWC();
+    const dwc = bootWC();
     dwcRef.current = dwc;
 
     dwc.addEventListener('listen', (payload) => {
@@ -241,7 +241,7 @@ function Playground() {
   return (
     <DocPage
       title="Playground"
-      lede="A real @dwc/core sandbox, booted on this page. Edit any file and it restarts automatically, like a dev server — require('./greeting') resolves between files exactly like it would in your own app, running in a Web Worker and previewed live on the right."
+      lede="A real duckwc sandbox, booted on this page. Edit any file and it restarts automatically, like a dev server — require('./greeting') resolves between files exactly like it would in your own app, running in a Web Worker and previewed live on the right."
       wide
     >
       <div className="-mx-4 grid grid-cols-1 gap-4 sm:mx-0 lg:grid-cols-2">

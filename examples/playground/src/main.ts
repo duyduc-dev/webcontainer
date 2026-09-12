@@ -1,6 +1,6 @@
-import { bootDWC } from "@dwc/core";
+import { bootWC } from "duckwc";
 
-const dwc = bootDWC();
+const dwc = bootWC();
 
 function pipeToConsole(
   stream: ReadableStream<Uint8Array>,

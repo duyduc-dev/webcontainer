@@ -15,7 +15,7 @@ interface Diagnostics {
 const HISTORY_LIMIT = 50;
 
 /**
- * Subscribers attach after async work (e.g. awaiting bootDWC()), by which point
+ * Subscribers attach after async work (e.g. awaiting bootWC()), by which point
  * boot-time events like the initial PING/PONG have already fired - onEvent()
  * replays recent history so a late subscriber still sees what already happened.
  */

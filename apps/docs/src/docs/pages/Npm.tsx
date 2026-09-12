@@ -8,7 +8,7 @@ function Npm() {
       lede="dwc.npm loads a real, unmodified npm CLI into the virtual filesystem and puts npm/npx/pnpm on PATH."
     >
       <p>
-        <code>@dwc/core</code> doesn't ship or pin any particular npm version itself — running real npm inside the
+        <code>duckwc</code> doesn't ship or pin any particular npm version itself — running real npm inside the
         sandbox means running npm's own unmodified JS source as a guest program, the same way any other script runs.
         <code>dwc.npm</code> is the mechanism for getting that source into the VFS; where the source comes from is up
         to you.

@@ -25,7 +25,7 @@ function previewServiceWorkerHeaders(): Plugin {
   };
 }
 
-// @dwc/core's synchronous fs bridge to the kernel worker needs
+// duckwc's synchronous fs bridge to the kernel worker needs
 // SharedArrayBuffer, which only exists on a cross-origin-isolated page —
 // these two response headers on every response are what
 // `self.crossOriginIsolated` reflects. Without them the library still works,

@@ -13,7 +13,7 @@ function CrossOriginIsolation() {
 Cross-Origin-Embedder-Policy: require-corp`}
       </CodeBlock>
       <p>
-        Without these headers, <code>@dwc/core</code> still works — it falls back to a slower static-preload path,
+        Without these headers, <code>duckwc</code> still works — it falls back to a slower static-preload path,
         just without the sync bridges.
       </p>
 

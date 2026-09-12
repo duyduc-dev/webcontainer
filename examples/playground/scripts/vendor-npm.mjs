@@ -23,7 +23,7 @@ const ROOT = path.resolve(fileURLToPath(new URL("../", import.meta.url)));
 // Must live OUTSIDE the repo: npm walks up from an empty cwd looking for the
 // nearest package.json to use as the "project" context. A scratch dir inside
 // this monorepo hits examples/playground/package.json, whose
-// "@dwc/core": "workspace:*" dependency real (non-workspace) npm can't parse
+// "duckwc": "workspace:*" dependency real (non-workspace) npm can't parse
 // (EUNSUPPORTEDPROTOCOL). /tmp has no package.json in its ancestry, so npm
 // stops there and installs only what we asked for.
 const VENDOR_DIR = process.env.DWC_VENDOR_DIR || path.join(os.tmpdir(), "dwc-vendor-npm");

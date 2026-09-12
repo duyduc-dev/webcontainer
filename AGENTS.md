@@ -4,7 +4,7 @@
 
 This pnpm workspace contains the browser-based WebContainer-style runtime.
 
-- `packages/core/`: published `@dwc/core` library. Public APIs live in `src/apis/`; the runtime, virtual filesystem, protocol, bridges, and Workers are under `src/runtime/`, `src/kernel/`, `src/workers/`, and `src/protocol/`.
+- `packages/core/`: published `duckwc` library. Public APIs live in `src/apis/`; the runtime, virtual filesystem, protocol, bridges, and Workers are under `src/runtime/`, `src/kernel/`, `src/workers/`, and `src/protocol/`.
 - `examples/playground/`: Vite integration demo and Playwright end-to-end coverage.
 - `apps/docs/`: React/Vite documentation site. `apps/studio/` is a separate Vite UI.
 - `PROGRESS.md`: verified behavior, known gaps, and active technical context; update it when changing a tracked capability.
@@ -18,7 +18,7 @@ Use pnpm 11 (the version is pinned in `package.json`).
 ```bash
 pnpm install                         # install workspace dependencies
 pnpm build                           # build every workspace package/app
-pnpm --filter @dwc/core test         # run the Vitest unit suite
+pnpm --filter duckwc test         # run the Vitest unit suite
 pnpm --filter playground e2e         # run Playwright browser tests
 pnpm --filter playground dev         # start the interactive demo
 pnpm --filter docs dev               # start the docs site
@@ -36,7 +36,7 @@ There is no repository-wide formatter. Preserve the conventions of the file you 
 
 ## Testing Guidelines
 
-Add or update focused Vitest coverage for every core behavior change, including success, failure, and message/stream edge cases. Name tests as readable behavior statements within `describe("module", ...)`. Run the smallest relevant suite first, then `pnpm --filter @dwc/core test`. Changes to the demo, preview, or Vite integration should also run `pnpm --filter playground e2e`.
+Add or update focused Vitest coverage for every core behavior change, including success, failure, and message/stream edge cases. Name tests as readable behavior statements within `describe("module", ...)`. Run the smallest relevant suite first, then `pnpm --filter duckwc test`. Changes to the demo, preview, or Vite integration should also run `pnpm --filter playground e2e`.
 
 ## Commit & Pull Request Guidelines
 

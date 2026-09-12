@@ -5,12 +5,12 @@ import DocPage from '../components/DocPage';
 function Installation() {
   return (
     <DocPage title="Installation">
-      <CodeBlock>{'npm install @dwc/core'}</CodeBlock>
+      <CodeBlock>{'npm install duckwc'}</CodeBlock>
       <p>Then boot it — no configuration required for the basics:</p>
       <CodeBlock>
-        {`import { bootDWC } from "@dwc/core";
+        {`import { bootWC } from "duckwc";
 
-const dwc = bootDWC();`}
+const dwc = bootWC();`}
       </CodeBlock>
       <h2>Enable cross-origin isolation (recommended)</h2>
       <p>
@@ -23,7 +23,7 @@ const dwc = bootDWC();`}
 Cross-Origin-Embedder-Policy: require-corp`}
       </CodeBlock>
       <p>
-        This is optional — without these headers <code>@dwc/core</code> still works, just via a slower fallback and
+        This is optional — without these headers <code>duckwc</code> still works, just via a slower fallback and
         without the shell/sync-exec bridges. See <Link to="/docs/cross-origin-isolation">Cross-origin isolation</Link>{' '}
         for how to add them with Vite or any other static host.
       </p>

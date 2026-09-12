@@ -20,7 +20,7 @@ importers:
       '@codemirror/lang-javascript':
         specifier: ^6.2.5
         version: 6.2.5
-      '@dwc/core':
+      'duckwc':
         specifier: workspace:*
         version: link:../../packages/core
       '@uiw/react-codemirror':
@@ -124,7 +124,7 @@ importers:
 
   examples/playground:
     dependencies:
-      '@dwc/core':
+      'duckwc':
         specifier: workspace:*
         version: link:../../packages/core
       '@xterm/xterm':

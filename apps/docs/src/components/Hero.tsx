@@ -40,7 +40,7 @@ function Hero() {
           <div className="overflow-x-auto px-[18px] pt-4 pb-[18px] font-mono text-[12.8px] leading-[1.72] text-[var(--color-text-dim)]">
             <TermLine>
               <span className="text-[var(--color-text-faint)]">$</span>{' '}
-              <span className="text-[var(--color-accent2)]">bootDWC</span>()
+              <span className="text-[var(--color-accent2)]">bootWC</span>()
               <span className="text-[var(--color-text-faint)]">  // no await needed</span>
             </TermLine>
             <TermLine>

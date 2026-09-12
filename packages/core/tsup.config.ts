@@ -26,7 +26,7 @@ export default defineConfig([
     // only exist inside this package's own dist/, so a consumer bundler
     // (e.g. Vite) that copies one of these worker files out to its own
     // assets/ dir - rather than recursively re-bundling it - ships a file
-    // whose imports 404. Confirmed live: @dwc/core/dist/workers/fs/worker.js
+    // whose imports 404. Confirmed live: duckwc/dist/workers/fs/worker.js
     // importing "../../chunk-*.js" broke exactly this way once deployed.
     splitting: false,
   },

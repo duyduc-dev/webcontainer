@@ -1,4 +1,4 @@
-# @dwc/core
+# duckwc
 
 A WebContainer-style sandbox that runs in the browser: a virtual filesystem, a
 shell, real `node`/`npm` execution against the live npm registry, and live
@@ -8,17 +8,17 @@ required. Inspired by [StackBlitz WebContainers](https://webcontainers.io/).
 ## Install
 
 ```bash
-npm install @dwc/core
+npm install duckwc
 ```
 
 ## Quick start
 
 ```ts
-import { bootDWC } from "@dwc/core";
+import { bootWC } from "duckwc";
 
-// No `await` needed — bootDWC() returns real, immediately usable handles.
+// No `await` needed — bootWC() returns real, immediately usable handles.
 // Every call queues behind the kernel worker's boot handshake internally.
-const dwc = bootDWC();
+const dwc = bootWC();
 
 await dwc.fs.mkdir("/project", { recursive: true });
 await dwc.fs.writeFile("/project/hello.txt", "hello world");
@@ -28,7 +28,7 @@ const result = await dwc.shell.exec("cd /project && pwd");
 // { output: "/project\n", cwd: "/project" }
 ```
 
-`await bootDWC()` still works too — `await` on a plain object that isn't a
+`await bootWC()` still works too — `await` on a plain object that isn't a
 Promise just resolves to it on the next microtask, so nothing breaks if you
 were relying on the old call shape. Use `await dwc.ready` if you want to know
 boot succeeded (or catch why it didn't) without making an actual call.
@@ -183,7 +183,7 @@ Two things this requires that can't be automated by the library:
    accepts a same-origin URL — there's no bundler magic (unlike the
    `new Worker(new URL(...))` calls this package uses internally) that can
    make a `node_modules` file reachable at a stable public URL for this.
-   Resolve the built file via the `@dwc/core/preview-sw` export and copy it
+   Resolve the built file via the `duckwc/preview-sw` export and copy it
    into wherever your app serves static assets from its origin root (see
    `examples/playground/scripts/copy-preview-sw.mjs` for a working example
    with Vite).
@@ -247,7 +247,7 @@ up-to-date build log.
 
 ## Development of this repo
 
-The steps above are for *using* the published `@dwc/core` package in your
+The steps above are for *using* the published `duckwc` package in your
 own app. If you're working on this library itself (or its demo playground):
 
 ```bash

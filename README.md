@@ -7,7 +7,7 @@ Inspired by [StackBlitz WebContainers](https://webcontainers.io/), built as
 its own kernel/worker architecture.
 
 This repo is a pnpm monorepo. The thing you actually install and use in your
-own app is the **`@dwc/core`** package under `packages/core`. This guide
+own app is the **`duckwc`** package under `packages/core`. This guide
 walks through using it — for repo-local development (building this repo
 itself, running its own demo), see
 [`packages/core/README.md`](packages/core/README.md#development-of-this-repo)
@@ -16,18 +16,18 @@ and [`PROGRESS.md`](PROGRESS.md).
 ## Install
 
 ```bash
-npm install @dwc/core
+npm install duckwc
 ```
 
 ## 1. Boot the sandbox
 
 ```ts
-import { bootDWC } from "@dwc/core";
+import { bootWC } from "duckwc";
 
-const dwc = bootDWC(); // synchronous - no await needed
+const dwc = bootWC(); // synchronous - no await needed
 ```
 
-That's the entire setup on the JavaScript side. `bootDWC()` spins up the
+That's the entire setup on the JavaScript side. `bootWC()` spins up the
 kernel/filesystem workers under the hood and returns real, immediately
 usable handles (`dwc.fs`, `dwc.process`, `dwc.shell`, `dwc.preview`) — every
 call on them transparently waits for the underlying boot handshake, so
@@ -46,7 +46,7 @@ Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-**This is optional** — without these headers `@dwc/core` still works, just
+**This is optional** — without these headers `duckwc` still works, just
 via a slower fallback and without the shell/sync-exec bridges. If you want
 full functionality, add them to whatever serves your page. With Vite:
 
@@ -80,7 +80,7 @@ way it creates its own internal Workers, since
 `navigator.serviceWorker.register()` only accepts a same-origin URL you
 serve yourself:
 
-1. Copy the built file at the package's `@dwc/core/preview-sw` export into
+1. Copy the built file at the package's `duckwc/preview-sw` export into
    your app's static output (e.g. `public/dwc-preview-sw.js` for
    Vite/Next/CRA-style setups):
 
@@ -89,7 +89,7 @@ serve yourself:
    import { copyFileSync } from "node:fs";
    import { createRequire } from "node:module";
    const require = createRequire(import.meta.url);
-   copyFileSync(require.resolve("@dwc/core/preview-sw"), "public/dwc-preview-sw.js");
+   copyFileSync(require.resolve("duckwc/preview-sw"), "public/dwc-preview-sw.js");
    ```
 
 2. Register it and point an iframe at a port your guest server listens on:
@@ -109,9 +109,9 @@ serve yourself:
 ## 4. A minimal end-to-end example
 
 ```ts
-import { bootDWC } from "@dwc/core";
+import { bootWC } from "duckwc";
 
-const dwc = bootDWC();
+const dwc = bootWC();
 
 await dwc.fs.mkdir("/project", { recursive: true });
 await dwc.fs.writeFile(

@@ -40,7 +40,7 @@ iframe.src = dwc.preview.url(port); // "/__dwc_preview__/<port>/"`}
         <li>
           <strong>Serve the Service Worker script yourself</strong>, at (or above) the scope you pass to{' '}
           <code>enable()</code>. <code>navigator.serviceWorker.register()</code> only accepts a same-origin URL.
-          Resolve the built file via the <code>@dwc/core/preview-sw</code> export and copy it into wherever your app
+          Resolve the built file via the <code>duckwc/preview-sw</code> export and copy it into wherever your app
           serves static assets from its origin root.
         </li>
         <li>
@@ -54,7 +54,7 @@ iframe.src = dwc.preview.url(port); // "/__dwc_preview__/<port>/"`}
 import { copyFileSync } from "node:fs";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
-copyFileSync(require.resolve("@dwc/core/preview-sw"), "public/dwc-preview-sw.js");`}
+copyFileSync(require.resolve("duckwc/preview-sw"), "public/dwc-preview-sw.js");`}
       </CodeBlock>
 
       <h2>No real origin isolation</h2>

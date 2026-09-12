@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 // So the built SW script has to be copied into Vite's public/ dir, which is
 // served verbatim from the origin root.
 const require = createRequire(import.meta.url);
-const src = require.resolve("@dwc/core/preview-sw");
+const src = require.resolve("duckwc/preview-sw");
 const dest = fileURLToPath(new URL("../public/dwc-preview-sw.js", import.meta.url));
 
 mkdirSync(dirname(dest), { recursive: true });

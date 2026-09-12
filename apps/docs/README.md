@@ -1,6 +1,6 @@
 # docs
 
-The public overview page for `duck-webcontainer-api` / `@dwc/core` — React +
+The public overview page for `duck-webcontainer-api` / `duckwc` — React +
 Vite + Tailwind CSS, one component per file under `src/components/`.
 Deployed to GitHub Pages automatically on push to `main` (see
 `.github/workflows/deploy-docs.yml`), at `duyduc-dev.github.io/webcontainer/`.

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { bootDWC } from "./dwc";
+import { bootWC } from "./dwc";
 
 /** Replies "ok" to every request after a real (fake-timer-driven) delay, so
  * boot-completion timing is actually observable in these tests rather than
@@ -24,7 +24,7 @@ class UnresponsiveWorker {
   terminate() {}
 }
 
-describe("bootDWC (synchronous boot facade)", () => {
+describe("bootWC (synchronous boot facade)", () => {
   const originalWorker = globalThis.Worker;
 
   beforeEach(() => {
@@ -40,7 +40,7 @@ describe("bootDWC (synchronous boot facade)", () => {
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = DelayedEchoWorker;
 
-    const dwc = bootDWC();
+    const dwc = bootWC();
 
     expect(dwc.fs).toBeDefined();
     expect(dwc.process).toBeDefined();
@@ -55,18 +55,18 @@ describe("bootDWC (synchronous boot facade)", () => {
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = DelayedEchoWorker;
 
-    const dwc = bootDWC();
+    const dwc = bootWC();
     const mkdirPromise = dwc.fs.mkdir("/project", { recursive: true });
 
     await vi.runAllTimersAsync();
     await expect(mkdirPromise).resolves.not.toBeInstanceOf(Error);
   });
 
-  it("`await bootDWC()` (the old call shape) still works - await on a plain non-Promise object just resolves to it", async () => {
+  it("`await bootWC()` (the old call shape) still works - await on a plain non-Promise object just resolves to it", async () => {
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = DelayedEchoWorker;
 
-    const dwc = await bootDWC();
+    const dwc = await bootWC();
     expect(dwc.fs).toBeDefined();
   });
 
@@ -74,7 +74,7 @@ describe("bootDWC (synchronous boot facade)", () => {
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = DelayedEchoWorker;
 
-    const dwc = bootDWC();
+    const dwc = bootWC();
     let resolved = false;
     dwc.ready.then(() => {
       resolved = true;
@@ -89,7 +89,7 @@ describe("bootDWC (synchronous boot facade)", () => {
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = UnresponsiveWorker;
 
-    const dwc = bootDWC({ bootTimeoutMs: 100 });
+    const dwc = bootWC({ bootTimeoutMs: 100 });
     const readyRejection = expect(dwc.ready).rejects.toThrow(/did not respond/);
 
     await vi.advanceTimersByTimeAsync(100);
@@ -100,7 +100,7 @@ describe("bootDWC (synchronous boot facade)", () => {
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = DelayedEchoWorker;
 
-    const dwc = bootDWC();
+    const dwc = bootWC();
     const handler = vi.fn();
     dwc.addEventListener("listen", handler);
 
@@ -117,7 +117,7 @@ describe("bootDWC (synchronous boot facade)", () => {
     // @ts-expect-error test stub, not a full Worker implementation
     globalThis.Worker = DelayedEchoWorker;
 
-    const dwc = bootDWC();
+    const dwc = bootWC();
     const handler = vi.fn();
     const unsubscribe = dwc.addEventListener("listen", handler);
     unsubscribe();

@@ -1,5 +1,5 @@
-export { bootDWC } from "./dwc";
-export type { BootDWCOptions, BootDWCReturn } from "./dwc";
+export { bootWC } from "./dwc";
+export type { BootWCOptions, BootWCReturn } from "./dwc";
 export {
   DWCError,
   ERR_BOOT_TIMEOUT,
