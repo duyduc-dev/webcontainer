@@ -1,6 +1,11 @@
 {
   "name": "duckwc",
-  "version": "0.1.0",
+  "version": "0.1.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/duyduc-dev/webcontainer.git",
+    "directory": "packages/core"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -19,7 +24,8 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "clean": "rm -rf dist",
-    "test": "vitest run"
+    "test": "vitest run",
+    "publish:github": "node scripts/publish-github-package.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
