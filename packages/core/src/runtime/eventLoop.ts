@@ -107,12 +107,24 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
 
   const waitForWake = (): Promise<void> => new Promise((resolve) => wakeResolvers.push(resolve));
 
+  // Timers are a public boundary for guest code. Letting a non-function enter
+  // the queue postpones the TypeError until a later drain turn, where it can
+  // take down the whole process and hides the caller that supplied it. Node
+  // rejects this synchronously at scheduling time, so do the same here.
+  const validateTask = (fn: unknown): asserts fn is Task => {
+    if (typeof fn !== "function") {
+      throw new TypeError(`The "callback" argument must be of type function. Received type ${typeof fn}`);
+    }
+  };
+
   const nextTick = (fn: Task, ...args: unknown[]): void => {
+    validateTask(fn);
     nextTickQueue.push({ fn, args });
     wake();
   };
 
   const setTimeoutFn = (fn: Task, delayMs = 0, ...args: unknown[]): number => {
+    validateTask(fn);
     const id = nextId++;
     timers.set(id, { id, fn, args, dueAt: now() + Math.max(0, delayMs) });
     // A runOnce() already parked in the activeHandles-or-earlier-timer wait
@@ -128,6 +140,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
   };
 
   const setImmediateFn = (fn: Task, ...args: unknown[]): number => {
+    validateTask(fn);
     const id = nextId++;
     immediates.set(id, { id, fn, args });
     wake();
@@ -236,6 +249,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
   };
 
   const queueClose = (fn: Task, ...args: unknown[]): void => {
+    validateTask(fn);
     closeCallbacks.push({ fn, args });
     wake();
   };

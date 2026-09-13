@@ -26,6 +26,33 @@ below is already committed and pushed to `origin/main`; the GitHub Actions
 workflow (`.github/workflows/deploy-docs.yml`) redeploys automatically on
 every push that touches `apps/docs/**` or `packages/core/**`.
 
+### Current working-tree verification — Vite 8 preview and HMR
+
+- `examples/playground` now completes the real Vite **8.0.0** flow: scaffold,
+  install the explicitly pinned WASI Rolldown binding, start the dev server,
+  wait for its reachable `listen(5173)` event, and render it in the preview
+  iframe. The browser regression test also changes `src/style.css` through
+  `dwc.fs` and observes the new color without a page reload.
+- Vite 8 builds its HMR WebSocket URL from the preview iframe's host-prefixed
+  location, so the injected socket bridge strips only that preview prefix
+  before the kernel dials the guest. The Service Worker rewrites initial HTML
+  attributes for preview navigation, but deliberately leaves JavaScript module
+  source unchanged: Vite's HMR packets use guest module IDs such as
+  `/src/style.css`, which must match `import.meta.hot` exactly. Runtime module
+  requests route through the Service Worker's per-iframe target map instead.
+- Preview WebSocket sends and closes now retain their channel ID, preventing
+  multiple sandboxes on one host page from cross-routing control frames.
+  The Docs Node and React examples intentionally share one lazy `bootWC()`
+  instance instead: their projects and servers stay isolated by directory and
+  port (`/project`: 3000; `/react-vite-app`: 5173), while a single preview
+  relay owns both iframe routes. The React preview now waits for DWC's
+  reachable `listen(5173)` event rather than only Vite's stdout banner.
+  `pnpm --filter docs build` and `pnpm --filter docs lint` pass; re-run the
+  interactive Docs browser check before publishing this uncommitted change.
+  Verified on 2026-09-13 with `pnpm --filter duckwc test` (701 passing),
+  `pnpm --filter duckwc build`, `pnpm --filter playground build`, and
+  `pnpm --filter playground e2e`.
+
 ### Shipped and verified
 
 - **CI actually builds `duckwc` before `apps/docs`, and redeploys on
@@ -83,6 +110,28 @@ every push that touches `apps/docs/**` or `packages/core/**`.
   into an automatic kill-old/spawn-new restart (uses `process.kill()`
   above), like `vite dev`; the whole file set persists to
   `localStorage`, with a **Reset** control back to the example.
+- **React + Vite Playground example:** a separate, on-demand section sits
+  below the original Node Playground, leaving that established demo unchanged.
+  It shares the Docs page's lazy `bootWC()` runtime, loads npm, scaffolds the
+  Vite 7 React starter, and
+  uses Vite 7.3.6 with `esbuild-wasm` and `@rollup/wasm-node` (rather than
+  Vite 8's Rolldown/WASI runtime, which traps before binding its port). React
+  18's local UMD builds are served from Vite's `public/` directory and JSX is
+  transformed by Babel in classic-runtime mode; this avoids the browser
+  runtime's unresolved CJS dependency-optimizer lifecycle while preserving a
+  real local React runtime, Vite server, editor, and preview. The preview
+  Service Worker rewrites initial root-relative HTML attributes and tracks
+  each iframe's target port, so the React and Node servers share one runtime
+  without cross-routing assets or relay responses. The standalone
+  `examples/playground` Vite 8 work remains separate.
+  The static module preloader now also follows literal
+  `path.resolve(__dirname, ...)` / `path.join(__dirname, ...)` paths before
+  guest boot; this fixes npm 10.9.2's dynamically required
+  `lib/cli/entry.js` when SharedArrayBuffer is unavailable. Docs' local Vite
+  server emits COOP/COEP headers for features that need cross-origin
+  isolation. Core tests and Docs lint/build pass. A fresh local browser run
+  verified the `Vite + React` iframe, its local React runtime, and an
+  interactive counter with no page errors or failed preview requests.
 
 ### Previously-suspected known limitation — CLOSED, was a testing artifact
 
@@ -3587,6 +3636,22 @@ current risk. The playground nevertheless uses the explicitly requested,
 exact `vite@8.0.0` and matching
 `@rolldown/binding-wasm32-wasi@1.0.0-rc.9` pair; do not upgrade either
 package implicitly until that browser flow passes.
+
+### Follow-up: normal React plugin experiment on Vite 8.2
+
+The standalone playground was also tested with a real React scaffold,
+`@vitejs/plugin-react`, Vite 8.2, and the exact Rolldown 1.2.1/
+`@napi-rs`/`@emnapi` dependency family used by the comparable implementation.
+The matching package family fixes the loader ABI error (`setLastError is not a
+function`), and `worker_threads.Worker` now dispatches EventTarget-style
+`onmessage`/`onerror` handlers as well as EventEmitter events; the latter is
+required by Rolldown's WASI filesystem proxy and is covered by a focused unit
+test. Startup nevertheless traps in the browser Worker before Vite listens:
+`RuntimeError: operation does not support unaligned accesses`. This is an
+upstream browser-worker WASI/Rolldown limitation, not a React-plugin setup
+error. The playground therefore retains the verified vanilla Vite 8.0 path;
+do not move Docs to normal `@vitejs/plugin-react` Vite 8 until this runtime
+trap is resolved upstream.
 
 ## 14. `dwc.npm` moved into the library, `dwc.shell.spawn()` added for live progress, and a long-standing "create-vite: command not found" bug finally root-caused (took three tries)
 

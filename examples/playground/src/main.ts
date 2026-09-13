@@ -1,6 +1,43 @@
 import { bootWC } from "duckwc";
 
 const dwc = bootWC();
+// Keep the live sandbox available to host-side editor integrations (and the
+// playground's CSS-HMR regression test) after booting it.
+Object.assign(window, { dwc });
+const terminal = document.getElementById("terminal");
+const MAX_TERMINAL_CHARS = 40_000;
+
+function terminalValue(value: unknown): string {
+  if (typeof value === "string") return value;
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function log(...values: unknown[]): void {
+  console.log(...values);
+  terminal?.append(`${values.map(terminalValue).join(" ")}\n`);
+  if (terminal && terminal.textContent && terminal.textContent.length > MAX_TERMINAL_CHARS) {
+    terminal.textContent = terminal.textContent.slice(-MAX_TERMINAL_CHARS);
+  }
+  terminal?.scrollTo({ top: terminal.scrollHeight });
+}
+
+function logError(...values: unknown[]): void {
+  console.error(...values);
+  terminal?.append(`${values.map(terminalValue).join(" ")}\n`);
+  if (terminal && terminal.textContent && terminal.textContent.length > MAX_TERMINAL_CHARS) {
+    terminal.textContent = terminal.textContent.slice(-MAX_TERMINAL_CHARS);
+  }
+  terminal?.scrollTo({ top: terminal.scrollHeight });
+}
+
+function compactEmbeddedModuleUrls(text: string): string {
+  return text.replace(/data:text\/javascript[^,\s]*,[A-Za-z0-9+/=_-]+/g, "data:text/javascript,[embedded module]");
+}
 
 function pipeToConsole(
   stream: ReadableStream<Uint8Array>,
@@ -14,10 +51,10 @@ function pipeToConsole(
       const { done, value } = await reader.read();
       if (done) {
         const trailing = decoder.decode();
-        if (trailing) console.log(`[${label}]`, trailing);
+        if (trailing) log(`[${label}]`, compactEmbeddedModuleUrls(trailing));
         return;
       }
-      console.log(`[${label}]`, decoder.decode(value, { stream: true }));
+      log(`[${label}]`, compactEmbeddedModuleUrls(decoder.decode(value, { stream: true })));
     }
   })();
 }
@@ -37,7 +74,7 @@ function pipeToConsoleUntil(
     const logAndCheck = (text: string): void => {
       if (!text) return;
 
-      console.log(`[${label}]`, text);
+      log(`[${label}]`, compactEmbeddedModuleUrls(text));
       if (found) return;
 
       const combined = trailingText + text;
@@ -67,7 +104,7 @@ function pipeToConsoleUntil(
         }
       } catch (error) {
         if (found) {
-          console.error(`[${label}] output stream failed after startup:`, error);
+          logError(`[${label}] output stream failed after startup:`, error);
         } else {
           reject(error);
         }
@@ -78,20 +115,40 @@ function pipeToConsoleUntil(
   });
 }
 
+function waitForListen(
+  dwc: ReturnType<typeof bootWC>,
+  port: number,
+  timeoutMs = 60_000,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      unsubscribe();
+      reject(new Error(`timed out waiting for a guest server on port ${port}`));
+    }, timeoutMs);
+    const unsubscribe = dwc.addEventListener("listen", (event: { port?: unknown }) => {
+      if (event.port !== port) return;
+      window.clearTimeout(timeout);
+      unsubscribe();
+      resolve();
+    });
+  });
+}
+
 const main = async () => {
   const npm = await dwc.npm.install("10.9.2");
-  console.log("npm loaded result:", npm.version, npm.fileCount);
+  log("npm loaded result:", npm.version, npm.fileCount);
 
   const shellResult = await dwc.shell.exec("npm -v");
-  console.log("shell exec result:", shellResult);
+  log("shell exec result:", shellResult);
 
   const shell = await dwc.shell.exec("ls -la /bin");
-  console.log("shell exec result 1:", shell.output.split("\n"));
+  log("shell exec result 1:", shell.output.split("\n"));
 
   const shell2 = await dwc.shell.exec(
     "npm create vite@latest my-vite-app -- --template vanilla",
   );
-  console.log("shell exec result 2:", shell2.output);
+  log("[npm create vite] exit=0");
+  log("[npm create vite]", shell2.output);
 
   // Vite 8 uses Rolldown. Declare its WASI binding explicitly: some Rolldown
   // releases do not expose it as an optional dependency for npm to select.
@@ -116,7 +173,7 @@ const main = async () => {
   };
   scaffoldedPkg.scripts = { ...scaffoldedPkg.scripts, dev: "vite --configLoader native" };
   await dwc.fs.writeFile(packageJsonPath, JSON.stringify(scaffoldedPkg, null, 2));
-  console.log("[vite] pinned Vite 8.0.0 with its explicit WASI Rolldown binding");
+  log("[vite] pinned Vite 8.0.0 with its explicit WASI Rolldown binding");
 
   // The vanilla scaffold has no external app dependencies. Disabling Vite's
   // optional discovery scan avoids the unsupported picomatch path. The native
@@ -130,7 +187,7 @@ const main = async () => {
 };
 `,
   );
-  console.log("[vite] disabled automatic dependency discovery");
+  log("[vite] disabled automatic dependency discovery");
 
   // const createProc = await dwc.process.spawn("/bin/npm.js", {
   //   argv: ["create", "vite@latest", "my-app", "--", "--template", "vanilla"],
@@ -142,7 +199,7 @@ const main = async () => {
   // await createProc.exit;
 
   const shell3 = await dwc.shell.exec("cat /my-vite-app/src/main.js");
-  console.log("shell exec result 3:", shell3.output.split("\n"));
+  log("shell exec result 3:", shell3.output.split("\n"));
 
   // The WASI binding declares `cpu: wasm32`, while DWC correctly reports a
   // stable x64 package platform. npm 10's Arborist validates direct package
@@ -152,7 +209,7 @@ const main = async () => {
   // Shell streams every output chunk. Its browser relay deliberately is not a
   // TTY, so request npm's textual progress and lifecycle-script output instead
   // of its animated terminal progress bar.
-  console.log("[install] Resolving and downloading dependencies...");
+  log("[install] Resolving and downloading dependencies...");
   const install = await dwc.shell.spawn(
     "npm install --force --loglevel=info --foreground-scripts",
     { cwd: "/my-vite-app" },
@@ -160,38 +217,43 @@ const main = async () => {
   pipeToConsole(install.stdout, "install");
   pipeToConsole(install.stderr, "install");
   const installExit = await install.exit;
-  console.log("npm install exit code:", installExit);
+  log(`[npm install] exit=${installExit}`);
   if (installExit !== 0) return;
 
   const shell4 = await dwc.shell.exec("cd my-vite-app && ls -la");
-  console.log("shell exec result 4:", shell4.output.split("\n"));
+  log("shell exec result 4:", shell4.output.split("\n"));
 
+  // Subscribe before starting the shell command: Vite can reach listen(5173)
+  // before its first stdout chunk is observed, and the preview relay is only
+  // ready after the kernel has registered the port's pipe listener.
+  const viteListening = waitForListen(dwc, 5173);
   const dev = await dwc.shell.spawn("npm run dev", { cwd: "/my-vite-app" });
   const devReady = pipeToConsoleUntil(dev.stdout, "dev", "Local:");
   pipeToConsole(dev.stderr, "dev");
   // A dev server never exits on its own - dev.exit intentionally isn't
   // awaited here. dev.kill() is available to stop it later.
 
-  // Vite first probes port 5173 before it starts serving. Waiting for the
-  // ready banner avoids previewing that short-lived probe connection.
+  // The banner indicates Vite initialized; the listen event proves the
+  // preview relay can actually dial its registered server.
   try {
-    await devReady;
+    await Promise.all([devReady, viteListening]);
   } catch (error) {
+    dev.kill();
     const exitCode = await dev.exit;
-    console.error("npm run dev exited before Vite became ready:", exitCode, error);
+    logError("npm run dev exited before Vite was preview-ready:", exitCode, error);
     return;
   }
 
-  await dwc.preview.enable({ swUrl: "/dwc-preview-sw.js" });
+  await dwc.preview.enable({ swUrl: "/dwc-preview-sw.js", id: "playground" });
   const url = dwc.preview.url(5173, "/");
   const preview = document.getElementById("preview") as HTMLIFrameElement | null;
   if (!preview) {
-    console.error("[preview] no #preview iframe found");
+    logError("[preview] no #preview iframe found");
     return;
   }
 
   preview.src = url;
-  console.log("[preview] iframe.src ->", preview.src);
+  log("[preview] iframe.src ->", preview.src);
 };
 
-main();
+void main().catch((error) => logError("[playground] startup failed:", error));

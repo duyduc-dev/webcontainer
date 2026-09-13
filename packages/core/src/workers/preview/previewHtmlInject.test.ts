@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { injectPreviewWsBootstrap } from "./previewHtmlInject";
+import { injectPreviewWsBootstrap, rewritePreviewRootUrls } from "./previewHtmlInject";
 
 describe("injectPreviewWsBootstrap", () => {
   it("inserts the bootstrap script right after an opening <head> tag", () => {
@@ -30,5 +30,31 @@ describe("injectPreviewWsBootstrap", () => {
     const result = injectPreviewWsBootstrap("<head></head>");
     expect(result).toContain("__dwcRealWebSocket");
     expect(result).toContain("window.WebSocket = DwcWebSocket");
+    expect(result).toContain("__dwcPreviewSocketCount");
+  });
+
+  it("keeps close messages on the preview channel that opened the socket", () => {
+    const result = injectPreviewWsBootstrap("<head></head>");
+
+    expect(result).toContain('type: "dwc:ws-send", previewId: PREVIEW_ID');
+    expect(result).toContain('type: "dwc:ws-close", previewId: PREVIEW_ID');
+  });
+
+  it("routes root-relative HTML attributes through the preview", () => {
+    const result = rewritePreviewRootUrls(
+      '<script src="/@vite/client"></script><link href="/src/style.css"><script>import \'/src/main.jsx\'</script><style>x { background: url(/logo.svg) }</style>',
+      "/webcontainer/__dwc_preview__/react-vite/5173/",
+    );
+
+    expect(result).toContain('src="/webcontainer/__dwc_preview__/react-vite/5173/@vite/client"');
+    expect(result).toContain('href="/webcontainer/__dwc_preview__/react-vite/5173/src/style.css"');
+    expect(result).toContain("import '/src/main.jsx'");
+    expect(result).toContain("url(/logo.svg)");
+  });
+
+  it("leaves protocol-relative URLs untouched", () => {
+    expect(rewritePreviewRootUrls('<script src="//cdn.example/app.js"></script>', "/preview/")).toContain(
+      'src="//cdn.example/app.js"',
+    );
   });
 });

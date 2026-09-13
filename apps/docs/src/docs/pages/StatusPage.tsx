@@ -28,8 +28,8 @@ function StatusPage() {
           <code>dwc.shell.exec()</code> doesn't expose a real exit code
         </li>
         <li>
-          <code>dwc.preview.enable()</code> assumes a single top-level host page relaying for a single sandbox
-          instance
+          Multiple previews on one host page must pass distinct <code>id</code> values to{' '}
+          <code>dwc.preview.enable()</code>
         </li>
         <li>
           <code>npm install</code> fetches directly from <code>registry.npmjs.org</code> over the network — no

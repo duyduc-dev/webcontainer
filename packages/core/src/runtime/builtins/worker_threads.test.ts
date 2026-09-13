@@ -59,7 +59,7 @@ describe("createWorkerThreadsModule", () => {
     expect(() => new (Worker as unknown as new (path: string) => unknown)("/some-script.js")).toThrow(/not supported/i);
   });
 
-  it("Worker spawns via the provided spawnWorker hook and relays real message/error events", async () => {
+  it("Worker spawns via the provided spawnWorker hook and relays EventEmitter plus EventTarget handlers", async () => {
     const target = new EventTarget();
     const fakeWorker = Object.assign(target, {
       postMessage: vi.fn(),
@@ -70,13 +70,28 @@ describe("createWorkerThreadsModule", () => {
     const spawnWorker = vi.fn().mockReturnValue({ worker: fakeWorker, ready: Promise.resolve(), ref, unref });
 
     const { Worker } = createWorkerThreadsModule(TestEventEmitter, { spawnWorker });
-    const worker = new (Worker as unknown as new (path: string) => InstanceType<typeof TestEventEmitter> & { postMessage(v: unknown): void; terminate(): Promise<number> })("/wasi-worker.mjs");
+    const worker = new (Worker as unknown as new (path: string) => InstanceType<typeof TestEventEmitter> & {
+      onerror: ((event: ErrorEvent) => void) | null;
+      onmessage: ((event: MessageEvent) => void) | null;
+      postMessage(v: unknown): void;
+      terminate(): Promise<number>;
+    })("/wasi-worker.mjs");
 
     expect(spawnWorker).toHaveBeenCalledWith("/wasi-worker.mjs", {});
 
     const received = new Promise((resolve) => worker.on("message", resolve));
+    const propertyReceived = new Promise((resolve) => {
+      worker.onmessage = (event) => resolve(event.data);
+    });
     target.dispatchEvent(new MessageEvent("message", { data: "hi" }));
     await expect(received).resolves.toBe("hi");
+    await expect(propertyReceived).resolves.toBe("hi");
+
+    const propertyError = new Promise((resolve) => {
+      worker.onerror = (event) => resolve(event.type);
+    });
+    target.dispatchEvent(new Event("error"));
+    await expect(propertyError).resolves.toBe("error");
 
     // postMessage() queues on the (already-resolved, here) `ready` promise -
     // real callers see this as synchronous-looking, but a test needs a

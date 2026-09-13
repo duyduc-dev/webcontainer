@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createEventLoop } from "../eventLoop";
 import { createNodeModules } from "./loader";
 
 const fakeProcess = () => ({
@@ -271,6 +272,51 @@ describe("vendored 'http' Server (real net.js underneath, real HTTP/1.1 wire for
     const second = await doRequest();
     expect(first).toContain("response 1");
     expect(second).toContain("response 2");
+    server.close();
+  });
+
+  it("returns a complete response over the kernel-relayed pipe used by previews", async () => {
+    const eventLoop = createEventLoop();
+    const process = { env: {}, nextTick: eventLoop.nextTick };
+    const outbound: Array<{ type: string; connId: number; chunk?: Uint8Array }> = [];
+    let receiveRelayMessage!: (message: { type: string; connId: number; path?: string; chunk?: Uint8Array }) => void;
+    const nodeModules = createNodeModules(process, {
+      queueClose: eventLoop.queueClose,
+      ref: eventLoop.ref,
+      unref: eventLoop.unref,
+      netBridge: {
+        listen: () => {},
+        closeServer: () => {},
+        pipeListen: () => {},
+        pipeCloseServer: () => {},
+        pipeConnect: async () => ({ connId: 0 }),
+        postRaw: (message) => outbound.push(message),
+        onMessage: (handler) => {
+          receiveRelayMessage = handler;
+        },
+      },
+    });
+    (globalThis as { Buffer?: unknown }).Buffer = (nodeModules.require("buffer") as { Buffer: unknown }).Buffer;
+    const http = nodeModules.require("http") as {
+      createServer(handler: (req: any, res: any) => void): { listen(port: number): unknown; close(): unknown };
+    };
+
+    const server = http.createServer((_req: any, res: any) => res.end("from relay"));
+    server.listen(5173);
+    receiveRelayMessage({ type: "pipe-open", connId: 1, path: "\0dwc-tcp:5173" });
+    receiveRelayMessage({
+      type: "pipe-data",
+      connId: 1,
+      chunk: new TextEncoder().encode("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    });
+
+    for (let i = 0; i < 20 && !outbound.some((message) => message.type === "pipe-shutdown"); i++) {
+      await eventLoop.runOnce();
+    }
+
+    const response = outbound.find((message) => message.type === "pipe-data")?.chunk;
+    expect(new TextDecoder().decode(response)).toContain("from relay");
+    expect(outbound).toContainEqual(expect.objectContaining({ type: "pipe-shutdown", connId: 1 }));
     server.close();
   });
 

@@ -31,7 +31,7 @@ declare const self: ServiceWorkerGlobalScope;
 
 import { PREVIEW_SCOPE_PREFIX } from "../../apis/previewProtocol";
 import type { PreviewRelayRequest, PreviewRelayResponse } from "../../apis/previewProtocol";
-import { injectPreviewWsBootstrap } from "./previewHtmlInject";
+import { injectPreviewWsBootstrap, rewritePreviewRootUrls } from "./previewHtmlInject";
 
 type RelayResult = Extract<PreviewRelayResponse, { ok: true }>["result"];
 
@@ -60,7 +60,18 @@ const NAVIGATION_ISOLATION_HEADERS: Record<string, string> = {
 const SCOPE_PATH = new URL(self.registration.scope).pathname;
 const EFFECTIVE_PREVIEW_PREFIX = (SCOPE_PATH.endsWith("/") ? SCOPE_PATH.slice(0, -1) : SCOPE_PATH) + PREVIEW_SCOPE_PREFIX;
 
-const clientPorts = new Map<string, number>();
+interface PreviewTarget {
+  port: number;
+  path: string;
+  previewId?: string;
+}
+
+const previewBaseForTarget = ({ port, previewId }: PreviewTarget): string =>
+  `${EFFECTIVE_PREVIEW_PREFIX}${previewId ? `${previewId}/` : ""}${port}/`;
+
+// Requests for an iframe's assets no longer carry the preview URL prefix,
+// so remember both its port and channel from its initial navigation.
+const clientPorts = new Map<string, Omit<PreviewTarget, "path">>();
 const pending = new Map<string, { resolve: (result: RelayResult) => void; reject: (error: unknown) => void }>();
 
 self.addEventListener("install", () => {
@@ -97,21 +108,41 @@ async function relay(request: Omit<PreviewRelayRequest, "requestId">): Promise<R
   });
 }
 
-function resolvePreviewTarget(url: URL, event: FetchEvent): { port: number; path: string } | undefined {
+function resolvePreviewTarget(url: URL, event: FetchEvent): PreviewTarget | undefined {
   if (url.pathname.startsWith(EFFECTIVE_PREVIEW_PREFIX)) {
     const rest = url.pathname.slice(EFFECTIVE_PREVIEW_PREFIX.length);
-    const slashIndex = rest.indexOf("/");
-    const port = Number(slashIndex === -1 ? rest : rest.slice(0, slashIndex));
-    const path = (slashIndex === -1 ? "/" : rest.slice(slashIndex)) + url.search;
+    const firstSlash = rest.indexOf("/");
+    const firstSegment = firstSlash === -1 ? rest : rest.slice(0, firstSlash);
+    const firstIsPort = /^\d+$/.test(firstSegment);
+    const afterFirst = firstSlash === -1 ? "" : rest.slice(firstSlash + 1);
+    const secondSlash = afterFirst.indexOf("/");
+    const portText = firstIsPort ? firstSegment : secondSlash === -1 ? afterFirst : afterFirst.slice(0, secondSlash);
+    const port = Number(portText);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+
+    const previewId = firstIsPort ? undefined : firstSegment;
+    const path =
+      (firstIsPort
+        ? firstSlash === -1
+          ? "/"
+          : rest.slice(firstSlash)
+        : secondSlash === -1
+          ? "/"
+          : afterFirst.slice(secondSlash)) + url.search;
 
     const clientId = event.clientId || event.resultingClientId;
-    if (clientId) clientPorts.set(clientId, port);
-    return { port, path };
+    if (clientId) clientPorts.set(clientId, { port, previewId });
+    return { port, path, previewId };
   }
 
-  const trackedPort = clientPorts.get(event.clientId);
-  if (trackedPort !== undefined) {
-    return { port: trackedPort, path: url.pathname + url.search };
+  // Module imports and worker-owned follow-up requests can identify the
+  // iframe through `resultingClientId` instead of `clientId`. Treat both as
+  // the same preview client so runtime-generated Vite URLs keep reaching the
+  // guest server, not the host application.
+  const clientId = event.clientId || event.resultingClientId;
+  const trackedTarget = clientPorts.get(clientId);
+  if (trackedTarget) {
+    return { ...trackedTarget, path: url.pathname + url.search };
   }
 
   return undefined;
@@ -128,7 +159,7 @@ self.addEventListener("fetch", (event) => {
     const body = method === "GET" || method === "HEAD" ? undefined : new Uint8Array(await event.request.arrayBuffer());
 
     try {
-      const result = await relay({ port: target.port, path: target.path, method, headers, body });
+      const result = await relay({ port: target.port, path: target.path, method, headers, body, previewId: target.previewId });
       // The real Headers constructor doesn't accept an array value for one
       // key (used above for a repeated response header) - folded into a
       // single comma-separated value, same as how HTTP itself represents
@@ -143,11 +174,14 @@ self.addEventListener("fetch", (event) => {
       const isHtml = typeof contentType === "string" && contentType.toLowerCase().includes("text/html");
       // Only ever rewritten when uncompressed - this worker never decodes
       // content-encoding (fetchFromGuestServer/HttpParser hand back raw
-      // wire bytes), and Vite's own dev server doesn't compress by default,
-      // so this covers the real case and explicitly no-ops the rare
-      // compressed one rather than corrupting it.
+      // wire bytes), and Vite's own dev server doesn't compress by default.
+      // Do not rewrite JavaScript: Vite's HMR message names modules by their
+      // guest path, and rewriting the module's `import.meta.hot` identifier
+      // makes it impossible for the client to match that message. Runtime
+      // module and asset requests are instead recovered through clientPorts.
       if (isHtml && !responseHeaders["content-encoding"]) {
-        responseBody = new TextEncoder().encode(injectPreviewWsBootstrap(new TextDecoder().decode(result.body)));
+        const rewritten = rewritePreviewRootUrls(new TextDecoder().decode(result.body), previewBaseForTarget(target));
+        responseBody = new TextEncoder().encode(isHtml ? injectPreviewWsBootstrap(rewritten) : rewritten);
         // The original length is stale once the body is rewritten; a
         // Response derives the real length from the buffer itself, so an
         // absent header is safe where a wrong one may not be.

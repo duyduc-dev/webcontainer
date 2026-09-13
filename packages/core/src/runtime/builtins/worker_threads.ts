@@ -104,6 +104,8 @@ interface ThreadContext {
 
 interface WorkerInstance extends EventEmitterLike {
   threadId: number;
+  onmessage: ((event: MessageEvent) => void) | null;
+  onerror: ((event: ErrorEvent) => void) | null;
   postMessage(value: unknown, transferList?: Transferable[]): void;
   terminate(): Promise<number>;
   ref(): this;
@@ -130,6 +132,11 @@ const createWorkerThreadsModule = (EventEmitterCtor: new () => EventEmitterLike,
 
   class DwcWorker extends (EventEmitterCtor as new () => EventEmitterLike) {
     threadId: number;
+    // Node's Worker also exposes EventTarget-style properties. Rolldown's
+    // WASI binding uses `worker.onmessage = …` for its filesystem-proxy
+    // replies, rather than EventEmitter's `.on("message", …)`.
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: ((event: ErrorEvent) => void) | null = null;
     #worker: Worker;
     #refSpawn: () => void;
     #unrefSpawn: () => void;
@@ -191,10 +198,12 @@ const createWorkerThreadsModule = (EventEmitterCtor: new () => EventEmitterLike,
           (this as unknown as EventEmitterLike).emit("error", new Error((data as { message: string }).message));
           return;
         }
+        this.onmessage?.(event as MessageEvent);
         (this as unknown as EventEmitterLike).emit("message", data);
       });
       worker.addEventListener("error", (event) => {
         const errorEvent = event as ErrorEvent;
+        this.onerror?.(errorEvent);
         (this as unknown as EventEmitterLike).emit("error", errorEvent.error ?? new Error(errorEvent.message));
       });
       // A channel-grant failure (e.g. not cross-origin isolated) surfaces the

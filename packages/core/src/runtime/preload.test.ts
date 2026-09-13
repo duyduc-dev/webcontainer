@@ -62,6 +62,23 @@ describe("preloadModuleGraph", () => {
     expect(Object.keys(sources).sort()).toEqual(["/bin/npm.js", "/usr/lib/node_modules/npm/bin/npm-cli.js"]);
   });
 
+  it("preloads a __dirname path that is required through a variable, like npm's CLI bootstrap", async () => {
+    const files = {
+      "/usr/lib/node_modules/npm/lib/cli.js": `const cliEntry = require("node:path").resolve(__dirname, "cli/entry.js");
+module.exports = require(cliEntry);`,
+      "/usr/lib/node_modules/npm/lib/cli/entry.js": "module.exports = 1;",
+    };
+
+    const { sources } = await preloadModuleGraph(
+      "/usr/lib/node_modules/npm/lib/cli.js",
+      readFileFrom(files),
+    );
+
+    expect(sources["/usr/lib/node_modules/npm/lib/cli/entry.js"]).toBe(
+      "module.exports = 1;",
+    );
+  });
+
   it("skips an unresolvable relative require instead of throwing", async () => {
     const files = { "/index.js": "require('./missing');" };
 

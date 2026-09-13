@@ -108,12 +108,11 @@ interface FsBuiltinCore {
 }
 
 interface FsBuiltin extends FsBuiltinCore {
-  // Real Node's callback-form fs.readFile - traced need: real npm's own
-  // read-cmd-shim does `promisify(fs.readFile)` then calls it as
-  // `readFile(path)`, expecting a `.toString()`-able Buffer back. No traced
-  // caller passes an encoding option, so (like readFileSync) this doesn't
-  // accept one either - it always resolves the raw (wrapped) bytes.
-  readFile(path: string, callback: NodeCallback<Uint8Array>): void;
+  // Real Node's callback-form fs.readFile accepts both
+  // `readFile(path, callback)` and `readFile(path, options, callback)`.
+  // Vite uses the latter while loading its config and source modules.
+  readFile(path: string | URL, callback: NodeCallback<Uint8Array>): void;
+  readFile(path: string | URL, options: { encoding?: string | null; flag?: string } | string | null, callback: NodeCallback<Uint8Array | string>): void;
   // Real Node's callback-form fs.stat - traced need: real npm's own
   // mkdirp dependency (bundled inside tar) checks whether its target
   // directory already exists via `fs.stat(dir, cb)` before creating it.
@@ -476,17 +475,30 @@ const createFsBuiltin = (
     },
   };
 
-  const readFile: FsBuiltin["readFile"] = (path, callback) => {
+  const readFile = ((
+    path: string | URL,
+    optionsOrCallback: { encoding?: string | null; flag?: string } | string | null | NodeCallback<Uint8Array>,
+    maybeCallback?: NodeCallback<Uint8Array | string>,
+  ) => {
+    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+    const options = typeof optionsOrCallback === "function" ? undefined : optionsOrCallback;
+    if (typeof callback !== "function") {
+      throw new TypeError('The "cb" argument must be of type function');
+    }
+
     nextTick(() => {
       try {
-        // core.readFileSync(path) (no encoding) already wraps via
-        // wrapBuffer - don't wrap a second time here.
-        callback(null, core.readFileSync(path));
+        // core.readFileSync(path) (no encoding) already wraps via wrapBuffer
+        // - don't wrap a second time here. An options object with no encoding
+        // (or a null encoding) is still the raw-buffer form in real Node.
+        const encoding = typeof options === "string" ? options : options?.encoding;
+        const result = encoding ? core.readFileSync(path, encoding) : core.readFileSync(path);
+        callback(null, result);
       } catch (error) {
         callback(error);
       }
     });
-  };
+  }) as FsBuiltin["readFile"];
 
   const stat: FsBuiltin["stat"] = (path, callback) => {
     nextTick(() => {

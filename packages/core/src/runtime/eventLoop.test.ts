@@ -303,4 +303,12 @@ describe("eventLoop", () => {
     expect(order).toEqual([]);
     expect(loop.hasPendingWork()).toBe(false);
   });
+
+  it("rejects a non-function callback before it can corrupt a later drain", () => {
+    const loop = createEventLoop();
+
+    expect(() => loop.setTimeout(null as unknown as () => void, 0)).toThrow(
+      'The "callback" argument must be of type function',
+    );
+  });
 });

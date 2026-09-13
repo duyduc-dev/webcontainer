@@ -91,12 +91,95 @@ describe("createPreviewAPI - url()", () => {
 
     expect(preview.url(3000)).toBe("/__dwc_preview__/3000/");
   });
+
+  it("namespaces a URL when enable() receives a preview channel id", async () => {
+    stubBrowserGlobals();
+    const registration = { scope: "http://localhost:5173/" };
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        serviceWorker: {
+          register: vi.fn().mockResolvedValue(registration),
+          ready: Promise.resolve(registration),
+          addEventListener: vi.fn(),
+        },
+      },
+    });
+
+    const preview = createPreviewAPI(vi.fn(), vi.fn());
+    await preview.enable({ swUrl: "/dwc-preview-sw.js", id: "react-vite" });
+
+    expect(preview.url(3000)).toBe("/__dwc_preview__/react-vite/3000/");
+  });
+
+  it("rejects an invalid preview channel id before registering a Service Worker", async () => {
+    stubBrowserGlobals();
+    const register = vi.fn();
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { serviceWorker: { register } },
+    });
+
+    const preview = createPreviewAPI(vi.fn(), vi.fn());
+    await expect(preview.enable({ swUrl: "/dwc-preview-sw.js", id: "not/a-channel" })).rejects.toThrow("id must begin");
+    expect(register).not.toHaveBeenCalled();
+  });
+});
+
+describe("createPreviewAPI - preview channels", () => {
+  afterEach(restoreBrowserGlobals);
+
+  it("only lets the sandbox owning a relay channel answer that request", async () => {
+    stubBrowserGlobals();
+    const registration = { scope: "http://localhost:5173/" };
+    const serviceWorkerMessageListener = vi.fn();
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        serviceWorker: {
+          register: vi.fn().mockResolvedValue(registration),
+          ready: Promise.resolve(registration),
+          addEventListener: serviceWorkerMessageListener,
+        },
+      },
+    });
+
+    const nodeRequest = vi.fn().mockResolvedValue({ status: 200, statusMessage: "OK", headers: {}, body: new Uint8Array() });
+    const reactRequest = vi.fn().mockResolvedValue({ status: 200, statusMessage: "OK", headers: {}, body: new Uint8Array() });
+    const nodePreview = createPreviewAPI(nodeRequest, vi.fn());
+    const reactPreview = createPreviewAPI(reactRequest, vi.fn());
+    await nodePreview.enable({ swUrl: "/dwc-preview-sw.js", id: "node" });
+    await reactPreview.enable({ swUrl: "/dwc-preview-sw.js", id: "react-vite" });
+
+    const postMessage = vi.fn();
+    const event = {
+      data: { requestId: "request-1", previewId: "react-vite", port: 5173, path: "/", method: "GET", headers: {} },
+      source: { postMessage },
+    };
+    for (const [type, handler] of serviceWorkerMessageListener.mock.calls) {
+      if (type === "message") handler(event);
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(nodeRequest).not.toHaveBeenCalled();
+    expect(reactRequest).toHaveBeenCalledWith("PREVIEW_FETCH", {
+      port: 5173,
+      path: "/",
+      init: { method: "GET", headers: {}, body: undefined },
+    });
+    expect(postMessage).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("createPreviewAPI - WebSocket relay (dwc:ws-* iframe messages)", () => {
   afterEach(restoreBrowserGlobals);
 
-  const enablePreview = async (request: (type: string, payload?: unknown) => Promise<any>, on: (type: string, handler: (payload?: any) => void) => () => void) => {
+  const enablePreview = async (
+    request: (type: string, payload?: unknown) => Promise<any>,
+    on: (type: string, handler: (payload?: any) => void) => () => void,
+    id?: string,
+  ) => {
     const { addEventListener } = stubBrowserGlobals();
     const registration = { scope: "http://localhost:5173/" };
     Object.defineProperty(globalThis, "navigator", {
@@ -105,7 +188,7 @@ describe("createPreviewAPI - WebSocket relay (dwc:ws-* iframe messages)", () => 
     });
 
     const preview = createPreviewAPI(request, on);
-    await preview.enable({ swUrl: "/dwc-preview-sw.js" });
+    await preview.enable({ swUrl: "/dwc-preview-sw.js", id });
 
     const call = addEventListener.mock.calls.find(([type]) => type === "message");
     const handleIframeMessage = call?.[1] as (event: { origin: string; data: unknown; source: unknown }) => void;
@@ -141,15 +224,19 @@ describe("createPreviewAPI - WebSocket relay (dwc:ws-* iframe messages)", () => 
     expect(postMessage).toHaveBeenCalledWith({ type: "dwc:ws-open-error", requestId: "r1", error: expect.stringContaining("nothing is listening") }, "http://localhost:5173");
   });
 
-  it("forwards dwc:ws-send and dwc:ws-close to their matching request types", async () => {
+  it("forwards dwc:ws-send and dwc:ws-close to their matching request types and acknowledges a clean close", async () => {
     const request = vi.fn().mockResolvedValue(undefined);
-    const { handleIframeMessage } = await enablePreview(request, vi.fn());
+    const { handleIframeMessage } = await enablePreview(request, vi.fn(), "playground");
+    const postMessage = vi.fn();
 
-    handleIframeMessage({ origin: "http://localhost:5173", data: { type: "dwc:ws-send", wsId: 1, data: "hello" }, source: { postMessage: vi.fn() } });
-    handleIframeMessage({ origin: "http://localhost:5173", data: { type: "dwc:ws-close", wsId: 1, code: 1000, reason: "bye" }, source: { postMessage: vi.fn() } });
+    handleIframeMessage({ origin: "http://localhost:5173", data: { type: "dwc:ws-send", previewId: "playground", wsId: 1, data: "hello" }, source: { postMessage: vi.fn() } });
+    handleIframeMessage({ origin: "http://localhost:5173", data: { type: "dwc:ws-close", previewId: "playground", wsId: 1, code: 1000, reason: "bye" }, source: { postMessage } });
+    await Promise.resolve();
+    await Promise.resolve();
 
     expect(request).toHaveBeenCalledWith("PREVIEW_WS_SEND", { wsId: 1, data: "hello" });
     expect(request).toHaveBeenCalledWith("PREVIEW_WS_CLOSE", { wsId: 1, code: 1000, reason: "bye" });
+    expect(postMessage).toHaveBeenCalledWith({ type: "dwc:ws-close", wsId: 1, code: 1000, reason: "bye" }, "http://localhost:5173");
   });
 
   it("ignores messages from a different origin", async () => {

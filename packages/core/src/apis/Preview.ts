@@ -17,6 +17,8 @@ interface PreviewFetchResult {
 interface PreviewEnableOptions {
   swUrl: string;
   scope?: string;
+  /** Routes this preview independently when a page hosts several sandboxes. */
+  id?: string;
 }
 
 interface PreviewAPI {
@@ -69,6 +71,7 @@ const createPreviewAPI = (request: Requester, on: Subscriber): PreviewAPI => {
   // matching this API's original root-only behavior for a caller who
   // doesn't need `enable()` at all (using `fetch()` directly instead).
   let previewScope: string | null = null;
+  let previewId: string | undefined;
 
   const fetchImpl = (port: number, path: string, init: PreviewFetchInit = {}): Promise<PreviewFetchResult> =>
     request<PreviewFetchResult>("PREVIEW_FETCH", { port, path, init });
@@ -76,6 +79,7 @@ const createPreviewAPI = (request: Requester, on: Subscriber): PreviewAPI => {
   const handleRelay = (event: MessageEvent): void => {
     const message = event.data as PreviewRelayRequest;
     if (!message || typeof message.requestId !== "string" || typeof message.port !== "number") return;
+    if (message.previewId !== previewId) return;
 
     const source = event.source as ServiceWorker | null;
     if (!source) return;
@@ -103,6 +107,7 @@ const createPreviewAPI = (request: Requester, on: Subscriber): PreviewAPI => {
     if (event.origin !== location.origin) return;
     const message = event.data;
     if (!message || typeof message.type !== "string" || !message.type.startsWith("dwc:ws-")) return;
+    if (message.previewId !== previewId) return;
     const source = event.source;
     if (!source) return;
 
@@ -119,8 +124,21 @@ const createPreviewAPI = (request: Requester, on: Subscriber): PreviewAPI => {
     } else if (message.type === "dwc:ws-send") {
       request("PREVIEW_WS_SEND", { wsId: message.wsId, data: message.data }).catch(() => {});
     } else if (message.type === "dwc:ws-close") {
-      request("PREVIEW_WS_CLOSE", { wsId: message.wsId, code: message.code, reason: message.reason }).catch(() => {});
-      wsSourceByWsId.delete(message.wsId);
+      const wsId = message.wsId;
+      const code = typeof message.code === "number" ? message.code : 1000;
+      const reason = typeof message.reason === "string" ? message.reason : "";
+      const closeSource = source as Window;
+
+      // A client-initiated close has no guest-originated close frame to
+      // route back through preview:ws-close. Acknowledge it after the
+      // kernel has released the pipe so the iframe's WebSocket leaves
+      // CLOSING, just as a native WebSocket eventually dispatches close.
+      request("PREVIEW_WS_CLOSE", { wsId, code, reason }).then(
+        () => closeSource.postMessage({ type: "dwc:ws-close", wsId, code, reason }, location.origin),
+        () => closeSource.postMessage({ type: "dwc:ws-close", wsId, code: 1006, reason: "close failed" }, location.origin),
+      ).finally(() => {
+        wsSourceByWsId.delete(wsId);
+      });
     }
   };
 
@@ -136,15 +154,20 @@ const createPreviewAPI = (request: Requester, on: Subscriber): PreviewAPI => {
     url: (port, path = "/") => {
       const scope = previewScope ?? "/";
       const base = scope.endsWith("/") ? scope.slice(0, -1) : scope;
-      return `${base}${PREVIEW_SCOPE_PREFIX}${port}${path}`;
+      const channel = previewId ? `${previewId}/` : "";
+      return `${base}${PREVIEW_SCOPE_PREFIX}${channel}${port}${path}`;
     },
 
     enable: (options) => {
       if (!("serviceWorker" in navigator)) {
         return Promise.reject(new Error("dwc preview: Service Workers are not supported in this environment"));
       }
+      if (options.id !== undefined && !/^[A-Za-z][A-Za-z0-9_-]*$/.test(options.id)) {
+        return Promise.reject(new Error("dwc preview: id must begin with a letter and contain only letters, numbers, '_' or '-'"));
+      }
 
       if (!serviceWorkerReady) {
+        previewId = options.id;
         serviceWorkerReady = navigator.serviceWorker.register(options.swUrl, { scope: options.scope ?? "/" }).then(async (registration) => {
           previewScope = new URL(registration.scope).pathname;
           await navigator.serviceWorker.ready;

@@ -521,6 +521,17 @@ describe("createFsBuiltin readFile (callback form)", () => {
     expect(result.toString()).toBe("wrapped:hi");
   });
 
+  it("accepts the (path, options, callback) overload Vite uses for source modules", async () => {
+    const fs = createFsBuiltin(makeIO(), (callback) => queueMicrotask(callback));
+    fs.writeFileSync("/config.js", "export default {}");
+
+    const source = await new Promise<string>((resolve, reject) => {
+      fs.readFile("/config.js", { encoding: "utf8" }, (error, result) => (error ? reject(error) : resolve(result as string)));
+    });
+
+    expect(source).toBe("export default {}");
+  });
+
   it("rejects (via the callback's error) for a missing file", async () => {
     const fs = createFsBuiltin(makeIO());
     const error = await new Promise((resolve) => {

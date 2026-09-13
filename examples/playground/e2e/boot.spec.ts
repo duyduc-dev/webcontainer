@@ -36,7 +36,7 @@ test("the playground demo scaffolds a real Vite project, installs it, and shows 
   // inspectable: real Vite content, not a blank or crashed page.
   await expect
     .poll(async () => page.frame({ url: /__dwc_preview__/ })?.title() ?? null, { timeout: 30_000 })
-    .toBe("my-app");
+    .toBe("my-vite-app");
 
   // At least one real image asset loads correctly - the exact regression
   // this guards against (fs.createReadStream, see PROGRESS.md item 10's
@@ -102,15 +102,14 @@ test("the playground demo scaffolds a real Vite project, installs it, and shows 
   // visible in the live preview, with no reload - real Vite CSS HMR swaps
   // the <style> tag's content in place once it learns (via fs.watch, now
   // real - see runtime/builtins/fs.ts and workers/fs/worker.ts's own watch
-  // registry) that /my-app/src/style.css changed. dwc.fs.writeFile() goes
+  // registry) that /my-vite-app/src/style.css changed. dwc.fs.writeFile() goes
   // through the exact same kernel FS_REQUEST -> FS Worker -> VirtualFileSystem
   // path chokidar's own fs.watch(dir, {recursive}) call is registered
   // against, so this exercises the real, full path end to end - not a
   // shortcut that only proves the transport (the block above) or only the
   // watch registry in isolation (covered by unit tests elsewhere).
   const marker = "rgb(1, 2, 3)";
-  const cssPath = "/my-app/src/style.css";
-
+  const cssPath = "/my-vite-app/src/style.css";
   await page.evaluate(
     async ({ path, markerColor }) => {
       const dwc = (

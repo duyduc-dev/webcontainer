@@ -1,4 +1,4 @@
-import { normalize } from "../kernel/fs/path";
+import { dirname, normalize } from "../kernel/fs/path";
 import { isBuiltinSpecifier } from "./builtins";
 import { fileCandidates, nodeModulesDirsFrom, relativeModuleCandidates, splitBareSpecifier } from "./resolveSpecifier";
 
@@ -9,10 +9,35 @@ interface PreloadResult {
 }
 
 const REQUIRE_PATTERN = /require\(\s*["']([^"']+)["']\s*\)/g;
+// Some CommonJS packages (including npm's lib/cli.js) calculate a local
+// module path first, then pass that variable to require(). The normal
+// literal-require scan cannot see the later require(variable), but the
+// dirname-relative path is still statically knowable here. Keep this narrow:
+// only string-literal path.resolve()/path.join() segments rooted at __dirname
+// are preloaded, never arbitrary computed paths.
+const DIRNAME_PATH_PATTERN =
+  /(?:require\(\s*["'](?:node:)?path["']\s*\)|\bpath)\.(?:resolve|join)\(\s*__dirname((?:\s*,\s*["'][^"']+["'])+)\s*\)/g;
+const QUOTED_PATH_SEGMENT_PATTERN = /["']([^"']+)["']/g;
 
 const extractRequireSpecifiers = (source: string): string[] => {
   const specifiers = new Set<string>();
   for (const match of source.matchAll(REQUIRE_PATTERN)) specifiers.add(match[1]);
+  return [...specifiers];
+};
+
+/** Literal __dirname paths are often assigned to a local variable before
+ * require(variable). Preloading them preserves that ordinary CommonJS pattern
+ * even when a process has no SharedArrayBuffer-backed synchronous FS bridge. */
+const extractDirnamePathSpecifiers = (source: string): string[] => {
+  const specifiers = new Set<string>();
+
+  for (const match of source.matchAll(DIRNAME_PATH_PATTERN)) {
+    const segments = [...match[1]!.matchAll(QUOTED_PATH_SEGMENT_PATTERN)].map(
+      (segment) => segment[1]!,
+    );
+    if (segments.length > 0) specifiers.add(segments.join("/"));
+  }
+
   return [...specifiers];
 };
 
@@ -94,6 +119,13 @@ const preloadModuleGraph = async (entryPath: string, readFile: ReadFile): Promis
     const path = queue.shift()!;
     const source = sources[path];
 
+    const enqueue = (resolved: { path: string; source: string } | null): void => {
+      if (!resolved || seen.has(resolved.path)) return;
+      seen.add(resolved.path);
+      sources[resolved.path] = resolved.source;
+      queue.push(resolved.path);
+    };
+
     for (const rawSpecifier of extractRequireSpecifiers(source)) {
       // Mirrors moduleLoader.ts's createRequire(): a "node:"-prefixed
       // specifier names the same builtin/file a bare one would.
@@ -105,11 +137,14 @@ const preloadModuleGraph = async (entryPath: string, readFile: ReadFile): Promis
         : specifier.startsWith("/")
           ? await tryReadFirstExisting(fileCandidates(specifier), readFile)
           : await resolveBareSpecifier(path, specifier, readFile, sources);
-      if (!resolved || seen.has(resolved.path)) continue;
+      enqueue(resolved);
+    }
 
-      seen.add(resolved.path);
-      sources[resolved.path] = resolved.source;
-      queue.push(resolved.path);
+    for (const relativePath of extractDirnamePathSpecifiers(source)) {
+      const resolvedPath = relativePath.startsWith("/")
+        ? relativePath
+        : normalize(`${dirname(path)}/${relativePath}`);
+      enqueue(await tryReadFirstExisting(fileCandidates(resolvedPath), readFile));
     }
   }
 

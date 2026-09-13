@@ -25,17 +25,23 @@ const PREVIEW_WS_BOOTSTRAP_SCRIPT = `(function () {
   window.__dwcRealWebSocket = window.WebSocket;
 
   // Recovered from THIS document's own initial navigation path (still
-  // "${PREVIEW_SCOPE_PREFIX}<port>/...") captured eagerly, right now,
+  // "${PREVIEW_SCOPE_PREFIX}<id>/<port>/..." or the legacy path without
+  // an id) captured eagerly, right now,
   // before any client-side routing (Vite/React Router/etc.) can rewrite
   // location.pathname via the History API - not from the URL passed to
   // the WebSocket constructor, which is robust to whatever hostname/port
   // Vite's own client bundle computes internally.
-  var portMatch = /${PREVIEW_SCOPE_PREFIX.replace(/\//g, "\\/")}(\\d+)/.exec(location.pathname);
-  var DEFAULT_PORT = portMatch ? Number(portMatch[1]) : null;
+  var previewMatch = /${PREVIEW_SCOPE_PREFIX.replace(/\//g, "\\/")}(?:([^\\/]+)\\/)?(\\d+)/.exec(location.pathname);
+  var PREVIEW_ID = previewMatch && previewMatch[1] ? previewMatch[1] : undefined;
+  var DEFAULT_PORT = previewMatch ? Number(previewMatch[2]) : null;
 
   var nextRequestId = 1;
   var pendingByRequestId = new Map();
   var socketsByWsId = new Map();
+  var updateSocketCount = function () {
+    window.__dwcPreviewSocketCount = socketsByWsId.size;
+  };
+  updateSocketCount();
 
   // A real \`class ... extends EventTarget\` (rather than the old
   // \`Object.create(EventTarget.prototype)\` pattern) is required, not just
@@ -54,13 +60,23 @@ const PREVIEW_WS_BOOTSTRAP_SCRIPT = `(function () {
       this._wsId = null;
 
       var requestId = String(nextRequestId++);
+      // Vite 8 derives its HMR URL from location.href, which is the host
+      // preview route ("/__dwc_preview__/<id>/<port>/...") rather than the
+      // guest server's own root. The kernel dials the guest directly, so
+      // strip only that route prefix while retaining Vite's query token.
+      var guestPath = target.pathname + target.search;
+      if (previewMatch && target.pathname.startsWith(previewMatch[0])) {
+        guestPath = target.pathname.slice(previewMatch[0].length) || "/";
+        guestPath += target.search;
+      }
       pendingByRequestId.set(requestId, this);
       window.parent.postMessage(
         {
           type: "dwc:ws-open",
           requestId: requestId,
+          previewId: PREVIEW_ID,
           port: DEFAULT_PORT,
-          path: target.pathname + target.search,
+          path: guestPath,
           protocols: protocols == null ? [] : Array.isArray(protocols) ? protocols : [protocols],
         },
         location.origin,
@@ -69,13 +85,13 @@ const PREVIEW_WS_BOOTSTRAP_SCRIPT = `(function () {
 
     send(data) {
       if (this.readyState !== DwcWebSocket.OPEN) throw new DOMException("Failed to execute 'send' on 'WebSocket': still in CONNECTING state.", "InvalidStateError");
-      window.parent.postMessage({ type: "dwc:ws-send", wsId: this._wsId, data: String(data) }, location.origin);
+      window.parent.postMessage({ type: "dwc:ws-send", previewId: PREVIEW_ID, wsId: this._wsId, data: String(data) }, location.origin);
     }
 
     close(code, reason) {
       if (this.readyState === DwcWebSocket.CLOSING || this.readyState === DwcWebSocket.CLOSED) return;
       this.readyState = DwcWebSocket.CLOSING;
-      window.parent.postMessage({ type: "dwc:ws-close", wsId: this._wsId, code: code, reason: reason }, location.origin);
+      window.parent.postMessage({ type: "dwc:ws-close", previewId: PREVIEW_ID, wsId: this._wsId, code: code, reason: reason }, location.origin);
     }
   }
 
@@ -116,12 +132,14 @@ const PREVIEW_WS_BOOTSTRAP_SCRIPT = `(function () {
       opened.protocol = message.protocol || "";
       opened.readyState = DwcWebSocket.OPEN;
       socketsByWsId.set(message.wsId, opened);
+      updateSocketCount();
       opened.dispatchEvent(new Event("open"));
     } else if (message.type === "dwc:ws-open-error") {
       var failed = pendingByRequestId.get(message.requestId);
       if (!failed) return;
       pendingByRequestId.delete(message.requestId);
       failed.readyState = DwcWebSocket.CLOSED;
+      updateSocketCount();
       failed.dispatchEvent(new Event("error"));
       failed.dispatchEvent(new CloseEvent("close", { code: 1006, reason: String(message.error) }));
     } else if (message.type === "dwc:ws-message") {
@@ -131,6 +149,7 @@ const PREVIEW_WS_BOOTSTRAP_SCRIPT = `(function () {
       var closing = socketsByWsId.get(message.wsId);
       if (!closing) return;
       socketsByWsId.delete(message.wsId);
+      updateSocketCount();
       closing.readyState = DwcWebSocket.CLOSED;
       closing.dispatchEvent(new CloseEvent("close", { code: message.code, reason: message.reason || "" }));
     }

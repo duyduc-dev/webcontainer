@@ -1,6 +1,10 @@
-type Token = { type: "word"; value: string } | { type: "and" } | { type: "redirect-out" };
+type Token =
+  | { type: "word"; value: string }
+  | { type: "and" }
+  | { type: "redirect-out" };
 
-const isAnd = (line: string, index: number): boolean => line[index] === "&" && line[index + 1] === "&";
+const isAnd = (line: string, index: number): boolean =>
+  (line[index] === "&" && line[index + 1] === "&") || line[index] === ";";
 
 /** Tokenizes a shell line: bare/quoted words, `&&` chaining, and `>` output redirection. */
 const tokenize = (line: string): Token[] => {
@@ -41,7 +45,13 @@ const tokenize = (line: string): Token[] => {
     }
 
     let value = "";
-    while (i < line.length && line[i] !== " " && line[i] !== "\t" && line[i] !== ">" && !isAnd(line, i)) {
+    while (
+      i < line.length &&
+      line[i] !== " " &&
+      line[i] !== "\t" &&
+      line[i] !== ">" &&
+      !isAnd(line, i)
+    ) {
       value += line[i];
       i++;
     }

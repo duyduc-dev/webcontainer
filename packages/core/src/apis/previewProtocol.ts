@@ -16,6 +16,8 @@ const PREVIEW_SCOPE_PREFIX = "/__dwc_preview__/";
 
 interface PreviewRelayRequest {
   requestId: string;
+  /** Optional preview channel for multiple duckwc instances sharing a page. */
+  previewId?: string;
   port: number;
   path: string;
   method: string;
