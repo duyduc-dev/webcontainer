@@ -296,4 +296,4 @@ const createWorkerThreadsModule = (EventEmitterCtor: new () => EventEmitterLike,
 };
 
 export { createWorkerThreadsModule };
-export type { SpawnedWorker, ThreadContext, WorkerOptions };
+export type { EventEmitterLike, SpawnedWorker, ThreadContext, WorkerOptions };

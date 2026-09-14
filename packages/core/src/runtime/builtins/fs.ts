@@ -493,7 +493,7 @@ const createFsBuiltin = (
         // (or a null encoding) is still the raw-buffer form in real Node.
         const encoding = typeof options === "string" ? options : options?.encoding;
         const result = encoding ? core.readFileSync(path, encoding) : core.readFileSync(path);
-        callback(null, result);
+        (callback as NodeCallback<Uint8Array | string>)(null, result);
       } catch (error) {
         callback(error);
       }

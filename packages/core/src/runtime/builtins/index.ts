@@ -16,7 +16,7 @@ import { createUrlModule } from "./url";
 import { createVmModule } from "./vm";
 import { createWasiModule } from "./wasi";
 import { createWorkerThreadsModule } from "./worker_threads";
-import type { ThreadContext } from "./worker_threads";
+import type { EventEmitterLike, ThreadContext } from "./worker_threads";
 import pathModule from "./path";
 import utilModule from "./util";
 import type { FsBuiltin } from "./fs";
@@ -119,7 +119,7 @@ const createBuiltinModules = (
   threadContext: ThreadContext = {},
 ): Record<string, unknown> => {
   const nodeModules = createNodeModules(process, netContext);
-  const EventEmitter = nodeModules.require("events") as new () => { emit(event: string, ...args: unknown[]): boolean };
+  const EventEmitter = nodeModules.require("events") as new () => EventEmitterLike;
   return {
     path: pathModule,
     util: utilModule,

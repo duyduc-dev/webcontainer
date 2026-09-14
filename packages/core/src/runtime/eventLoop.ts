@@ -111,7 +111,7 @@ const createEventLoop = (options: CreateEventLoopOptions = {}): EventLoop => {
   // the queue postpones the TypeError until a later drain turn, where it can
   // take down the whole process and hides the caller that supplied it. Node
   // rejects this synchronously at scheduling time, so do the same here.
-  const validateTask = (fn: unknown): asserts fn is Task => {
+  const validateTask = (fn: unknown): void => {
     if (typeof fn !== "function") {
       throw new TypeError(`The "callback" argument must be of type function. Received type ${typeof fn}`);
     }

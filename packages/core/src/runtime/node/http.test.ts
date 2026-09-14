@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEventLoop } from "../eventLoop";
 import { createNodeModules } from "./loader";
+import type { PipeRelayMessage } from "./bindings/net";
 
 const fakeProcess = () => ({
   env: {},
@@ -279,7 +280,7 @@ describe("vendored 'http' Server (real net.js underneath, real HTTP/1.1 wire for
     const eventLoop = createEventLoop();
     const process = { env: {}, nextTick: eventLoop.nextTick };
     const outbound: Array<{ type: string; connId: number; chunk?: Uint8Array }> = [];
-    let receiveRelayMessage!: (message: { type: string; connId: number; path?: string; chunk?: Uint8Array }) => void;
+    let receiveRelayMessage!: (message: PipeRelayMessage) => void;
     const nodeModules = createNodeModules(process, {
       queueClose: eventLoop.queueClose,
       ref: eventLoop.ref,
