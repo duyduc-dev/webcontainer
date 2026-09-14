@@ -79,14 +79,74 @@ const parseNameList = (inner: string): NameAlias[] => {
   return entries;
 };
 
-const DEFAULT_EXPORT_RE = /export\s+default\s+([^;\n]+);/g;
+// Only the two keywords are matched, never the expression after them: a
+// real `export default` is followed by anything from an identifier to a
+// multi-line object, class or function literal, and rewriting just the
+// keywords into an assignment leaves whatever follows to stand as its own
+// expression. Traced need: real yargs' own platform shim opens with
+// `export default {` and closes many lines later.
+const DEFAULT_EXPORT_RE = /export\s+default\s+/g;
 const DECLARATION_EXPORT_RE = /export\s+(async function|function|class|const|let|var)\s+(\w+)/g;
 const EXPORT_LIST_RE = /export\s*\{([\s\S]*?)\}\s*(?:from\s*(["'])([^"']+)\2)?\s*;?/g;
 const EXPORT_STAR_RE = /export\s*\*\s*from\s*(["'])([^"']+)\1;?/g;
 const IMPORT_DEFAULT_RE = /import\s+(\w+)\s+from\s*(["'])([^"']+)\2;?/g;
 const IMPORT_NAMED_RE = /import\s*\{([\s\S]*?)\}\s*from\s*(["'])([^"']+)\2;?/g;
 const IMPORT_NAMESPACE_RE = /import\s*\*\s*as\s+(\w+)\s+from\s*(["'])([^"']+)\2;?/g;
+// `import Default, { a, b } from '...'` and `import Default, * as ns from
+// '...'` - the combined forms, which neither the default-only nor the
+// named-only pattern matches (the comma breaks both). Traced need: real
+// listr2, reached through Angular's own CLI, opens with
+// `import EventEmitter, { setMaxListeners } from "node:events";`.
+const IMPORT_DEFAULT_AND_NAMED_RE = /import\s+(\w+)\s*,\s*\{([\s\S]*?)\}\s*from\s*(["'])([^"']+)\3;?/g;
+const IMPORT_DEFAULT_AND_NAMESPACE_RE = /import\s+(\w+)\s*,\s*\*\s*as\s+(\w+)\s+from\s*(["'])([^"']+)\3;?/g;
 const IMPORT_SIDE_EFFECT_RE = /import\s*(["'])([^"']+)\1;?/g;
+
+// The names moduleLoader.ts's `new Function` wrapper passes as parameters.
+// A real ESM file is free to declare any of them itself - `const require =
+// createRequire(import.meta.url)` is the common one, and perfectly legal
+// where there is no outer `require` binding - but the same declaration in
+// the wrapper's own scope is a redeclaration SyntaxError, which defeats
+// this whole retry. Traced need: real yargs-parser@22, reached through
+// Angular's CLI.
+const WRAPPER_BINDINGS = ["module", "exports", "require", "__filename", "__dirname", "__dwcImport", "__dwcInteropDefault"];
+
+// Generated code addresses the wrapper's bindings through these aliases,
+// never by their own names. Captured before the body, so a module that
+// shadows one of them inside the added block scope below shadows it only
+// for its OWN code - without this, a rewritten `require(...)` sitting above
+// the module's own `const require` reads that declaration's temporal dead
+// zone instead of the wrapper's parameter.
+const REQUIRE_ALIAS = "__dwcRequireRef";
+const EXPORTS_ALIAS = "__dwcExportsRef";
+const INTEROP_ALIAS = "__dwcInteropRef";
+const FILENAME_ALIAS = "__dwcFilenameRef";
+const DIRNAME_ALIAS = "__dwcDirnameRef";
+// Only the aliases a given module's own rewrite actually needs are
+// emitted - referencing a wrapper binding the caller never passed (the
+// unit tests build a deliberately minimal wrapper) would throw before the
+// module body ever ran.
+const aliasPrologue = (options: { interop: boolean; importMeta: boolean }): string => {
+  const parts = [`${REQUIRE_ALIAS} = require`, `${EXPORTS_ALIAS} = exports`];
+  if (options.interop) parts.push(`${INTEROP_ALIAS} = __dwcInteropDefault`);
+  if (options.importMeta) parts.push(`${FILENAME_ALIAS} = __filename`, `${DIRNAME_ALIAS} = __dirname`);
+  return `const ${parts.join(", ")};`;
+};
+const WRAPPER_BINDING_DECL_RE = new RegExp(`(?:^|[;{}()\\n])\\s*(?:const|let|class)\\s+(?:${WRAPPER_BINDINGS.join("|")})\\b`, "g");
+
+const IMPORT_META_RE = /\bimport\s*\.\s*meta\b/g;
+const IMPORT_META_IDENTIFIER = "__dwcImportMeta";
+// `url` is required lazily inside each accessor rather than at the top of
+// the prologue: a module that merely mentions `import.meta` without ever
+// reading it (the common case - one branch of a config loader) should not
+// pay for loading a builtin, and `resolve()` needs a fresh `require` call
+// anyway to resolve relative to this module.
+const IMPORT_META_PROLOGUE = `const ${IMPORT_META_IDENTIFIER} = {
+  get url() { return ${REQUIRE_ALIAS}("url").pathToFileURL(${FILENAME_ALIAS}).href; },
+  get filename() { return ${FILENAME_ALIAS}; },
+  get dirname() { return ${DIRNAME_ALIAS}; },
+  resolve: function (specifier) { return ${REQUIRE_ALIAS}("url").pathToFileURL(${REQUIRE_ALIAS}.resolve(specifier)).href; },
+};`
+
 
 /**
  * Best-effort rewrite of top-level ESM `import`/`export` statement syntax
@@ -116,21 +176,22 @@ const transformEsmToCjs = (source: string): string => {
     }
   };
 
-  scan(DEFAULT_EXPORT_RE, (match) => {
-    appends.push(`exports.default = ${match[1]};`);
-    return "";
-  });
+  scan(DEFAULT_EXPORT_RE, () => `${EXPORTS_ALIAS}.default = `);
 
   scan(DECLARATION_EXPORT_RE, (match) => {
     const [, keyword, name] = match as unknown as [string, string, string];
-    appends.push(`exports.${name} = ${name};`);
+    appends.push(`${EXPORTS_ALIAS}.${name} = ${name};`);
     return `${keyword} ${name}`;
   });
 
   scan(EXPORT_LIST_RE, (match) => {
     const [, inner, , from] = match as unknown as [string, string, string | undefined, string | undefined];
     for (const { name, alias } of parseNameList(inner)) {
-      appends.push(from !== undefined ? `exports.${alias} = require(${JSON.stringify(from)}).${name};` : `exports.${alias} = ${name};`);
+      appends.push(
+        from !== undefined
+          ? `${EXPORTS_ALIAS}.${alias} = ${REQUIRE_ALIAS}(${JSON.stringify(from)}).${name};`
+          : `${EXPORTS_ALIAS}.${alias} = ${name};`,
+      );
     }
     return "";
   });
@@ -149,24 +210,60 @@ const transformEsmToCjs = (source: string): string => {
   scan(EXPORT_STAR_RE, (match) => {
     const from = match[2]!;
     appends.push(
-      `Object.keys(require(${JSON.stringify(from)})).forEach(function (__dwcReexportKey) { if (__dwcReexportKey !== "default") exports[__dwcReexportKey] = require(${JSON.stringify(from)})[__dwcReexportKey]; });`,
+      `Object.keys(${REQUIRE_ALIAS}(${JSON.stringify(from)})).forEach(function (__dwcReexportKey) { if (__dwcReexportKey !== "default") ${EXPORTS_ALIAS}[__dwcReexportKey] = ${REQUIRE_ALIAS}(${JSON.stringify(from)})[__dwcReexportKey]; });`,
     );
     return "";
   });
 
-  scan(IMPORT_DEFAULT_RE, (match) => `const ${match[1]} = __dwcInteropDefault(require(${JSON.stringify(match[3])}));`);
+  let usesInterop = false;
+
+  scan(IMPORT_DEFAULT_AND_NAMED_RE, (match) => {
+    const [, defaultName, inner, , specifier] = match as unknown as [string, string, string, string, string];
+    usesInterop = true;
+    const bindings = parseNameList(inner)
+      .map(({ name, alias }) => `${name}: ${alias}`)
+      .join(", ");
+    const required = `${REQUIRE_ALIAS}(${JSON.stringify(specifier)})`;
+    return `const ${defaultName} = ${INTEROP_ALIAS}(${required}); const { ${bindings} } = ${required};`;
+  });
+
+  scan(IMPORT_DEFAULT_AND_NAMESPACE_RE, (match) => {
+    const [, defaultName, namespaceName, , specifier] = match as unknown as [string, string, string, string, string];
+    usesInterop = true;
+    const required = `${REQUIRE_ALIAS}(${JSON.stringify(specifier)})`;
+    return `const ${defaultName} = ${INTEROP_ALIAS}(${required}); const ${namespaceName} = ${required};`;
+  });
+
+  scan(IMPORT_DEFAULT_RE, (match) => {
+    usesInterop = true;
+    return `const ${match[1]} = ${INTEROP_ALIAS}(${REQUIRE_ALIAS}(${JSON.stringify(match[3])}));`;
+  });
 
   scan(IMPORT_NAMED_RE, (match) => {
     const [, inner, , specifier] = match as unknown as [string, string, string, string];
     const bindings = parseNameList(inner)
       .map(({ name, alias }) => `${name}: ${alias}`)
       .join(", ");
-    return `const { ${bindings} } = require(${JSON.stringify(specifier)});`;
+    return `const { ${bindings} } = ${REQUIRE_ALIAS}(${JSON.stringify(specifier)});`;
   });
 
-  scan(IMPORT_NAMESPACE_RE, (match) => `const ${match[1]} = require(${JSON.stringify(match[3])});`);
+  scan(IMPORT_NAMESPACE_RE, (match) => `const ${match[1]} = ${REQUIRE_ALIAS}(${JSON.stringify(match[3])});`);
 
-  scan(IMPORT_SIDE_EFFECT_RE, (match) => `require(${JSON.stringify(match[2])});`);
+  scan(IMPORT_SIDE_EFFECT_RE, (match) => `${REQUIRE_ALIAS}(${JSON.stringify(match[2])});`);
+
+  // `import.meta` is a syntax error in anything `new Function` compiles,
+  // not just an unsupported statement - so a single mention of it anywhere
+  // in the file defeats this whole retry, even on a line that never runs.
+  // Traced need: real yargs@18 (reached through Angular's own CLI, which
+  // require()s it from CommonJS) has exactly one `import.meta.resolve(...)`
+  // call, on its `extends`-config branch. Rewritten to a local stand-in
+  // built from the CommonJS bindings the wrapper already provides, so the
+  // three members real code actually reaches for keep working.
+  let usesImportMeta = false;
+  scan(IMPORT_META_RE, () => {
+    usesImportMeta = true;
+    return IMPORT_META_IDENTIFIER;
+  });
 
   edits.sort((a, b) => a.start - b.start);
   let out = "";
@@ -177,7 +274,21 @@ const transformEsmToCjs = (source: string): string => {
   }
   out += source.slice(cursor);
 
-  return `Object.defineProperty(exports, "__esModule", { value: true });\n${out}\n${appends.join("\n")}\n`;
+  const prologue = usesImportMeta ? `${IMPORT_META_PROLOGUE}\n` : "";
+  const body = `${prologue}${out}\n${appends.join("\n")}`;
+
+  // Only wrapped when the module actually redeclares one of the wrapper's
+  // own parameter names: a plain block is enough to turn the redeclaration
+  // into ordinary shadowing, and the generated `exports.X = X` lines have
+  // to live inside it to still see what the body declared. `var` keeps
+  // hoisting out of the block either way, so nothing else moves.
+  const needsScope = Array.from(source.matchAll(WRAPPER_BINDING_DECL_RE)).some(
+    (match) => match.index !== undefined && isRealCode(masked, source, match.index),
+  );
+
+  const aliases = aliasPrologue({ interop: usesInterop, importMeta: usesImportMeta });
+
+  return `${aliases}\nObject.defineProperty(${EXPORTS_ALIAS}, "__esModule", { value: true });\n${needsScope ? `{\n${body}\n}` : body}\n`;
 };
 
 export { interopDefault, toNamespace, transformEsmToCjs };

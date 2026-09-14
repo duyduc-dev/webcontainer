@@ -136,3 +136,129 @@ describe("transformEsmToCjs", () => {
     expect(() => transformEsmToCjs("this is not valid javascript(")).not.toThrow();
   });
 });
+
+describe("transformEsmToCjs import.meta handling", () => {
+  it("compiles a module that mentions import.meta", () => {
+    const source = [
+      "import { YError } from '../yerror.js';",
+      "export function applyExtends(config) {",
+      "  return import.meta.resolve(config.extends);",
+      "}",
+    ].join("\n");
+
+    const compiled = transformEsmToCjs(source);
+    expect(() => new Function("module", "exports", "require", "__filename", "__dirname", compiled)).not.toThrow();
+  });
+
+  it("resolves url/filename/dirname from the CommonJS bindings", () => {
+    const compiled = transformEsmToCjs("export const here = import.meta.dirname;\nexport const self = import.meta.url;");
+    const exported: Record<string, unknown> = {};
+    const requireStub = (specifier: string) =>
+      specifier === "url" ? { pathToFileURL: (path: string) => new URL(`file://${path}`) } : {};
+
+    new Function("module", "exports", "require", "__filename", "__dirname", compiled)(
+      { exports: exported },
+      exported,
+      requireStub,
+      "/pkg/lib/thing.js",
+      "/pkg/lib",
+    );
+
+    expect(exported.here).toBe("/pkg/lib");
+    expect(exported.self).toBe("file:///pkg/lib/thing.js");
+  });
+
+  it("leaves the text 'import.meta' inside a string literal alone", () => {
+    const compiled = transformEsmToCjs('export const advice = "use import.meta.url instead";');
+    expect(compiled).toContain('"use import.meta.url instead"');
+    expect(compiled).not.toContain("__dwcImportMeta = {");
+  });
+});
+
+describe("transformEsmToCjs wrapper-binding collisions", () => {
+  it("lets a module declare its own require via createRequire", () => {
+    const source = [
+      "import { createRequire } from 'node:module';",
+      "const require = createRequire(import.meta.url);",
+      "export const pkg = 'ok';",
+    ].join("\n");
+
+    const compiled = transformEsmToCjs(source);
+    expect(() =>
+      new Function("module", "exports", "require", "__filename", "__dirname", compiled),
+    ).not.toThrow();
+  });
+
+  it("still exports everything the body declared inside the added scope", () => {
+    const compiled = transformEsmToCjs("const require = () => 1;\nexport const value = 42;");
+    const exported: Record<string, unknown> = {};
+
+    new Function("module", "exports", "require", "__filename", "__dirname", compiled)(
+      { exports: exported },
+      exported,
+      () => ({}),
+      "/pkg/index.js",
+      "/pkg",
+    );
+
+    expect(exported.value).toBe(42);
+  });
+
+  it("does not add a scope for a module that declares nothing conflicting", () => {
+    expect(transformEsmToCjs("export const value = 1;")).not.toContain("{\n");
+  });
+});
+
+describe("transformEsmToCjs multi-line default exports", () => {
+  it("handles an export default whose expression spans many lines", () => {
+    const source = ["export default {", "  a: 1,", "  b: 2,", "};"].join("\n");
+    const exported: Record<string, unknown> = {};
+
+    new Function("module", "exports", "require", transformEsmToCjs(source))({ exports: exported }, exported, () => ({}));
+
+    expect(exported.default).toEqual({ a: 1, b: 2 });
+  });
+
+  it("handles export default class and keeps the rest of the file intact", () => {
+    const source = ["export default class Thing {", "  value() { return 7; }", "}", "export const extra = 1;"].join("\n");
+    const exported: Record<string, unknown> = {};
+
+    new Function("module", "exports", "require", transformEsmToCjs(source))({ exports: exported }, exported, () => ({}));
+
+    const Thing = exported.default as new () => { value(): number };
+    expect(new Thing().value()).toBe(7);
+    expect(exported.extra).toBe(1);
+  });
+});
+
+describe("transformEsmToCjs combined default+named imports", () => {
+  it("handles import Default, { named } from 'specifier'", () => {
+    const source = "import Dep, { helper } from './dep.js';\nexport const out = [Dep, helper];";
+    const exported: Record<string, unknown> = {};
+    const fakeRequire = () => ({ __esModule: true, default: "the-default", helper: "the-helper" });
+
+    new Function("module", "exports", "require", "__dwcInteropDefault", transformEsmToCjs(source))(
+      { exports: exported },
+      exported,
+      fakeRequire,
+      interopDefault,
+    );
+
+    expect(exported.out).toEqual(["the-default", "the-helper"]);
+  });
+
+  it("handles import Default, * as ns from 'specifier'", () => {
+    const source = "import Dep, * as ns from './dep.js';\nexport const out = [Dep, ns.helper];";
+    const exported: Record<string, unknown> = {};
+    const fakeRequire = () => ({ __esModule: true, default: "the-default", helper: "the-helper" });
+
+    new Function("module", "exports", "require", "__dwcInteropDefault", transformEsmToCjs(source))(
+      { exports: exported },
+      exported,
+      fakeRequire,
+      interopDefault,
+    );
+
+    expect(exported.out).toEqual(["the-default", "the-helper"]);
+  });
+});

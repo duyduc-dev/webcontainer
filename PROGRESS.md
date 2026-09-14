@@ -422,7 +422,19 @@ tests → build → real browser check) before moving to the next, matching
 the method used throughout this project so far — don't batch multiple
 unverified steps together.
 
-**Pick up here (updated, latest session): read item 14 at the very end of
+**Latest session: items 15 and 16 at the very end of this file — Duck
+Studio's template picker gained two real templates (React + TypeScript,
+then Vue + TypeScript), both built on item 10's verified Vite 7 recipe
+rather than the vanilla template's Vite 8/Rolldown one. Item 16 also fixes
+a real, general preview bug the Vue work uncovered: the preview Service
+Worker lost every client's port mapping whenever the browser terminated it
+for being idle (~30s), so prefix-less runtime module requests — Vite's HMR
+re-imports above all — escaped to the host application. The item 14
+follow-up below is still open. Item 17 records an attempt at newest Angular
+(v22): not working, but five real, general ESM-interop fixes came out of
+it.**
+
+**Pick up here (updated, earlier session): read item 14 near the end of
 this file first — moved npm loading into `duckwc` as a real `dwc.npm`
 API (zero-local-build-step `install()`, fetching straight from the real
 registry), added a genuinely new `dwc.shell.spawn()` streaming API so a
@@ -3927,6 +3939,347 @@ actually does what it's for, not just what its own tests assert:
   scaffolded page's real content, the way `dwc.preview.fetch()` was
   confirmed to do for a `dwc.process.spawn()`-based server back in
   Phase 3.
+
+Per standing preference, commit messages for this project should not
+include `Co-Authored-By`/session-link footers.
+
+## 15. Duck Studio's second template: React + TypeScript, on the Vite 7 recipe — DONE, verified live
+
+Studio's template picker offered exactly one wired-up template
+(`vite-vanilla`); its React tile was listed but marked "Coming soon". This
+item makes it real: `createViteReactTsProject()` in
+`apps/studio/src/duck/project.ts`, its guest-side files in the new
+`apps/studio/src/duck/reactTsTemplate.ts`, and a `CREATORS` map in
+`TemplateDialog.tsx` replacing the hardcoded `selected !== "vite-vanilla"`
+checks, so a third template is now a one-line addition rather than another
+edit to four conditionals.
+
+**Why it deliberately does NOT reuse the vanilla template's Vite 8/Rolldown
+setup.** React ships CommonJS, so an ordinary `import { useState } from
+"react"` only resolves in a Vite dev server once the dependency optimizer
+has pre-bundled it to ESM - and that optimizer is exactly the path this
+runtime can't run today (item 9/13's confirmed-upstream Rolldown WASI trap,
+including item 13.1's own Vite 8 + `@vitejs/plugin-react` attempt that
+trapped before the server ever listened). So this follows the one React
+recipe this repo has verified live instead - apps/docs' React + Vite example
+(section 0) - adapted from JSX to TypeScript:
+
+- `npm create vite@7.0.0 <slug> -- --template react-ts`, then Vite pinned to
+  7.3.6 with `esbuild`/`rollup` aliased to `esbuild-wasm`/`@rollup/wasm-node`
+  via `overrides` (item 10's recipe), and `dev` set to
+  `vite --configLoader native`.
+- The scaffold's own devDependencies are replaced rather than extended:
+  `@vitejs/plugin-react`, `typescript` and the eslint toolchain are all
+  unused here, which is what keeps the install to 17 packages / ~35s.
+- `esbuild: false`, and a single `enforce: "pre"` plugin transforms
+  `.ts`/`.tsx` with `@babel/standalone`'s `preset-typescript` +
+  `preset-react` (`runtime: "automatic"`) - no esbuild service ever has to
+  start inside the sandbox.
+- React 18.3.1, not 19: React stopped publishing UMD builds after 18, and
+  the UMD build is the whole trick. `index.html` loads
+  `react.development.js`/`react-dom.development.js` as plain `<script>`s,
+  and `resolve.alias` points `react`, `react-dom`, `react-dom/client` and
+  `react/jsx-runtime`/`jsx-dev-runtime` at four tiny generated ESM modules
+  under `src/duckwc-react/` that re-export those globals. The optimizer then
+  has no bare dependency left to pre-bundle, and **the scaffolded sources
+  run completely unmodified** - `App.tsx`/`main.tsx` keep their normal
+  imports, which is the part that makes this a real template rather than a
+  hand-written demo.
+- React 18's UMD bundle predates the automatic JSX runtime's own entry
+  point, so `jsx()`/`jsxs()` are rebuilt on top of `createElement` (which
+  pulls `key` out of the props object itself and leaves `props.children`
+  alone when no variadic children are passed - exactly the automatic
+  runtime's calling convention).
+
+**One real bug found by running it, not by inspection.** The UMD builds only
+exist under `node_modules`, so the config copies them into `public/` itself.
+The first version did that in `buildStart` and the preview came up with an
+empty `<div id="root">`: `/react.development.js` returned Vite's SPA
+fallback HTML (`content-type: text/html`, 6736 bytes) even though the file
+was genuinely on disk - confirmed by fetching `/public/react.development.js`
+and `/node_modules/react/umd/react.development.js` through the preview relay
+and getting the real 587294-byte file from both. Cause: Vite's dev server
+snapshots `public/`'s file list once while starting up
+(`initPublicFiles`) and serves nothing that isn't in that snapshot;
+`buildStart` runs after it. Moved the copy into the `config` hook, which
+runs during config resolution, before that scan - and before `vite build`'s
+own public-dir copy too.
+
+**Verified live, in a real browser, through Studio's own UI** (not a unit
+test - this is a browser-only path end to end): From template -> React ->
+Create -> the workspace opens, `npm install` streams into the terminal
+(`added 17 packages in 32s`), `VITE v7.3.6 ready` / `Local:
+http://localhost:5173/`, and the preview iframe renders the real scaffolded
+page. Checked precisely, not just by screenshot: `document.title` is
+`"Vite + React + TS"`, `React.version` is `18.3.1`, `#root` has real
+children, both logo images report non-zero natural dimensions, and clicking
+the counter really advances `useState` (`count is 2`). Editing `App.tsx` in
+Studio's editor produced `[vite] (client) page reload src/App.tsx` in the
+terminal and a re-rendered preview - so `fs.watch` (item 12) drives this
+template too.
+
+**Known limitation, deliberate:** no React Fast Refresh - that lives in
+`@vitejs/plugin-react`, which this recipe drops. A component edit reaches
+the preview as Vite's full page reload instead of a state-preserving hot
+swap (the counter resets to 0). Restoring Fast Refresh means either a
+working Vite 8/Rolldown path (blocked upstream, items 9/13) or adding
+react-refresh's own Babel transform, which `@babel/standalone` does not
+bundle.
+
+Studio typecheck, `pnpm --filter studio lint`, and `pnpm --filter studio
+build` are all clean.
+
+Per standing preference, commit messages for this project should not
+include `Co-Authored-By`/session-link footers.
+
+## 16. Duck Studio's third template: Vue + TypeScript — DONE; and a real, general preview bug it uncovered (Service Worker restart loses every runtime module request)
+
+Vue turned out to be an easier fit than React in one way and a harder one
+in another, and chasing the hard part found a genuine `duckwc` bug that had
+been quietly degrading every preview in this project.
+
+### The template
+
+`createViteVueTsProject()` in `apps/studio/src/duck/project.ts`, guest-side
+files in the new `apps/studio/src/duck/vueTsTemplate.ts`, tile wired up the
+same way item 15 wired React.
+
+- **No UMD shims needed, unlike React.** Vue publishes a real browser ESM
+  build, so `resolve.alias` pointing `vue` at
+  `node_modules/vue/dist/vue.runtime.esm-browser.js` gives the dev server a
+  file it can serve as-is and leaves the dependency optimizer - the Rolldown
+  WASI path this runtime can't run (items 9/13) - with nothing to pre-bundle.
+  That build also has `process.env.NODE_ENV` already resolved, which is the
+  other thing the optimizer would otherwise be needed for.
+- **TypeScript could NOT go through Babel the way React's does.**
+  `@vitejs/plugin-vue` hands a `lang="ts"` script block to Vite's own
+  `transformWithEsbuild()` from inside the plugin (on Vite 8 it would be
+  `transformWithOxc` - Rolldown - which traps), and it has to: compiler-sfc's
+  type-driven macros like `defineProps<{ msg: string }>()` need the
+  annotations intact, so pre-stripping types before the plugin sees the SFC
+  would break them. esbuild itself therefore has to work.
+- **So the template makes esbuild work.** `overrides` already swaps the
+  `esbuild` package for `esbuild-wasm`, whose own Node entry still spawns a
+  child process to talk to the binary over stdio; a generated
+  `scripts/duckwc-setup.mjs` replaces that entry with a direct call into
+  esbuild-wasm's *browser* API, instantiating the `.wasm` sitting in the same
+  package (the same approach apps/docs' React example already uses, reduced
+  to just the async surface). **This has to run in a separate process before
+  `vite` does** - Vite 7 imports esbuild statically at the top of
+  `dist/node/index.js` and `chunks/config.js`, so a plugin `config` hook is
+  far too late. Hence `"dev": "node <project>/scripts/duckwc-setup.mjs &&
+  vite --configLoader native"` rather than anything inside vite.config.js.
+- `@vue/tsconfig` is kept in devDependencies even though nothing
+  type-checks here: the scaffolded `tsconfig.app.json` extends it, and Vite's
+  esbuild transform reads that tsconfig before transforming a single file.
+  Dropping it produced `failed to resolve "extends":
+  "@vue/tsconfig/tsconfig.dom.json"` on the first request - found live.
+
+As with React, the scaffolded sources run **completely unmodified**.
+
+### The real bug: a preview stops resolving its own modules after ~30s idle
+
+The Vue template rendered correctly, but an edit never reached the preview.
+The server side was provably fine - `[vite] (client) hmr update
+/src/App.vue` in the terminal, and fetching the module through the preview
+relay returned the newly compiled code. The client side said `[vite] Failed
+to reload /src/App.vue. This could be due to syntax errors or importing
+non-existent modules.`
+
+Reproducing the client's own dynamic import inside the iframe gave the real
+error - `Failed to fetch dynamically imported module` - and fetching that
+same URL from inside the iframe returned **`content-type: text/html`**: the
+host application's index.html, not the guest's module.
+
+Root cause: `PreviewServiceWorker.ts` remembers each client's port in an
+in-memory `Map`, populated when that client's initial prefixed navigation
+goes through. It is the only thing making prefix-less, root-absolute
+requests (`/@vite/client`, `/src/App.vue?t=...`) reach the guest. **A
+Service Worker is terminated whenever it goes idle and restarted with fresh
+module state on the next event**, so that map empties itself roughly 30
+seconds after the preview stops being touched, while the iframe is still
+very much alive. Every runtime-generated URL then escapes to the host origin.
+
+Confirmed directly rather than inferred: immediately after a prefixed
+navigation, `/src/App.vue` from inside the iframe returns
+`content-type: text/javascript`; after ~65 seconds of idle, the identical
+request returns `text/html`.
+
+This was never Vue-specific. It silently affected every preview in this
+repo - it just hid behind the fact that a full page reload re-navigates the
+prefixed URL and repopulates the map, so anything whose HMR degrades to a
+reload (item 15's React template, plain CSS HMR) appeared to work.
+
+**Fix**: the map is now only a cache. On a miss, the target is recovered
+from the requesting client's own document URL - `self.clients.get(clientId)`
+- which still carries the preview prefix and is answered by the browser
+rather than by anything the worker has to remember, then cached again. The
+asynchronous lookup is only attempted for requests that could plausibly
+belong to a preview iframe (same-origin, known client, not a navigation -
+a preview navigation always carries the prefix), and a client shown to be
+something else is remembered as such so the host application's own requests
+take the same synchronous "not ours" path as before. A request that turns
+out not to be a preview's is passed through with `fetch(event.request)`.
+
+New `PreviewServiceWorker.test.ts` (7 cases; the worker had no test at all
+before - it reads `self.registration` at module load, so the suite builds a
+fake Service Worker global and re-imports the module, which doubles as the
+way to simulate a restart): prefixed relay, prefix-less follow-up, recovery
+after a restart, the cache avoiding a second lookup, host-page passthrough,
+and the two cases it must not touch at all.
+
+### Verified live, in a real browser, through Studio's UI
+
+From template -> Vue -> Create -> `added 18 packages`, `[duckwc] routed
+esbuild through its browser entry.`, `VITE v7.3.6 ready`, and the preview
+renders the real scaffolded page. Checked precisely: `document.title` is
+`"Vite + Vue + TS"`, the app really mounted (`[data-v-app]` present), the
+counter advances through Vue's reactivity (`count is 3`), both logos report
+non-zero natural dimensions.
+
+Then the actual acceptance test for the fix: left the preview idle for ~70
+seconds (long enough for the browser to terminate the worker), confirmed a
+prefix-less module request now still returns `text/javascript`, and edited
+`HelloWorld.vue` in Studio's editor. **The preview hot-updated -
+`Vite + Vue-HOT-UPDATED` - while the counter stayed at `count is 3`**: real
+state-preserving Vue HMR, with no "Failed to reload" error this time, where
+before the fix the identical edit produced one every time.
+
+Item 15's React template was re-verified on the patched worker afterwards
+(React 18.3.1, interactive counter, UMD builds served, logos loaded) - the
+Service Worker is shared by every preview in this repo, so this mattered.
+
+Core suite 708 tests green, core typecheck and build clean; Studio
+typecheck, lint and build clean.
+
+Per standing preference, commit messages for this project should not
+include `Co-Authored-By`/session-link footers.
+
+## 17. Tried Angular (newest, v22) — NOT working yet, but five real, general ESM-interop bugs found and fixed along the way
+
+Asked to try the newest Angular as a Studio template. It does not work yet,
+and this entry records exactly how far it gets and what stands in the way -
+no Angular template was added to Studio, matching this repo's own rule that
+a tile only goes green once its recipe is verified end to end.
+
+### What Angular needs, read before running anything
+
+`@angular/build@22.1.8`'s own dependencies: **`vite 8.1.5`**, **`rolldown
+1.2.0`**, `esbuild 0.28.2`, `oxc-parser 0.142.0`, `piscina`, `sass`,
+`@babel/core 8`, optional `lmdb`. So the newest Angular sits directly on the
+Vite 8 + Rolldown combination items 9 and 13 confirmed still traps upstream
+(`RuntimeError: unreachable`, the napi-rs tokio-runtime lifecycle bug).
+Version archaeology, since it decides any future attempt:
+
+- **Angular 22** - vite 8.1.5 + rolldown 1.2.0 + oxc-parser.
+- **Angular 21** - vite 7.3.6 + rolldown 1.0.0-rc.4.
+- **Angular 20** - vite 7.3.6 + esbuild, **no rolldown, no oxc-parser** - the
+  newest Angular that avoids the known-trapping dependency entirely.
+
+`oxc-parser` is less alarming than it looks: its own loader carries the
+**same `process.versions.webcontainer` fallback convention rolldown uses**
+(`src-js/webcontainer-fallback.cjs`, installing
+`@oxc-parser/binding-wasm32-wasi` on demand), which this runtime already
+satisfies - see item 3.
+
+The deeper structural problem is esbuild. Angular's builder does not merely
+*transform* with esbuild the way `@vitejs/plugin-vue` does (item 16); it
+**bundles** with esbuild's `build()`/`context()` API. The only esbuild that
+runs in this sandbox is esbuild-wasm's browser API, which has no filesystem
+at all - item 16's shim works precisely because `transform()` is a pure
+string-in/string-out call. Making `build()` work would mean feeding Angular's
+own entry points and plugin pipeline through a VFS-backed esbuild plugin
+appended after Angular's own - possible in principle, not attempted here.
+
+### What actually happened when it ran
+
+A real Angular 22 project (hand-written to match `ng new`'s output:
+`angular.json` with `@angular/build:application` + `:dev-server`, tsconfigs,
+a signals-based standalone component, zoneless bootstrap) with
+`overrides: { "esbuild": "npm:esbuild-wasm@0.28.2" }`.
+
+**`npm install` succeeded: `added 300 packages in 13m`, exit 0.** That is
+itself a first for this runtime - roughly twenty times the dependency count
+of the Vite templates. (Later installs of the same tree took ~2.5 minutes:
+the npm cache lives in the VFS and is lost on every reload, but Chrome's own
+HTTP cache survives, so only the first install pays full price.)
+
+Running `@angular/cli`'s own `bin/ng.js` then walked straight into this
+runtime's CommonJS→ESM interop retry - `ng.js` is CommonJS and `require()`s
+a long chain of `"type": "module"` packages, and `require()` must stay
+synchronous, so those files go through `esmInterop.ts`'s regex rewrite
+rather than the real ESM loader (esmLoader.ts), exactly as its doc comment
+says. Each failure below was found by running the real thing, fixed, and
+re-run:
+
+1. **`import.meta` anywhere in the file defeated the whole retry.** It is a
+   syntax error in anything `new Function` compiles, not merely an
+   unsupported statement - so one mention on a line that never executes
+   killed the file. Real yargs@18 has exactly one, `import.meta.resolve(...)`
+   on its `extends`-config branch. Now rewritten to a local stand-in built
+   from the CommonJS bindings the wrapper already provides (`url`,
+   `filename`, `dirname`, `resolve`).
+2. **A module declaring its own `require` could not compile.** `const
+   require = createRequire(import.meta.url)` is legal ESM and extremely
+   common; in the wrapper's scope it is a redeclaration of a parameter.
+   Real yargs-parser@22 does it. Fixed by wrapping the body in a plain block
+   when - and only when - the module redeclares one of the wrapper's own
+   parameter names, turning the redeclaration into ordinary shadowing.
+3. **That fix then caused a TDZ error**, found on the very next run:
+   rewritten `require(...)` calls sitting above the module's own `const
+   require` now read its temporal dead zone. Fixed properly by having all
+   *generated* code address the wrapper through aliases captured outside the
+   block (`__dwcRequireRef` and friends), emitted only when a given module's
+   rewrite actually needs them.
+4. **`export default` only matched a single-line expression.** The old
+   pattern required the whole expression and its `;` on one line, so
+   `export default {` spanning many lines (real yargs' platform shim) was
+   left untouched. Now only the two keywords are rewritten into an
+   assignment and whatever follows stands as its own expression - which
+   covers objects, classes and functions uniformly.
+5. **`import Default, { named } from '...'` was unhandled** - the comma
+   breaks both the default-only and the named-only pattern, so nothing
+   matched. Real listr2 opens with `import EventEmitter, { setMaxListeners }
+   from "node:events"`. Added, along with the `import Default, * as ns`
+   variant.
+
+**Measured effect, independent of Angular:** scanning every ESM file in a
+real 309-package Angular dependency tree (3416 files) through the retry and
+compiling each, failures went from **930 to 55**. Fix 4 alone accounts for
+most of it - `@angular/common`'s 885 locale files are all multi-line
+`export default [...]`. The 55 that remain are four classes: large
+pre-bundled `.mjs` bundles (`@angular/compiler`'s fesm2022 output), some
+`@babel/core` internals, the `ngc` bin wrappers, and genuine top-level
+`await` - which a CommonJS wrapper structurally cannot support at all.
+
+**Where it stops now:** `ng version` gets through yargs, yargs-parser and
+listr2's *compilation* and dies inside listr2's *execution* with
+`TypeError: Cannot convert undefined or null to object`. That is a different
+and deeper class than everything above - the regex rewrite produces
+syntactically valid but semantically imperfect CommonJS (a namespace object
+shaped differently than real ESM would produce), not a parse failure. Worth
+knowing before picking this up: every remaining fix is of that harder kind,
+and the CLI has not yet reached `@angular/build` at all, where the vite
+8/rolldown and esbuild-`build()` walls above are still waiting.
+
+**Honest assessment:** newest Angular is a multi-session effort of the same
+shape items 7-13 were for Vite, with two known-hard walls at the end of it.
+If an Angular template is wanted sooner, **Angular 20** is the version to
+try - it is the newest one whose dev server avoids rolldown entirely and
+pins the exact Vite 7.3.6 the React and Vue templates already use.
+
+### Technique notes
+
+- **Rebuilding `duckwc` while a probe page is open resets the sandbox.**
+  Vite HMR re-imports the rebuilt `dist`, the page re-runs `bootWC()`, and
+  the VFS - including a 13-minute install - is gone. Costly to learn twice.
+  For long-lived sandbox state, serve the probe page from a built bundle
+  (`vite preview`) instead of the dev server.
+- **A local scan beats iterating through the sandbox.** Installing the same
+  dependency tree with real npm on the host (4 seconds) and running
+  `transformEsmToCjs` over every ESM file in it found and grouped every
+  remaining failure class at once, with no reinstall between fixes. Three of
+  the five fixes above were verified this way before ever being rebuilt.
 
 Per standing preference, commit messages for this project should not
 include `Co-Authored-By`/session-link footers.

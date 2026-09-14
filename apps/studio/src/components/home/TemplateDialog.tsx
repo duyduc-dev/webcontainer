@@ -3,7 +3,12 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import { createViteVanillaProject, type Project } from "@/duck/project";
+import {
+  createViteReactTsProject,
+  createViteVanillaProject,
+  createViteVueTsProject,
+  type Project,
+} from "@/duck/project";
 
 interface TemplateOption {
   id: string;
@@ -14,15 +19,23 @@ interface TemplateOption {
   available: boolean;
 }
 
-// Only "Vite (Vanilla)" is wired to a real, verified-working recipe in this
-// runtime (see PROGRESS.md's Vite/Rolldown WASI investigation) - everything
-// else is shown for parity with the design but marked unavailable rather
-// than shipping an untested path.
+type ProjectCreator = (name: string, onLog: (text: string) => void) => Promise<Project>;
+
+const CREATORS: Record<string, ProjectCreator> = {
+  "vite-vanilla": createViteVanillaProject,
+  "react-ts": createViteReactTsProject,
+  "vue-ts": createViteVueTsProject,
+};
+
+// A template is only marked available once it is wired to a real,
+// verified-working recipe in this runtime (see PROGRESS.md's Vite/Rolldown
+// WASI investigation) - everything else is shown for parity with the design
+// but marked unavailable rather than shipping an untested path.
 const TEMPLATE_CATALOG: Record<string, TemplateOption[]> = {
   Frontend: [
     { id: "vite-vanilla", name: "Vite (Vanilla)", lang: "JavaScript", badge: "Vi", color: "#71717a", available: true },
-    { id: "react", name: "React", lang: "TypeScript", badge: "Rx", color: "#61dafb", available: false },
-    { id: "vue", name: "Vue", lang: "TypeScript", badge: "Vu", color: "#42b883", available: false },
+    { id: "react-ts", name: "React", lang: "TypeScript", badge: "Rx", color: "#61dafb", available: true },
+    { id: "vue-ts", name: "Vue", lang: "TypeScript", badge: "Vu", color: "#42b883", available: true },
     { id: "svelte", name: "Svelte", lang: "TypeScript", badge: "Sv", color: "#ff3e00", available: false },
   ],
   Meta: [
@@ -50,12 +63,14 @@ export function TemplateDialog({
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState("");
 
+  const creator = selected === null ? undefined : CREATORS[selected];
+
   const create = async () => {
-    if (selected !== "vite-vanilla") return;
+    if (!creator) return;
     setBusy(true);
     setLog("");
     try {
-      const project = await createViteVanillaProject(name, (text) => setLog((prev) => prev + text));
+      const project = await creator(name, (text) => setLog((prev) => prev + text));
       onOpenChange(false);
       onCreated(project);
     } finally {
@@ -124,7 +139,7 @@ export function TemplateDialog({
           </div>
         </ScrollArea>
 
-        {selected === "vite-vanilla" && (
+        {creator && (
           <div className="px-6 pb-1">
             <input
               value={name}
@@ -145,7 +160,7 @@ export function TemplateDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
             Cancel
           </Button>
-          <Button disabled={!selected || selected !== "vite-vanilla" || busy} onClick={() => void create()}>
+          <Button disabled={!creator || busy} onClick={() => void create()}>
             {busy ? "Creating…" : "Create"}
           </Button>
         </DialogFooter>

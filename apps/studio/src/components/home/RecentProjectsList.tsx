@@ -14,6 +14,8 @@ function relativeTime(ts: number): string {
 const KIND_LABEL: Record<Project["kind"], string> = {
   blank: "blank",
   "vite-vanilla": "vite",
+  "vite-react-ts": "react + vite",
+  "vite-vue-ts": "vue + vite",
 };
 
 export function RecentProjectsList({

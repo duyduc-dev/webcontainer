@@ -16,6 +16,16 @@
 // resolved to — every later request from that same client is routed there
 // even without the prefix.
 //
+// That memory alone is not enough: a Service Worker is terminated whenever
+// it goes idle (Chrome does this after roughly 30 seconds) and restarted
+// with completely fresh module state on the next event, so the map is empty
+// again while the iframe is still very much alive. Every runtime-generated
+// root-absolute URL then escaped to the host application instead — Vite's
+// HMR re-imports, dynamic imports, code-split chunks. The map is therefore
+// only a cache: on a miss, the target is recovered from the requesting
+// client's own document URL, which still carries the prefix and is answered
+// by the browser rather than by anything this worker has to remember.
+//
 // Cross-Origin-Resource-Policy: a host page that needs SharedArrayBuffer
 // (this library's own sync fs bridge does) sets
 // Cross-Origin-Embedder-Policy: require-corp on itself, and Chrome enforces
@@ -108,31 +118,39 @@ async function relay(request: Omit<PreviewRelayRequest, "requestId">): Promise<R
   });
 }
 
+// Splits a prefixed preview pathname into the guest port, the optional
+// preview channel id, and the path the guest server itself should see.
+function parsePreviewPath(pathname: string): PreviewTarget | undefined {
+  if (!pathname.startsWith(EFFECTIVE_PREVIEW_PREFIX)) return undefined;
+
+  const rest = pathname.slice(EFFECTIVE_PREVIEW_PREFIX.length);
+  const firstSlash = rest.indexOf("/");
+  const firstSegment = firstSlash === -1 ? rest : rest.slice(0, firstSlash);
+  const firstIsPort = /^\d+$/.test(firstSegment);
+  const afterFirst = firstSlash === -1 ? "" : rest.slice(firstSlash + 1);
+  const secondSlash = afterFirst.indexOf("/");
+  const portText = firstIsPort ? firstSegment : secondSlash === -1 ? afterFirst : afterFirst.slice(0, secondSlash);
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+
+  const previewId = firstIsPort ? undefined : firstSegment;
+  const path = firstIsPort
+    ? firstSlash === -1
+      ? "/"
+      : rest.slice(firstSlash)
+    : secondSlash === -1
+      ? "/"
+      : afterFirst.slice(secondSlash);
+
+  return { port, path, previewId };
+}
+
 function resolvePreviewTarget(url: URL, event: FetchEvent): PreviewTarget | undefined {
-  if (url.pathname.startsWith(EFFECTIVE_PREVIEW_PREFIX)) {
-    const rest = url.pathname.slice(EFFECTIVE_PREVIEW_PREFIX.length);
-    const firstSlash = rest.indexOf("/");
-    const firstSegment = firstSlash === -1 ? rest : rest.slice(0, firstSlash);
-    const firstIsPort = /^\d+$/.test(firstSegment);
-    const afterFirst = firstSlash === -1 ? "" : rest.slice(firstSlash + 1);
-    const secondSlash = afterFirst.indexOf("/");
-    const portText = firstIsPort ? firstSegment : secondSlash === -1 ? afterFirst : afterFirst.slice(0, secondSlash);
-    const port = Number(portText);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
-
-    const previewId = firstIsPort ? undefined : firstSegment;
-    const path =
-      (firstIsPort
-        ? firstSlash === -1
-          ? "/"
-          : rest.slice(firstSlash)
-        : secondSlash === -1
-          ? "/"
-          : afterFirst.slice(secondSlash)) + url.search;
-
+  const prefixed = parsePreviewPath(url.pathname);
+  if (prefixed) {
     const clientId = event.clientId || event.resultingClientId;
-    if (clientId) clientPorts.set(clientId, { port, previewId });
-    return { port, path, previewId };
+    if (clientId) clientPorts.set(clientId, { port: prefixed.port, previewId: prefixed.previewId });
+    return { ...prefixed, path: prefixed.path + url.search };
   }
 
   // Module imports and worker-owned follow-up requests can identify the
@@ -148,12 +166,45 @@ function resolvePreviewTarget(url: URL, event: FetchEvent): PreviewTarget | unde
   return undefined;
 }
 
-self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
-  const target = resolvePreviewTarget(url, event);
-  if (!target) return; // not a tracked preview request — let the browser handle it normally
+// Clients already shown to be something other than a preview iframe (the
+// host application's own page, most of all). Purely an optimisation: it
+// keeps the asynchronous lookup below to one call per client, after which
+// every host request takes the same synchronous "not ours" path as before.
+const nonPreviewClients = new Set<string>();
 
-  const responsePromise = (async () => {
+// Only worth an asynchronous client lookup when the request could plausibly
+// belong to a preview iframe: same-origin, from a known client, and not a
+// navigation (a preview navigation always carries the prefix, so a
+// prefix-less one is the host application's own).
+function mayBelongToPreviewClient(url: URL, event: FetchEvent): boolean {
+  if (url.origin !== self.location.origin) return false;
+  if (event.request.mode === "navigate") return false;
+  const clientId = event.clientId || event.resultingClientId;
+  return Boolean(clientId) && !nonPreviewClients.has(clientId);
+}
+
+// Recovers the target after a Service Worker restart has emptied
+// clientPorts: the iframe's own document URL still carries the preview
+// prefix, and the browser - not this worker's memory - is what answers for
+// it. Repopulates the cache so only the first request after a restart pays
+// for the lookup.
+async function recoverPreviewTarget(url: URL, event: FetchEvent): Promise<PreviewTarget | undefined> {
+  const clientId = event.clientId || event.resultingClientId;
+  const client = await self.clients.get(clientId);
+  if (!client) return undefined;
+
+  const parsed = parsePreviewPath(new URL(client.url).pathname);
+  if (!parsed) {
+    nonPreviewClients.add(clientId);
+    return undefined;
+  }
+
+  clientPorts.set(clientId, { port: parsed.port, previewId: parsed.previewId });
+  return { port: parsed.port, previewId: parsed.previewId, path: url.pathname + url.search };
+}
+
+function respondFromGuest(target: PreviewTarget, event: FetchEvent): Promise<Response> {
+  return (async () => {
     const method = event.request.method;
     const headers = Object.fromEntries(event.request.headers.entries());
     const body = method === "GET" || method === "HEAD" ? undefined : new Uint8Array(await event.request.arrayBuffer());
@@ -196,6 +247,24 @@ self.addEventListener("fetch", (event) => {
       });
     }
   })();
+}
+
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  const target = resolvePreviewTarget(url, event);
+
+  // Not obviously a preview request, and not worth asking the browser about
+  // - let it be handled normally.
+  if (!target && !mayBelongToPreviewClient(url, event)) return;
+
+  const responsePromise = target
+    ? respondFromGuest(target, event)
+    : (async () => {
+        const recovered = await recoverPreviewTarget(url, event);
+        // Passing the original request straight through is how this worker
+        // declines a request it has already committed to answering.
+        return recovered ? respondFromGuest(recovered, event) : fetch(event.request);
+      })();
 
   // event.waitUntil() alongside respondWith(): a navigation's extended-
   // lifetime guarantee is otherwise tied only to respondWith's own promise -
