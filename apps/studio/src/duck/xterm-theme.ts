@@ -1,0 +1,53 @@
+import type { ITheme } from "@xterm/xterm";
+
+// Concrete hex values, not CSS var() references - xterm's renderer needs
+// real colors to composite against, matching the card/foreground tokens in
+// index.css for each theme.
+export const XTERM_THEME: Record<"light" | "dark", ITheme> = {
+  light: {
+    background: "#ffffff",
+    foreground: "#18181b",
+    cursor: "#18181b",
+    cursorAccent: "#ffffff",
+    selectionBackground: "rgba(99,102,241,0.25)",
+    black: "#18181b",
+    red: "#dc2626",
+    green: "#16a34a",
+    yellow: "#ca8a04",
+    blue: "#2563eb",
+    magenta: "#9333ea",
+    cyan: "#0891b2",
+    white: "#71717a",
+    brightBlack: "#71717a",
+    brightRed: "#ef4444",
+    brightGreen: "#22c55e",
+    brightYellow: "#eab308",
+    brightBlue: "#3b82f6",
+    brightMagenta: "#a855f7",
+    brightCyan: "#06b6d4",
+    brightWhite: "#18181b",
+  },
+  dark: {
+    background: "#18181b",
+    foreground: "#fafafa",
+    cursor: "#fafafa",
+    cursorAccent: "#18181b",
+    selectionBackground: "rgba(99,102,241,0.35)",
+    black: "#27272a",
+    red: "#f87171",
+    green: "#4ade80",
+    yellow: "#facc15",
+    blue: "#60a5fa",
+    magenta: "#c084fc",
+    cyan: "#22d3ee",
+    white: "#e4e4e7",
+    brightBlack: "#71717a",
+    brightRed: "#fca5a5",
+    brightGreen: "#86efac",
+    brightYellow: "#fde047",
+    brightBlue: "#93c5fd",
+    brightMagenta: "#d8b4fe",
+    brightCyan: "#67e8f9",
+    brightWhite: "#fafafa",
+  },
+};
