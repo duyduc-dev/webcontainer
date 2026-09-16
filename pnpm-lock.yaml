@@ -152,6 +152,19 @@ importers:
         specifier: ^8.2.2
         version: 8.2.2(@types/node@24.13.3)(esbuild@0.27.7)(jiti@2.7.0)
 
+  examples/angular-playground:
+    dependencies:
+      duckwc:
+        specifier: workspace:*
+        version: link:../../packages/core
+    devDependencies:
+      '@playwright/test':
+        specifier: ^1.62.1
+        version: 1.62.1
+      vite:
+        specifier: ^7.1.0
+        version: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)(lightningcss@1.33.0)
+
   examples/playground:
     dependencies:
       '@xterm/xterm':

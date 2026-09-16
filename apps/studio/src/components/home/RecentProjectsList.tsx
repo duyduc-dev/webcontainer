@@ -16,6 +16,7 @@ const KIND_LABEL: Record<Project["kind"], string> = {
   "vite-vanilla": "vite",
   "vite-react-ts": "react + vite",
   "vite-vue-ts": "vue + vite",
+  "vite-angular-ts": "angular + vite",
 };
 
 export function RecentProjectsList({

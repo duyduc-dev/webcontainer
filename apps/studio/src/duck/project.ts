@@ -1,5 +1,15 @@
 import { ensureNpm, getDwc, pipeToLog, pipeUntilMarker, waitForListen } from "./session";
 import {
+  ANGULAR_APP_COMPONENT_TS,
+  ANGULAR_INDEX_HTML,
+  ANGULAR_MAIN_TS,
+  ANGULAR_VERSION,
+  BABEL_STANDALONE_VERSION as ANGULAR_BABEL_STANDALONE_VERSION,
+  VITE_VERSION as ANGULAR_VITE_VERSION,
+  ZONE_VERSION,
+  angularViteConfig,
+} from "./angularTemplate";
+import {
   BABEL_STANDALONE_VERSION,
   REACT_TS_INDEX_HTML,
   REACT_TS_SHIM_DIR,
@@ -18,7 +28,7 @@ import {
   vueTsViteConfig,
 } from "./vueTsTemplate";
 
-export type ProjectKind = "blank" | "vite-vanilla" | "vite-react-ts" | "vite-vue-ts";
+export type ProjectKind = "blank" | "vite-vanilla" | "vite-react-ts" | "vite-vue-ts" | "vite-angular-ts";
 
 export interface Project {
   id: string;
@@ -260,6 +270,60 @@ export async function createViteVueTsProject(name: string, onLog: (text: string)
   return project;
 }
 
+// Angular + TypeScript. Unlike the other three templates, this one is
+// written straight into the VFS rather than scaffolded via a real CLI - see
+// angularTemplate.ts's own header for why (`@angular/create` needs
+// `child_process.spawnSync`, which this runtime does not implement) and how
+// it still avoids the Rolldown-optimizer problem the React/Vue templates
+// work around (every `@angular/*`/rxjs/zone.js import is aliased straight to
+// its real, self-contained ESM file).
+export async function createViteAngularProject(name: string, onLog: (text: string) => void): Promise<Project> {
+  const dwc = getDwc();
+  await ensureNpm();
+  const slug = slugify(name);
+  const path = `/${slug}`;
+
+  await dwc.fs.mkdir(`${path}/src`, { recursive: true });
+
+  const pkg = {
+    name: slug,
+    version: "0.0.0",
+    private: true,
+    type: "module",
+    dependencies: {
+      "@angular/core": ANGULAR_VERSION,
+      "@angular/common": ANGULAR_VERSION,
+      "@angular/compiler": ANGULAR_VERSION,
+      "@angular/platform-browser": ANGULAR_VERSION,
+      rxjs: "^7.8.2",
+      "zone.js": ZONE_VERSION,
+    },
+    devDependencies: {
+      "@babel/standalone": ANGULAR_BABEL_STANDALONE_VERSION,
+      vite: ANGULAR_VITE_VERSION,
+    },
+    overrides: {
+      esbuild: "npm:esbuild-wasm@^0.25.0",
+      rollup: "npm:@rollup/wasm-node@^4.43.0",
+    },
+    scripts: {
+      dev: "vite --configLoader native",
+      build: "vite build",
+    },
+  };
+  await dwc.fs.writeFile(`${path}/package.json`, JSON.stringify(pkg, null, 2));
+
+  await dwc.fs.writeFile(`${path}/vite.config.js`, angularViteConfig(path));
+  await dwc.fs.writeFile(`${path}/index.html`, ANGULAR_INDEX_HTML);
+  await dwc.fs.writeFile(`${path}/src/main.ts`, ANGULAR_MAIN_TS);
+  await dwc.fs.writeFile(`${path}/src/app.component.ts`, ANGULAR_APP_COMPONENT_TS);
+  onLog(`wrote a standalone Angular ${ANGULAR_VERSION} app to ${path}\n`);
+
+  const project: Project = { id: crypto.randomUUID(), name: slug, path, kind: "vite-angular-ts", createdAt: Date.now() };
+  saveRecentProject(project);
+  return project;
+}
+
 // A "recent" project's files only survive if this page's sandbox has been
 // alive the whole time (duckwc's VFS is in-memory, reset on reload) - so
 // reopening either resumes the still-live project as-is, or, if the VFS was
@@ -271,6 +335,7 @@ export async function reopenProject(project: Project, onLog: (text: string) => v
   if (project.kind === "blank") return createBlankProject(project.name);
   if (project.kind === "vite-react-ts") return createViteReactTsProject(project.name, onLog);
   if (project.kind === "vite-vue-ts") return createViteVueTsProject(project.name, onLog);
+  if (project.kind === "vite-angular-ts") return createViteAngularProject(project.name, onLog);
   return createViteVanillaProject(project.name, onLog);
 }
 

@@ -1,0 +1,21 @@
+{
+  "name": "angular-playground",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "predev": "node scripts/vendor-npm.mjs && node scripts/copy-preview-sw.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/vendor-npm.mjs && node scripts/copy-preview-sw.mjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "duckwc": "workspace:*"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "vite": "^7.1.0"
+  }
+}

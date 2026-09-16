@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import {
+  createViteAngularProject,
   createViteReactTsProject,
   createViteVanillaProject,
   createViteVueTsProject,
@@ -25,6 +26,7 @@ const CREATORS: Record<string, ProjectCreator> = {
   "vite-vanilla": createViteVanillaProject,
   "react-ts": createViteReactTsProject,
   "vue-ts": createViteVueTsProject,
+  "angular-ts": createViteAngularProject,
 };
 
 // A template is only marked available once it is wired to a real,
@@ -36,6 +38,7 @@ const TEMPLATE_CATALOG: Record<string, TemplateOption[]> = {
     { id: "vite-vanilla", name: "Vite (Vanilla)", lang: "JavaScript", badge: "Vi", color: "#71717a", available: true },
     { id: "react-ts", name: "React", lang: "TypeScript", badge: "Rx", color: "#61dafb", available: true },
     { id: "vue-ts", name: "Vue", lang: "TypeScript", badge: "Vu", color: "#42b883", available: true },
+    { id: "angular-ts", name: "Angular", lang: "TypeScript", badge: "Ng", color: "#dd0031", available: true },
     { id: "svelte", name: "Svelte", lang: "TypeScript", badge: "Sv", color: "#ff3e00", available: false },
   ],
   Meta: [
